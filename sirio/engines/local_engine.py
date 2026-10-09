@@ -158,13 +158,20 @@ def _key(text: str) -> str:
     return "".join(unicodedata.normalize("NFKC", text).split()).upper()
 
 
+# Segni spuri tollerati prima/dopo il valore (residui di linee, punti, apostrofi).
+_JUNK_LEAD = ".'`\"-"
+_JUNK_TRAIL = ".,'`\"-:;"
+_MAX_JUNK = 2
+
+
 @dataclass(frozen=True, eq=False)
 class Lexicon:
     """Insieme finito di scritture ammesse, ognuna con il suo valore canonico.
 
     Le scritture sono confrontate senza spazi e in maiuscolo (``_key``): la
     decodifica vincolata ammette solo i token che mantengono il testo un
-    prefisso di qualche scrittura del lessico.
+    prefisso di qualche scrittura del lessico. Sono tollerati fino a due segni
+    spuri (punti, apostrofi, trattini) prima e dopo la scrittura.
     """
 
     name: str
@@ -183,13 +190,48 @@ class Lexicon:
         if not forms:
             raise ValueError(f"Lessico vuoto: {name}")
         prefixes = frozenset(k[:i] for k in forms for i in range(len(k) + 1))
-        return cls(name, forms, prefixes, frozenset("".join(forms)), max(len(k) for k in forms))
+        alphabet = frozenset("".join(forms)) | frozenset(_JUNK_LEAD) | frozenset(_JUNK_TRAIL)
+        return cls(name, forms, prefixes, alphabet, max(len(k) for k in forms) + 2 * _MAX_JUNK)
+
+    def is_prefix(self, key: str) -> bool:
+        """True se ``key`` puo' ancora diventare una scrittura ammessa."""
+        core = key.lstrip(_JUNK_LEAD)
+        if len(key) - len(core) > _MAX_JUNK:
+            return False
+        if core in self.prefixes:
+            return True
+        body = core.rstrip(_JUNK_TRAIL)
+        return len(core) - len(body) <= _MAX_JUNK and body in self.forms
+
+    def complete(self, key: str) -> Any:
+        """Valore canonico se ``key`` e' una scrittura completa (``None`` altrimenti)."""
+        core = key.lstrip(_JUNK_LEAD)
+        if len(key) - len(core) > _MAX_JUNK:
+            return None
+        if core in self.forms:
+            return self.forms[core]
+        body = core.rstrip(_JUNK_TRAIL)
+        if len(core) - len(body) > _MAX_JUNK:
+            return None
+        return self.forms.get(body)
 
     def value(self, text: str | None) -> Any:
         """Valore canonico di una scrittura (``None`` se non appartiene al lessico)."""
         if not text:
             return None
-        return self.forms.get(_key(text))
+        return self.complete(_key(text))
+
+
+# Confusioni tipiche della lettura delle cifre scritte a mano.
+_DIGIT_ALIASES = {"1": ("1", "I", "L"), "0": ("0", "O")}
+
+
+def _digit_variants(s: str) -> list[str]:
+    """Varianti di una sequenza di cifre con le confusioni piu' comuni ("11" -> "1I", "LL", "U"...)."""
+    out = ["".join(p) for p in itertools.product(*(_DIGIT_ALIASES.get(c, (c,)) for c in s))]
+    if s == "11":
+        out.append("U")
+    return out
 
 
 def _num_forms(x: float) -> list[str]:
@@ -205,6 +247,9 @@ def _num_forms(x: float) -> list[str]:
     return forms
 
 
+_TIME_SEPARATORS = (":", ".", ",", ";", "'", "")
+
+
 @functools.cache
 def time_lexicon() -> Lexicon:
     """Orari 06:00-20:00 a passi di 15 minuti ("8:00", "08.30", "1100", "8"...)."""
@@ -212,11 +257,17 @@ def time_lexicon() -> Lexicon:
     for minutes in range(TIME_MIN, TIME_MAX + 1, TIME_STEP):
         h, m = divmod(minutes, 60)
         value = f"{h:02d}:{m:02d}"
-        for hh in dict.fromkeys((str(h), f"{h:02d}")):
-            for sep in (":", ".", ",", ""):
-                pairs.append((f"{hh}{sep}{m:02d}", value))
-            if m == 0:
-                pairs.append((hh, value))
+        mins = _digit_variants(f"{m:02d}")
+        if m == 0:
+            mins += ["000", "0"]
+        for hh_digits in dict.fromkeys((str(h), f"{h:02d}")):
+            for hh in _digit_variants(hh_digits):
+                for sep in _TIME_SEPARATORS:
+                    for mm in mins:
+                        if sep or len(mm) == 2:
+                            pairs.append((f"{hh}{sep}{mm}", value))
+                if m == 0:
+                    pairs.append((hh, value))
     return Lexicon.build("orari", pairs)
 
 
@@ -227,8 +278,9 @@ def hours_lexicon() -> Lexicon:
     for half in range(0, int(HOURS_MAX_DAY * 2) + 1):
         v = half / 2
         for f in _num_forms(v):
-            pairs.append((f, v))
-            pairs.append((f + "h", v))
+            for variant in _digit_variants(f):
+                pairs.append((variant, v))
+                pairs.append((variant + "h", v))
     return Lexicon.build("ore", pairs)
 
 
@@ -436,7 +488,7 @@ class TrOCRRecognizer:
         ck = (lex.name, prefix)
         ids = self._allowed.get(ck)
         if ids is None:
-            sel = [i for i, k in self._lexicon_tokens(lex) if prefix + k in lex.prefixes]
+            sel = [i for i, k in self._lexicon_tokens(lex) if lex.is_prefix(prefix + k)]
             ids = self.torch.tensor(sel, dtype=self.torch.long)
             self._allowed[ck] = ids
         return ids
@@ -523,7 +575,7 @@ class TrOCRRecognizer:
                     continue
                 if lexicon is not None:
                     allowed = self._allowed_for(lexicon, h.key)
-                    eos_ok = h.key in lexicon.forms
+                    eos_ok = lexicon.complete(h.key) is not None
                 else:
                     allowed = static_ids
                     eos_ok = bool(h.key)
@@ -600,7 +652,7 @@ class TrOCRRecognizer:
             for i, h in enumerate(live):
                 if lexicon is not None:
                     allowed = self._allowed_for(lexicon, h.key)
-                    eos_ok = h.key in lexicon.forms
+                    eos_ok = lexicon.complete(h.key) is not None
                 else:
                     allowed = static_ids
                     eos_ok = bool(h.key)
@@ -632,14 +684,14 @@ class TrOCRRecognizer:
                 self._fast = False
         lex = req.lexicon
         if lex is not None:
-            steps = lex.max_chars + 1
+            steps = lex.max_chars
             if start is not None:
                 fin = self._search(enc1, start, max(1, req.beams), steps, lex, None, False)
             else:
                 fin = self._search_slow(enc1, max(1, req.beams), steps, lex, None)
             by_value: dict[Any, list[float]] = {}
             for key, _ids, score in fin:
-                value = lex.forms.get(key)
+                value = lex.complete(key)
                 if value is not None:
                     by_value.setdefault(value, []).append(score)
             cands = [(v, _logsumexp(s)) for v, s in by_value.items()]
@@ -863,7 +915,7 @@ def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_p
     return path
 
 
-def _load_recognizer(path: Path, model_name: str, device: str) -> TrOCRRecognizer:
+def _load_recognizer(path: Path, model_name: str, device: str, quantize: bool = True) -> TrOCRRecognizer:
     torch = importlib.import_module("torch")
     transformers = importlib.import_module("transformers")
     try:
@@ -884,7 +936,26 @@ def _load_recognizer(path: Path, model_name: str, device: str) -> TrOCRRecognize
         ) from exc
     model.eval()
     model.to(torch.device(device))
+    if quantize and torch.device(device).type == "cpu":
+        _quantize_decoder(model)
     return TrOCRRecognizer(model, processor, model_name, device)
+
+
+def _quantize_decoder(model: Any) -> None:
+    """Quantizzazione dinamica int8 dei livelli lineari del *solo* decoder: circa
+    2x piu' veloce su CPU con letture identiche (l'encoder resta in float32:
+    quantizzato peggiora sensibilmente il riconoscimento)."""
+    import warnings  # noqa: PLC0415
+
+    torch = importlib.import_module("torch")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from torch.ao.quantization import quantize_dynamic  # noqa: PLC0415
+
+            model.decoder = quantize_dynamic(model.decoder, {torch.nn.Linear}, dtype=torch.qint8)
+    except Exception:  # noqa: BLE001 - facoltativa: senza quantizzazione funziona comunque
+        log.info("Quantizzazione del decoder non disponibile, uso float32", exc_info=True)
 
 
 # ==========================================================================
@@ -1044,7 +1115,7 @@ def model_image(crop: np.ndarray, min_aspect: float = 1.0) -> np.ndarray:
 # altezze di riga rispetto al bordo superiore dell'intestazione della tabella
 # (negative = sopra). Per ogni campo: (x0, x1, ordinata della riga di risposta).
 HEADER_LAYOUT: dict[str, tuple[float, float, float]] = {
-    "lotto": (0.258, 0.300, -3.42),
+    "lotto": (0.262, 0.300, -3.42),
     "municipalita": (0.372, 0.745, -3.42),
     "ente": (0.250, 0.745, -2.65),
     "istituto": (0.340, 0.745, -1.88),
@@ -1672,7 +1743,9 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
     if plan.header_ink.get("mese_anno"):
         reading = readings.get("header.mese_anno")
         dist, illegible = _lexicon_field(reading, "month")
-        fld = _Field(illeggibile=True) if illegible else _choose(dist)
+        worked = [g for g, st in plan.cells.items()
+                  if any(st.get(f) == TESTO for f in TEXT_FIELDS) or st.get("firma") == FIRMA]
+        fld = _Field(illeggibile=True) if illegible else _choose_month(dist, worked)
         if fld.illeggibile:
             header.illeggibili += ["mese", "anno"]
         elif fld.value is not None:
@@ -1728,6 +1801,54 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
         confidence=confidence,
         engine="locale",
     )
+
+
+W_CAL_SABATO = -0.5      # giorno lavorato di sabato (possibile)
+W_CAL_FESTIVO = -1.5     # giorno lavorato di domenica, festivo o inesistente nel mese
+
+
+def _month_prior(value: tuple[int, int], today: date | None = None) -> float:
+    """Preferenza per i mesi recenti: i fogli si rendicontano dopo il mese di riferimento."""
+    today = today or date.today()
+    m, y = value
+    ago = (today.year * 12 + today.month) - (y * 12 + m)
+    if ago < -1:
+        return -3.0
+    return -0.04 * max(0, ago - 1)
+
+
+def calendar_penalty(value: tuple[int, int], worked_days: Sequence[int]) -> float:
+    """Incoerenza fra mese/anno e giorni compilati: chi lavora di domenica o in
+    giorni inesistenti suggerisce una lettura sbagliata del mese o dell'anno."""
+    from sirio.calendario import tipo_giorno  # noqa: PLC0415
+
+    m, y = value
+    pen = 0.0
+    for g in worked_days:
+        try:
+            tipo = tipo_giorno(y, m, g)
+        except (ValueError, TypeError):
+            tipo = "inesistente"
+        if tipo == "sabato":
+            pen += W_CAL_SABATO
+        elif tipo != "feriale":
+            pen += W_CAL_FESTIVO
+    return pen
+
+
+def _choose_month(dist: list[tuple[Any, float]], worked_days: Sequence[int]) -> _Field:
+    """Mese/anno: lettura combinata con la coerenza del calendario dei giorni compilati."""
+    if not dist:
+        return _Field(illeggibile=True)
+    scored = [(v, lp + _month_prior(v) + calendar_penalty(v, worked_days)) for v, lp in dist]
+    z = _logsumexp(s for _v, s in scored)
+    scored = sorted(((v, s - z) for v, s in scored), key=lambda t: t[1], reverse=True)
+    v, lp = scored[0]
+    # la probabilita' riportata resta quella della lettura (non gonfiata dal calendario)
+    p_read = math.exp(next(l for vv, l in dist if vv == v))
+    p = min(p_read, math.exp(lp)) if v == dist[0][0] else math.exp(lp)
+    incerto = p < P_INCERTO or v != dist[0][0] and math.exp(lp) < 0.9
+    return _Field(value=v, confidence=p, incerto=incerto)
 
 
 def _choose_total(dist: list[tuple[Any, float]], somma: float, free_v: Any) -> _Field:

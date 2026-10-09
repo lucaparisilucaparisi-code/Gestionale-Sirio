@@ -22,7 +22,6 @@ from fastapi.testclient import TestClient
 
 from sirio import app as sirio_app
 from sirio import config, server
-from sirio.config import Settings
 from sirio.processing import Processor
 from sirio.store import DocumentStore
 from tests.fake_engine import FakeEngine
@@ -172,6 +171,8 @@ def test_index_injects_token_and_sets_cookie(env: Env) -> None:
 def test_static_files_no_cache_and_no_cors(env: Env) -> None:
     r = env.anon.get("/static/styles.css")
     assert r.status_code == 200 and r.headers["cache-control"] == "no-cache"
+    assert env.anon.get("/styles.css").text == r.text            # ripiego alla radice
+    assert env.anon.get("/manca.js").json() == {"detail": "Risorsa non trovata."}
     r = env.client.get("/api/state", headers={"Origin": "http://evil.example"})
     assert "access-control-allow-origin" not in {k.lower() for k in r.headers}
     r = env.client.options("/api/state", headers={

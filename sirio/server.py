@@ -1333,6 +1333,9 @@ def create_app(
         threading.Timer(0.2, _call, args=(on_shutdown, "arresto")).start()
         return _json({"ok": True})
 
+    # Ripiego: file dell'interfaccia anche alla radice (es. "app.js" referenziato in modo relativo).
+    # Montato per ultimo: le rotte precedenti hanno la precedenza.
+    app.mount("/", _NoCacheStaticFiles(directory=WEB_DIR, check_dir=False), name="web")
     return app
 
 

@@ -48,6 +48,7 @@ IDLE_TIMEOUT = 15 * 60.0     # nessun heartbeat (s)
 SUSPEND_GAP = 30.0           # pausa del ciclo oltre la quale si presume una sospensione del sistema
 INSTANCE_WAIT = 30.0         # attesa dell'istanza in avvio (s)
 SERVER_START_TIMEOUT = 20.0
+PROCESSOR_STOP_TIMEOUT = 5.0
 
 INSTANCE_FILE = "istanza.json"
 LOCK_FILE = "istanza.lock"
@@ -676,7 +677,8 @@ def main(argv: list[str] | None = None) -> int:
 def _shutdown(processor: Any, server: ServerThread | None, token: str, lock: InstanceLock) -> None:
     if processor is not None:
         try:
-            processor.stop()
+            # le letture ancora in corso dopo l'attesa riprendono al prossimo avvio
+            processor.stop(timeout=PROCESSOR_STOP_TIMEOUT)
         except Exception:  # noqa: BLE001
             log.exception("Arresto della coda di elaborazione non riuscito")
     if server is not None:
