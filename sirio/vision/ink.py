@@ -156,17 +156,25 @@ def _drop_line_remnants(ink: np.ndarray, h_lines: np.ndarray, v_lines: np.ndarra
     piece = max(6.0, 0.16 * bh)       # spessore massimo di uno spezzone di linea
     edge = 0.18 * bh
     reach = int(3 * bh)
+    lines = h_lines | v_lines
     drop = np.zeros(n, dtype=bool)
     for k in range(1, n):
         x, y, w, h, _ = (int(v) for v in stats[k])
         yc, xc = y + h / 2.0, x + w / 2.0
-        if h <= piece and w >= h and min(abs(yc - fy0), abs(yc - fy1)) <= edge:
+        near_h = min(abs(yc - fy0), abs(yc - fy1)) <= edge
+        near_v = min(abs(xc - fx0), abs(xc - fx1)) <= edge
+        # frammento minuscolo attaccato a una linea (es. negli incroci)
+        if (max(w, h) <= piece and (near_h or near_v)
+                and lines[max(0, y - 2):min(H, y + h + 2), max(0, x - 2):min(W, x + w + 2)].any()):
+            drop[k] = True
+            continue
+        if h <= piece and w >= h and near_h:
             band = h_lines[max(0, y - 1):min(H, y + h + 1)]
             left = band[:, max(0, x - reach):max(0, x - 1)].any()
             right = band[:, min(W, x + w + 1):min(W, x + w + reach)].any()
             if (h <= sliver and w >= 3 * h) or left or right:
                 drop[k] = True
-        elif w <= piece and h >= max(w, 0.6 * bh) and min(abs(xc - fx0), abs(xc - fx1)) <= edge:
+        elif w <= piece and h >= max(w, 0.6 * bh) and near_v:
             band = v_lines[:, max(0, x - 1):min(W, x + w + 1)]
             up = band[max(0, y - reach):max(0, y - 1)].any()
             down = band[min(H, y + h + 1):min(H, y + h + reach)].any()
@@ -255,9 +263,14 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
     empty.foreign = foreign
     if not owned.any():
         return empty
-    sel = owned[inner]
-    pixels = int(sel.sum())
-    if pixels == 0:
+    # le misure di forma usano solo i tratti significativi dentro la cella
+    # (un pixel isolato non deve allargare il riquadro dell'inchiostro)
+    major = owned & (inside >= min_area)
+    if not major.any():
+        major = owned
+    sel = major[inner]
+    pixels = int(owned[inner].sum())
+    if pixels == 0 or not sel.any():
         return empty
     ys, xs = np.nonzero(sel)
     comp_sizes = inside[owned]
