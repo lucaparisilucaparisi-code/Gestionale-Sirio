@@ -182,8 +182,9 @@ function renderKpis(root) {
       nav: '#/documenti?stato=errori',
     }),
     kpiCard({
-      tone: 'k-slate', ic: 'coin', label: 'Costo stimato', value: fmtUSD(k.costo_usd || 0),
-      foot: engine === 'claude' ? 'Letture con Claude Vision' : 'Motore locale gratuito',
+      tone: 'k-slate', ic: 'coin', label: 'Costo stimato',
+      value: (engine !== 'claude' && !(k.costo_usd > 0)) ? 'Gratuito' : fmtUSD(k.costo_usd || 0),
+      foot: engine === 'claude' ? 'Letture con Claude Vision' : 'Motore locale offline',
       tip: 'Stima del costo delle letture con Claude Vision (prezzi pubblici di Anthropic). Il motore locale non ha costi.',
     }),
   ];
