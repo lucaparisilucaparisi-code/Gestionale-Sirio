@@ -111,7 +111,7 @@ I fogli firma contengono dati personali di minori con disabilità (categorie
 particolari di dati, art. 9 GDPR).
 
 - Con il **motore Claude** le immagini dei fogli vengono inviate all'API di
-  Anthropic per la lettura. Anthropic non usa i dati inviati tramite API per
+  Anthropic per la lettura. Per impostazione predefinita Anthropic non usa i dati inviati tramite API per
   addestrare i modelli; valutate comunque con il vostro DPO la nomina a
   responsabile del trattamento e le condizioni contrattuali applicabili.
 - Con il **motore locale** tutto resta sul computer.
