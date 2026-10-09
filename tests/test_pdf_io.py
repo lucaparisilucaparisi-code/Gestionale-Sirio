@@ -43,7 +43,8 @@ def _rgb(img: np.ndarray) -> Image.Image:
 # --------------------------------------------------------------------------
 
 def test_supported_extensions_and_names():
-    assert pdf_io.SUPPORTED_EXTENSIONS == {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+    expected = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+    assert expected == pdf_io.SUPPORTED_EXTENSIONS
     assert pdf_io.is_supported("Foglio firma – città è ñ 日本.PDF")
     assert pdf_io.is_supported(r"C:\Scansioni\Febbraio\pagina.JpEg")
     assert pdf_io.is_supported("cartella/sotto/scan.tiff")
@@ -90,6 +91,21 @@ def test_pdf_page_rotation_is_applied(sheet):
     doc.close()
     (_, img), = list(pdf_io.iter_pages(data, "ruotato.pdf", dpi=100))
     assert img.shape[1] > img.shape[0]          # pagina orizzontale come la vede il lettore PDF
+
+
+def test_pdf_rendering_from_several_threads(sheet):
+    from concurrent.futures import ThreadPoolExecutor
+
+    data = sheet_to_pdf([sheet, sheet], dpi=150)
+
+    def render(_: int) -> list[np.ndarray]:
+        return [img for _, img in pdf_io.iter_pages(data, "parallelo.pdf", dpi=72)]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(render, range(8)))
+    for pages in results:
+        assert len(pages) == 2
+        assert all(np.array_equal(p, results[0][0]) for p in pages)
 
 
 def test_pdf_detected_by_content_even_with_wrong_extension(sheet):

@@ -28,12 +28,12 @@ from tests.synthetic import make_synthetic_sheet
 TIME_FIELDS = ("prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita")
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _sheet(seed: int = 0, skew: float = 0.0, dpi: int = 200) -> tuple[np.ndarray, dict]:
     return make_synthetic_sheet(seed=seed, skew_deg=skew, dpi=dpi)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _processed(seed: int = 0, skew: float = 0.0, dpi: int = 200) -> tuple[np.ndarray, TableGrid]:
     img, _ = _sheet(seed, skew, dpi)
     page = normalize_page(img)
@@ -272,6 +272,20 @@ def test_ink_classification_other_sheets(seed):
     _, truth = _sheet(seed, 0.0, 300)
     page, grid = _processed(seed, 0.0, 300)
     assert classification_errors(page, grid, truth) == []
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_footer_boxes_synthetic(present):
+    data = {"header": {"firma_coordinatore": present, "timbro_referente": present}}
+    img, truth = make_synthetic_sheet(seed=3, data=data)
+    page = normalize_page(img)
+    grid = detect_grid(page)
+    assert grid.detected
+    coord, stamp, total = grid.coordinator_signature_box(), grid.referent_stamp_box(), grid.total_value_box()
+    assert ink.has_signature(page, coord) is present
+    assert ink.is_blank(page, stamp) is not present
+    assert truth["header"]["totale_mensile_dichiarato"] == pytest.approx(49.5)
+    assert not ink.is_blank(page, total)
 
 
 def _cell_canvas() -> tuple[np.ndarray, TableGrid]:

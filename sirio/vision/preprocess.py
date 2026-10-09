@@ -316,23 +316,23 @@ def _table_chain(ys: list[int]) -> tuple[int, int, int] | None:
     return best
 
 
-def _upright_votes(bw: np.ndarray) -> int:
-    """Indizi di verso corretto (>0) o capovolto (<0) su un'immagine binaria con
-    le righe della tabella orizzontali e raddrizzata."""
+def _upright_votes(bw: np.ndarray) -> tuple[int, int]:
+    """Indizi di verso su un'immagine binaria con le righe della tabella
+    orizzontali: (margini, colonne), ciascuno +1 = diritto, -1 = capovolto, 0 = incerto."""
     h, w = bw.shape
     rows = _long_lines(bw, 0, 0.4)
     chain = _table_chain(rows)
     if chain is None or chain[2] < 12:
-        return 0
+        return 0, 0
     t0, t1, _ = chain
-    votes = 0
+    margin_vote = col_vote = 0
     top_margin = t0 / h
     bottom_margin = (h - t1) / h
     # Il modulo ha l'intestazione (testo) sopra la tabella e poco spazio sotto.
     if top_margin > bottom_margin + 0.04:
-        votes += 1
+        margin_vote = 1
     elif bottom_margin > top_margin + 0.04:
-        votes -= 1
+        margin_vote = -1
     # Colonna "Giorno" stretta a sinistra, colonne "Firma"/"Note" larghe a destra.
     band = bw[t0:t1 + 1]
     if band.shape[0] > 20:
@@ -345,10 +345,10 @@ def _upright_votes(bw: np.ndarray) -> int:
                 left = float(gaps[0])
                 right = float(gaps[-1])
                 if left < 0.6 * right:
-                    votes += 1
+                    col_vote = 1
                 elif right < 0.6 * left:
-                    votes -= 1
-    return votes
+                    col_vote = -1
+    return margin_vote, col_vote
 
 
 def _resize_long(gray: np.ndarray) -> tuple[np.ndarray, float]:
@@ -386,13 +386,17 @@ def detect_orientation(img: np.ndarray) -> int:
         ang, _ = _coarse_skew(cand)
         if abs(ang) >= MIN_SKEW_DEG:
             cand = _fix_binary(rotate_small_angle(cand, -ang))
-        votes = _upright_votes(cand)
-        return 270 if votes < 0 else 90
+        # il verso va scelto comunque: basta un indizio non contraddetto
+        margin_vote, col_vote = _upright_votes(cand)
+        return 270 if margin_vote + col_vote < 0 else 90
 
     if n_h < 12:
         return 0
-    votes = _upright_votes(_fix_binary(bw_h))
-    return 180 if votes < 0 else 0
+    # Capovolgimento solo con l'indizio piu' affidabile (colonne) non smentito
+    # dai margini: una pagina diritta non deve mai essere girata per errore
+    # (es. scansione con l'intestazione tagliata).
+    margin_vote, col_vote = _upright_votes(_fix_binary(bw_h))
+    return 180 if col_vote < 0 and margin_vote <= 0 else 0
 
 
 def _fix_binary(bw: np.ndarray) -> np.ndarray:

@@ -34,6 +34,7 @@ SIGNATURE_WIDTH = 0.22      # estensione orizzontale minima della firma (frazion
 CROSS_SPAN = 0.16           # estensione minima (larghezza e altezza) di una crocetta
 DASH_MAX_HEIGHT = 0.22      # altezza massima di un trattino (frazione della cella)
 DASH_MIN_ASPECT = 1.8       # rapporto larghezza/altezza minimo di un trattino
+SHARED_STROKE_RATIO = 0.045  # inchiostro minimo nella cella per un tratto condiviso con altre righe
 
 
 @dataclass
@@ -50,10 +51,22 @@ class CellInk:
     cy: float = 0.5             # baricentro verticale (0 = bordo superiore, 1 = inferiore)
     bbox: Box | None = None     # riquadro dell'inchiostro in coordinate dell'immagine
     foreign: float = 0.0        # inchiostro presente nella cella ma attribuito ad altre celle
+    cell_w: int = 0             # dimensioni della cella analizzata (pixel)
+    cell_h: int = 0
 
     @property
     def empty(self) -> bool:
         return self.pixels == 0
+
+    @property
+    def ink_w(self) -> float:
+        """Larghezza dell'inchiostro in pixel."""
+        return self.width_frac * self.cell_w
+
+    @property
+    def ink_h(self) -> float:
+        """Altezza dell'inchiostro in pixel."""
+        return self.height_frac * self.cell_h
 
 
 # --------------------------------------------------------------------------
@@ -92,19 +105,35 @@ def _ink_mask(gray: np.ndarray) -> np.ndarray:
     return gray < thr
 
 
-def _remove_grid_lines(ink: np.ndarray, line_len_x: int, line_len_y: int,
-                       grow: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
-    """Toglie le linee lunghe orizzontali/verticali. Restituisce (inchiostro, linee)."""
+def _remove_grid_lines(ink: np.ndarray, line_len_x: int, line_len_y: int, grow: float = 2.0,
+                       rows: list[tuple[int, int]] | None = None,
+                       cols: list[tuple[int, int]] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Toglie le linee lunghe orizzontali/verticali.
+
+    ``rows``/``cols`` (facoltativi) limitano le linee orizzontali/verticali alle
+    fasce in cui possono trovarsi i bordi della griglia: un tratto di scrittura
+    lungo e dritto in mezzo alla cella non viene scambiato per una linea.
+    Restituisce (inchiostro, linee orizzontali, linee verticali)."""
     m = ink.astype(np.uint8) * 255
     hl = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, line_len_x), 1)))
     vl = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, line_len_y))))
+    if rows is not None:
+        keep = np.zeros(hl.shape[0], dtype=bool)
+        for a, b in rows:
+            keep[max(0, a):max(0, b)] = True
+        hl[~keep, :] = 0
+    if cols is not None:
+        keep = np.zeros(vl.shape[1], dtype=bool)
+        for a, b in cols:
+            keep[max(0, a):max(0, b)] = True
+        vl[:, ~keep] = 0
     # allarga le linee trovate di qualche pixel nel verso dello spessore: i bordi
     # delle linee ondulate o sfrangiate non devono restare come "inchiostro"
     k = max(2, int(round(grow)))
     hl = cv2.dilate(hl, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2 * k + 1)))
     vl = cv2.dilate(vl, cv2.getStructuringElement(cv2.MORPH_RECT, (2 * k + 1, 3)))
-    lines = cv2.bitwise_or(hl, vl) > 0
-    return ink & ~lines, lines
+    h_lines, v_lines = hl > 0, vl > 0
+    return ink & ~(h_lines | v_lines), h_lines, v_lines
 
 
 def _line_kernel(extent: int, bh: int) -> int:
@@ -113,7 +142,8 @@ def _line_kernel(extent: int, bh: int) -> int:
     return int(max(1.4 * bh, min(0.45 * extent, 2.0 * bh)))
 
 
-def _drop_line_remnants(ink: np.ndarray, lines: np.ndarray, cell: Box, bh: int) -> np.ndarray:
+def _drop_line_remnants(ink: np.ndarray, h_lines: np.ndarray, v_lines: np.ndarray, cell: Box,
+                        bh: int) -> np.ndarray:
     """Elimina i frammenti di linea rimasti lungo i bordi della cella: bordi
     sfrangiati di linee ondulate (sottilissimi) e spezzoni di linee interrotte
     (allineati con il resto della linea gia' rimossa)."""
@@ -130,23 +160,17 @@ def _drop_line_remnants(ink: np.ndarray, lines: np.ndarray, cell: Box, bh: int) 
     for k in range(1, n):
         x, y, w, h, _ = (int(v) for v in stats[k])
         yc, xc = y + h / 2.0, x + w / 2.0
-        if w >= 3 * h and h <= piece and min(abs(yc - fy0), abs(yc - fy1)) <= edge:
-            if h <= sliver:
+        if h <= piece and w >= h and min(abs(yc - fy0), abs(yc - fy1)) <= edge:
+            band = h_lines[max(0, y - 1):min(H, y + h + 1)]
+            left = band[:, max(0, x - reach):max(0, x - 1)].any()
+            right = band[:, min(W, x + w + 1):min(W, x + w + reach)].any()
+            if (h <= sliver and w >= 3 * h) or left or right:
                 drop[k] = True
-                continue
-            band = lines[max(0, y - 1):min(H, y + h + 1)]
-            left = band[:, max(0, x - reach):max(0, x - 1)]
-            right = band[:, min(W, x + w + 1):min(W, x + w + reach)]
-            if left.any() or right.any():
-                drop[k] = True
-        elif h >= max(3 * w, 0.6 * bh) and w <= piece and min(abs(xc - fx0), abs(xc - fx1)) <= edge:
-            if w <= sliver:
-                drop[k] = True
-                continue
-            band = lines[:, max(0, x - 1):min(W, x + w + 1)]
-            up = band[max(0, y - reach):max(0, y - 1)]
-            down = band[min(H, y + h + 1):min(H, y + h + reach)]
-            if up.any() or down.any():
+        elif w <= piece and h >= max(w, 0.6 * bh) and min(abs(xc - fx0), abs(xc - fx1)) <= edge:
+            band = v_lines[:, max(0, x - 1):min(W, x + w + 1)]
+            up = band[max(0, y - reach):max(0, y - 1)].any()
+            down = band[min(H, y + h + 1):min(H, y + h + reach)].any()
+            if (w <= sliver and h >= 3 * w) or up or down:
                 drop[k] = True
     if not drop.any():
         return ink
@@ -165,8 +189,9 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
     """
     x0, y0, x1, y1 = _norm_box(img, box)
     bw, bh = x1 - x0, y1 - y0
+    empty = CellInk(cell_w=max(0, bw), cell_h=max(0, bh))
     if bw < 4 or bh < 4:
-        return CellInk()
+        return empty
     H, W = img.shape[:2]
     # Zona estesa: righe sopra e sotto (per attribuire i tratti che debordano)
     # e un po' di contesto a sinistra e a destra.
@@ -177,10 +202,16 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
     gray = to_gray(img[ey0:ey1, ex0:ex1])
     ink = _ink_mask(gray)
     ew, eh = ex1 - ex0, ey1 - ey0
-    ink, lines = _remove_grid_lines(ink, _line_kernel(ew, bh), _line_kernel(eh, bh))
-
     fx0, fy0, fx1, fy1 = x0 - ex0, y0 - ey0, x1 - ex0, y1 - ey0
-    ink = _drop_line_remnants(ink, lines, (fx0, fy0, fx1, fy1), bh)
+    # le linee della griglia possono stare solo attorno ai bordi della cella
+    tol = int(round(0.3 * bh)) + 1
+    ink, h_lines, v_lines = _remove_grid_lines(
+        ink, _line_kernel(ew, bh), _line_kernel(eh, bh),
+        rows=[(fy0 - tol, fy0 + tol), (fy1 - tol, fy1 + tol)],
+        cols=[(fx0 - tol, fx0 + tol), (fx1 - tol, fx1 + tol)],
+    )
+    lines = h_lines | v_lines
+    ink = _drop_line_remnants(ink, h_lines, v_lines, (fx0, fy0, fx1, fy1), bh)
 
     # Connettivita': i pixel di linea vicini ai tratti vengono rimessi solo per
     # ricucire i tratti che attraversano una linea (es. l'asta di una firma che
@@ -191,7 +222,7 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
     conn = (ink | (lines & near)).astype(np.uint8)
     n, labels = cv2.connectedComponents(conn, connectivity=8)
     if n <= 1:
-        return CellInk()
+        return empty
 
     lab = np.where(ink, labels, 0)
     total = np.bincount(lab.ravel(), minlength=n)
@@ -201,7 +232,7 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
     cx0, cy0 = fx0 + mx, fy0 + my
     cx1, cy1 = fx1 - mx, fy1 - my
     if cx1 <= cx0 or cy1 <= cy0:
-        return CellInk()
+        return empty
     inner = lab[cy0:cy1, cx0:cx1]
     inside = np.bincount(inner.ravel(), minlength=n)
     # pixel nella cella vera (senza margine): per l'attribuzione
@@ -213,18 +244,21 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
         if total[k] < min_area or inside[k] == 0:
             continue
         share = in_cell[k] / float(total[k])
-        # parte maggiore nella cella, oppure grande quantita' d'inchiostro nella
-        # cella (due firme consecutive che si toccano)
-        if share >= 0.5 or (share >= 0.3 and in_cell[k] >= 0.02 * bw * bh):
+        # parte maggiore nella cella, oppure molto inchiostro dentro la cella:
+        # firme (o scritte) di righe consecutive che si toccano formano un solo
+        # tratto, ma ognuna riempie la propria cella; le code che debordano
+        # dalle righe vicine restano invece ben sotto questa soglia.
+        if share >= 0.5 or (share >= 0.15 and in_cell[k] >= SHARED_STROKE_RATIO * bw * bh):
             owned[k] = True
     area = float((cx1 - cx0) * (cy1 - cy0))
     foreign = float(inside[1:][~owned[1:]].sum()) / area if area > 0 else 0.0
+    empty.foreign = foreign
     if not owned.any():
-        return CellInk(foreign=foreign)
+        return empty
     sel = owned[inner]
     pixels = int(sel.sum())
     if pixels == 0:
-        return CellInk(foreign=foreign)
+        return empty
     ys, xs = np.nonzero(sel)
     comp_sizes = inside[owned]
     bx0, bx1 = int(xs.min()), int(xs.max()) + 1
@@ -240,6 +274,8 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
         cy=(float(ys.mean()) + my) / bh,
         bbox=(x0 + mx + bx0, y0 + my + by0, x0 + mx + bx1, y0 + my + by1),
         foreign=foreign,
+        cell_w=bw,
+        cell_h=bh,
     )
 
 
@@ -258,7 +294,7 @@ def ink_ratio(img: np.ndarray, box: Box, margin: float = 0.12, remove_lines: boo
         ex0, ex1 = max(0, x0 - bh // 2), min(W, x1 + bh // 2)
         ey0, ey1 = max(0, y0 - bh // 2), min(H, y1 + bh // 2)
         ink = _ink_mask(to_gray(img[ey0:ey1, ex0:ex1]))
-        ink, _ = _remove_grid_lines(ink, _line_kernel(ex1 - ex0, bh), _line_kernel(ey1 - ey0, bh))
+        ink, _, _ = _remove_grid_lines(ink, _line_kernel(ex1 - ex0, bh), _line_kernel(ey1 - ey0, bh))
         sub = ink[y0 - ey0 + my:y1 - ey0 - my, x0 - ex0 + mx:x1 - ex0 - mx]
     else:
         sub = _ink_mask(to_gray(img[y0:y1, x0:x1]))[my:bh - my, mx:bw - mx]
@@ -271,31 +307,28 @@ def ink_ratio(img: np.ndarray, box: Box, margin: float = 0.12, remove_lines: boo
 # Classificazione
 # --------------------------------------------------------------------------
 
-def _is_speck(info: CellInk, box: Box) -> bool:
+def _is_speck(info: CellInk) -> bool:
     """Puntino isolato (polvere, punto di penna): piccolo e non allungato."""
-    bw = max(1, box[2] - box[0])
-    bh = max(1, box[3] - box[1])
-    w_px = info.width_frac * bw
-    h_px = info.height_frac * bh
-    return max(w_px, h_px) < 0.22 * bh and w_px < DASH_MIN_ASPECT * max(h_px, 1.0)
+    w_px, h_px = info.ink_w, info.ink_h
+    return max(w_px, h_px) < 0.22 * info.cell_h and w_px < DASH_MIN_ASPECT * max(h_px, 1.0)
 
 
 def is_blank(img: np.ndarray, box: Box) -> bool:
     """True se nella cella non c'e' inchiostro proprio (puntini, residui di
     linee e code di firme delle righe vicine non contano)."""
     info = analyze_cell(img, box)
-    return info.ratio < BLANK_RATIO or _is_speck(info, box)
+    return info.ratio < BLANK_RATIO or _is_speck(info)
 
 
 def has_cross(img: np.ndarray, box: Box) -> bool:
     """True se nella cella (colonne di assenza) c'e' una crocetta."""
     info = analyze_cell(img, box, margin=0.06)
-    if info.ratio < BLANK_RATIO:
+    if info.ratio < BLANK_RATIO or _is_speck(info):
         return False
     if info.width_frac < CROSS_SPAN or info.height_frac < CROSS_SPAN:
         return False
     # un trattino orizzontale o una barretta verticale non sono crocette
-    aspect = info.width_frac * (box[2] - box[0]) / max(1e-6, info.height_frac * (box[3] - box[1]))
+    aspect = info.ink_w / max(1e-6, info.ink_h)
     return 0.25 <= aspect <= 4.5
 
 
@@ -308,14 +341,22 @@ def has_signature(img: np.ndarray, box: Box) -> bool:
 def is_dash(img: np.ndarray, box: Box) -> bool:
     """True se la cella contiene soltanto un trattino ("-")."""
     info = analyze_cell(img, box)
-    if info.ratio < BLANK_RATIO * 0.5 or info.pixels == 0:
+    if info.ratio < BLANK_RATIO or info.pixels == 0:
         return False
-    bw = box[2] - box[0]
-    bh = box[3] - box[1]
-    w_px = info.width_frac * bw
-    h_px = info.height_frac * bh
-    if info.height_frac > DASH_MAX_HEIGHT or w_px < DASH_MIN_ASPECT * h_px:
+    if info.height_frac > DASH_MAX_HEIGHT or info.ink_w < DASH_MIN_ASPECT * info.ink_h:
         return False
     if info.width_frac < 0.05 or info.width_frac > 0.7:
         return False
     return info.n_components <= 2 and info.largest_frac >= 0.75
+
+
+__all__ = [
+    "CellInk",
+    "analyze_cell",
+    "crop",
+    "has_cross",
+    "has_signature",
+    "ink_ratio",
+    "is_blank",
+    "is_dash",
+]

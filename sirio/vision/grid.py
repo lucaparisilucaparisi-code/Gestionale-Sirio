@@ -192,7 +192,7 @@ class TableGrid:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "TableGrid":
+    def from_dict(cls, d: dict) -> TableGrid:
         try:
             col_x = [int(v) for v in d["col_x"]]
             row_y = [int(v) for v in d["row_y"]]
@@ -215,7 +215,7 @@ class TableGrid:
             raise ValueError("Descrizione della griglia non valida: dimensioni non positive.")
         return grid
 
-    def scaled(self, sx: float, sy: float) -> "TableGrid":
+    def scaled(self, sx: float, sy: float) -> TableGrid:
         """Stessa griglia per un'immagine ridimensionata di (sx, sy)."""
         return TableGrid(
             width=max(1, int(round(self.width * sx))),
@@ -351,7 +351,7 @@ def _fit_columns(vlines: list[_Line], x_left: float, x_right: float, w: int) -> 
         pos: list[float] = []
         found = 0
         score = 0.0
-        for j, f in enumerate(fr):
+        for f in fr:
             pred = a + f * tw
             tol = 0.32 * min_gap * tw
             d = np.abs(xs - pred)

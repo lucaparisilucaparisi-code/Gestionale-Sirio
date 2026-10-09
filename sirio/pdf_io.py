@@ -16,6 +16,7 @@ import io
 import logging
 import math
 import os
+import threading
 from collections.abc import Iterator
 
 import cv2
@@ -105,6 +106,9 @@ def _detect_kind(data: bytes, filename: str) -> str:
 # --------------------------------------------------------------------------
 
 _pymupdf_ready = False
+# MuPDF non e' garantito thread-safe: ogni chiamata a PyMuPDF avviene sotto
+# questo lock (mai tenuto tra una pagina restituita e la successiva).
+_MUPDF_LOCK = threading.RLock()
 
 
 def _pymupdf():
@@ -124,6 +128,19 @@ def _pymupdf():
 
 
 def _open_pdf(data: bytes, filename: str):
+    with _MUPDF_LOCK:
+        return _open_pdf_locked(data, filename)
+
+
+def _close_pdf(doc) -> None:
+    with _MUPDF_LOCK:
+        try:
+            doc.close()
+        except Exception:  # noqa: BLE001
+            log.debug("Chiusura del PDF non riuscita", exc_info=True)
+
+
+def _open_pdf_locked(data: bytes, filename: str):
     pymupdf = _pymupdf()
     name = _display_name(filename)
     try:
@@ -175,11 +192,15 @@ def _iter_pdf(data: bytes, filename: str, dpi: int) -> Iterator[tuple[int, np.nd
     doc = _open_pdf(data, filename)
     name = _display_name(filename)
     try:
-        for i in range(doc.page_count):
+        with _MUPDF_LOCK:
+            n_pages = int(doc.page_count)
+        for i in range(n_pages):
             try:
-                page = doc.load_page(i)
-                pix = _render_page(page, dpi)
-                img = _pixmap_to_bgr(pix)
+                with _MUPDF_LOCK:
+                    page = doc.load_page(i)
+                    pix = _render_page(page, dpi)
+                    img = _pixmap_to_bgr(pix)
+                    del pix, page
             except ValueError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -188,7 +209,7 @@ def _iter_pdf(data: bytes, filename: str, dpi: int) -> Iterator[tuple[int, np.nd
                 ) from exc
             yield i, img
     finally:
-        doc.close()
+        _close_pdf(doc)
 
 
 # --------------------------------------------------------------------------
@@ -253,8 +274,7 @@ def _image_frames(im: Image.Image) -> Iterator[Image.Image]:
     if n <= 1:
         yield im
         return
-    for frame in ImageSequence.Iterator(im):
-        yield frame
+    yield from ImageSequence.Iterator(im)
 
 
 def _limit_image(img: np.ndarray, dpi: int, source_dpi: float | None) -> np.ndarray:
@@ -307,9 +327,10 @@ def count_pages(data: bytes, filename: str) -> int:
     if kind == "pdf":
         doc = _open_pdf(data, filename)
         try:
-            return int(doc.page_count)
+            with _MUPDF_LOCK:
+                return int(doc.page_count)
         finally:
-            doc.close()
+            _close_pdf(doc)
     im = _open_image(data, filename)
     try:
         return max(1, int(getattr(im, "n_frames", 1) or 1))

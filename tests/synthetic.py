@@ -129,6 +129,9 @@ def _merge_data(data: dict | None) -> dict:
             if 1 <= g <= 31:
                 by_day[g] = {**_row(g), **copy.deepcopy(r)}
         out["rows"] = [by_day[g] for g in range(1, 32)]
+        if "totale_mensile_dichiarato" not in data.get("header", {}):
+            hours = [r["ore_dichiarate"] for r in out["rows"] if r.get("ore_dichiarate") is not None]
+            out["header"]["totale_mensile_dichiarato"] = float(sum(hours)) if hours else None
     return out
 
 
@@ -138,6 +141,11 @@ def _merge_data(data: dict | None) -> dict:
 
 def _blend(canvas: np.ndarray, alpha: np.ndarray, x: int, y: int, color: tuple[int, int, int]) -> None:
     """Compone ``alpha`` (0..255) sul canvas con il colore dato (l'inchiostro scurisce)."""
+    bx, by, bw, bh = cv2.boundingRect(alpha)      # solo la zona effettivamente disegnata
+    if bw == 0 or bh == 0:
+        return
+    alpha = alpha[by:by + bh, bx:bx + bw]
+    x, y = x + bx, y + by
     h, w = alpha.shape
     H, W = canvas.shape[:2]
     x0, y0 = max(0, x), max(0, y)
@@ -438,6 +446,14 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
     for j in (6, 9, 10):
         vline(col_x[j], tbot, rbot)
 
+    # interruzioni casuali delle linee (prima della scrittura, che non va cancellata)
+    if noise:
+        for _ in range(int(rng.integers(6, 14))):
+            y = row_y[int(rng.integers(0, 32))]
+            x = rng.uniform(tx0, tx1)
+            gl = rng.uniform(2, 0.006 * W)
+            cv2.rectangle(img, (int(x), int(y - lt)), (int(x + gl), int(y + lt)), (paper,) * 3, -1)
+
     # --- intestazione della tabella
     th_h = 0.62 * u
 
@@ -468,6 +484,9 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
     _print(img, "Timbro e firma Referente Scolastico", col_x[6] + 0.004 * W, (tbot + rbot) / 2 + 0.3 * u,
            0.62 * u, bold=True)
     _print(img, "Napoli, ___/___/______", col_x[0], 0.967 * H, 0.62 * u, bold=True)
+    if hdr.get("data_compilazione"):
+        _hand(img, str(hdr["data_compilazione"]), col_x[0] + _text_width("Napoli, ", 0.62 * u, True),
+              0.967 * H - 0.15 * u, 1.0 * u, rng, pen)
 
     # --- righe giornaliere
     text_h = rh * 0.42
@@ -476,7 +495,7 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
         g = int(r["giorno"])
         ya, yb = row_y[g - 1], row_y[g]
 
-        def cell(j: int) -> tuple[float, float, float, float]:
+        def cell(j: int, ya: float = ya, yb: float = yb) -> tuple[float, float, float, float]:
             return col_x[j], ya, col_x[j + 1], yb
 
         for j, key in ((1, "prog_entrata"), (2, "prog_uscita"), (3, "eff_entrata"), (4, "eff_uscita")):
@@ -518,12 +537,6 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
 
     # --- rumore di scansione
     if noise:
-        # interruzioni casuali delle linee della tabella
-        for _ in range(int(rng.integers(6, 14))):
-            y = row_y[int(rng.integers(0, 32))]
-            x = rng.uniform(tx0, tx1)
-            gl = rng.uniform(2, 0.006 * W)
-            cv2.rectangle(img, (int(x), int(y - lt)), (int(x + gl), int(y + lt)), (paper,) * 3, -1)
         # puntini e polvere
         n = int(W * H / 6000)
         ys = rng.integers(0, H, n)
