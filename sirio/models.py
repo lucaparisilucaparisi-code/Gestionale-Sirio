@@ -62,7 +62,7 @@ class Header(BaseModel):
     lotto: str | None = None                    # es. "1"
     municipalita: str | None = None             # es. "2"
     ente: str | None = None                     # es. "Cooperativa Sociale Sirio"
-    istituto: str | None = None                 # es. "IC 9 Cuoco-Schipa"
+    istituto: str | None = None                 # es. "IC 12 Vittorio Emanuele"
     operatore: str | None = None                # "COGNOME NOME" come scritto
     alunno: str | None = None
     mese: int | None = None                     # 1..12 (MESE/ANNO DI RIF.)

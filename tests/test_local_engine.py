@@ -260,6 +260,107 @@ def test_assemble_column_pattern_flags_unusual_values():
     assert all(not res.rows[g - 1].incerti for g in range(2, 7))
 
 
+def _row_readings(g: int, a: str = "08:00", b: str = "11:00", ore: float = 3.0) -> dict[str, le.Reading]:
+    """Riga completa letta con sicurezza (programmato = effettivo, ore coerenti)."""
+    return {f"rows.{g}.prog_entrata": _time(a), f"rows.{g}.prog_uscita": _time(b),
+            f"rows.{g}.eff_entrata": _time(a), f"rows.{g}.eff_uscita": _time(b),
+            f"rows.{g}.ore_dichiarate": le.Reading([(ore, -0.05)], _fmt_hours(ore), -0.06, 2)}
+
+
+def _faint(value: str, alt: str, free: str = "thios .") -> le.Reading:
+    """Scrittura poco leggibile: fra i valori ammessi la lettura preferisce nettamente
+    ``value`` (circa 90%), ma la lettura libera e' una parola molto piu' probabile."""
+    return le.Reading([(value, -4.0), (alt, -6.3)], free, -0.3, 3)
+
+
+FULL_ROW = {f: le.TESTO for f in le.TEXT_FIELDS} | {"firma": le.FIRMA}
+
+
+def test_assemble_confirms_faint_reading_implied_by_solid_cells():
+    plan = _plan_with({g: FULL_ROW for g in (2, 3, 4)})
+    readings = {**_row_readings(2), **_row_readings(3), **_row_readings(4)}
+    # giorno 2: uscita effettiva poco leggibile ma letta come 11:00, che e' anche quanto
+    # impongono l'uscita programmata e entrata + ore (celle sicure) -> confermata
+    readings["rows.2.eff_uscita"] = _faint("11:00", "11:30")
+    # giorno 3: stessa scrittura poco leggibile, ma la lettura preferisce 14:00: il valore
+    # scelto (11:00) viene solo dal contesto e resta da verificare
+    readings["rows.3.eff_uscita"] = _faint("14:00", "11:00")
+    # giorno 4: due celle poco leggibili che si confermerebbero solo a vicenda
+    readings["rows.4.eff_entrata"] = _faint("08:00", "08:30")
+    readings["rows.4.eff_uscita"] = _faint("11:00", "11:30")
+    readings["rows.4.prog_entrata"] = _faint("08:00", "09:00")
+    readings["rows.4.prog_uscita"] = _faint("11:00", "12:00")
+    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    r2, r3, r4 = res.rows[1], res.rows[2], res.rows[3]
+    assert r2.eff_uscita == "11:00" and "eff_uscita" not in r2.incerti
+    assert r2.confidenza["eff_uscita"] >= le.CONF_CONFERMA
+    assert "confermati dalla coerenza" in (res.ocr_notes or "")
+    assert r3.eff_uscita == "11:00" and "eff_uscita" in r3.incerti
+    assert {"prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita"} <= set(r4.incerti)
+    assert (r4.prog_entrata, r4.prog_uscita, r4.eff_entrata, r4.eff_uscita) == ("08:00", "11:00", "08:00", "11:00")
+
+
+def test_assemble_confirmation_respects_hours_inconsistency():
+    plan = _plan_with({2: FULL_ROW})
+    readings = _row_readings(2)
+    readings["rows.2.ore_dichiarate"] = le.Reading([(2.5, -0.05)], "2,5", -0.06, 3)
+    # uscita poco leggibile letta come 11:00 = uscita programmata, ma entrata 8:00 + 2,5 ore
+    # (celle sicure) darebbero 10:30: la relazione orari/ore e' violata -> resta incerta
+    readings["rows.2.eff_uscita"] = _faint("11:00", "10:30")
+    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    assert "eff_uscita" in res.rows[1].incerti
+
+
+def test_assemble_flags_programmed_effective_mismatch_with_plausible_misreading():
+    plan = _plan_with({2: FULL_ROW, 3: FULL_ROW})
+    readings = {**_row_readings(2, "09:00", "13:00", 4.0), **_row_readings(3, "08:00", "11:00", 3.0)}
+    # "13:00" letto con sicurezza come 13:30 nell'orario programmato (13:00 fra le
+    # alternative), mentre effettivo e ore dicono 13:00: va segnalato
+    readings["rows.2.prog_uscita"] = le.Reading([("13:30", -0.1), ("13:00", -3.0)], "13.30", -0.12, 4)
+    # ritardo vero: entrata effettiva 8:30, giustificata da uscita - ore; l'8:00
+    # programmato non ha 8:30 fra le letture -> nessuna segnalazione
+    readings["rows.3.eff_entrata"] = le.Reading([("08:30", -0.05), ("08:00", -3.5)], "8:30", -0.06, 4)
+    readings["rows.3.ore_dichiarate"] = le.Reading([(2.5, -0.05)], "2,5", -0.06, 3)
+    readings["rows.3.prog_entrata"] = le.Reading([("08:00", -0.05), ("08:30", -6.0)], "8:00", -0.06, 4)
+    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    r2, r3 = res.rows[1], res.rows[2]
+    assert r2.prog_uscita == "13:30" and "prog_uscita" in r2.incerti
+    assert r2.eff_uscita == "13:00" and "eff_uscita" not in r2.incerti
+    assert (r3.prog_entrata, r3.eff_entrata, r3.ore_dichiarate) == ("08:00", "08:30", 2.5)
+    assert not r3.incerti
+
+
+def test_programmed_time_confirmed_by_weekly_schedule():
+    prog_only = {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO, "note": le.TESTO}
+    days = (2, 9, 16, 23)          # stesso giorno della settimana
+    readings = {}
+    for g in days:
+        readings[f"rows.{g}.prog_entrata"] = _time("08:00")
+        readings[f"rows.{g}.prog_uscita"] = _time("11:00")
+        readings[f"rows.{g}.note"] = le.Reading([("FESTIVO", -0.2)], "Festivo", -0.2, 3)
+    # lettura incerta (copertura ~0,27: "8.80"), ma fra gli orari ammessi preferisce 08:00
+    readings["rows.16.prog_entrata"] = le.Reading([("08:00", -1.6), ("09:00", -3.8)], "8.80", -0.6, 4)
+    plan = _plan_with({g: prog_only for g in days})
+    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    assert res.rows[15].prog_entrata == "08:00" and "prog_entrata" not in res.rows[15].incerti
+    # un giorno della stessa settimana con un orario diverso: nessuna conferma
+    readings["rows.9.prog_entrata"] = _time("09:00")
+    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    assert "prog_entrata" in res.rows[15].incerti
+
+
+def test_free_reading_outside_form_rules_does_not_block_confirmation():
+    plan = _plan_with({2: FULL_ROW, 3: FULL_ROW})
+    readings = {**_row_readings(2), **_row_readings(3)}
+    # lettura libera "11.10" (minuti non a quarti d'ora: cifra letta male) -> confermabile
+    readings["rows.2.eff_uscita"] = le.Reading([("11:00", -0.2), ("11:30", -2.5)], "11.10", -0.15, 4)
+    # lettura libera "11.30" (orario ammesso diverso) -> resta da verificare
+    readings["rows.3.eff_uscita"] = le.Reading([("11:00", -0.2), ("11:30", -2.5)], "11.30", -0.15, 4)
+    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    assert res.rows[1].eff_uscita == "11:00" and "eff_uscita" not in res.rows[1].incerti
+    assert res.rows[2].eff_uscita == "11:00" and "eff_uscita" in res.rows[2].incerti
+
+
 def test_notes_snap_to_recurring_phrases_and_neighbours():
     plan = _plan_with({16: {"note": le.TESTO}, 17: {"note": le.TESTO}, 18: {"note": le.TESTO}})
     readings = {
@@ -481,42 +582,82 @@ needs_model = pytest.mark.skipif(_hf_cache() is None,
                                  reason="modello TrOCR non presente nella cache SIRIO_HF_CACHE")
 
 
+@functools.cache
+def _real_recognizer() -> le.TrOCRRecognizer:
+    return le._load_recognizer(le.local_model_path(le.DEFAULT_MODEL, _hf_cache()), le.DEFAULT_MODEL, "cpu")
+
+
 @needs_model
-def test_fast_decoding_matches_reference_search():
+def test_batched_decoding_matches_reference_search():
+    """Le ricerche fatte avanzare insieme per piu' ritagli danno gli stessi punteggi
+    della decodifica di riferimento (un ritaglio alla volta, senza cache)."""
     pytest.importorskip("torch")
     import torch
 
     img, grid, _truth = _synthetic(0)
     plan = le.plan_page(img, grid)
-    reqs = [r for r in plan.requests if r.key.endswith(("prog_entrata", "ore_dichiarate"))][:4]
-    path = le.local_model_path(le.DEFAULT_MODEL, _hf_cache())
-    # senza quantizzazione: le due decodifiche devono dare gli stessi punteggi
-    rec = le._load_recognizer(path, le.DEFAULT_MODEL, "cpu", quantize=False)
+    reqs = [r for r in plan.requests if r.key.endswith(("prog_entrata", "ore_dichiarate"))][:3]
+    rec = _real_recognizer()
     with torch.inference_mode():
-        for req in reqs:
-            enc = rec.encode([req.image])
-            fast = rec._search(enc, rec._start(enc), 4, req.lexicon.max_chars, req.lexicon, None, False)
-            slow = rec._search_slow(enc, 4, req.lexicon.max_chars, req.lexicon, None)
+        enc = rec.encode([r.image for r in reqs])
+        cross = rec._cross_kv(enc)
+        n = len(reqs)
+        start = torch.full((n,), rec.start_id, dtype=torch.long)
+        lps, cache = rec._step(start, 0, None, cross, torch.arange(n))
+        jobs = [rec._new_job(i, r, True) for i, r in enumerate(reqs)]
+        jobs += [rec._new_job(i, r, False) for i, r in enumerate(reqs)]
+        rec._run(jobs, cache, lps, cross)
+        for i, req in enumerate(reqs):
+            lex_job, free_job = jobs[i], jobs[n + i]
+            slow = rec._search_slow(enc[i:i + 1], lex_job.width, lex_job.max_steps, req.lexicon, None)
             slow_scores = {(key, ids): score for key, ids, score in slow}
-            common = [(f, slow_scores[(f[0], f[1])]) for f in fast if (f[0], f[1]) in slow_scores]
+            common = [(f, slow_scores[(f[0], f[1])]) for f in lex_job.finished if (f[0], f[1]) in slow_scores]
             assert common, req.key
             for (_key, _ids, score), ref in common:
                 assert abs(score - ref) < 1e-3
-            best_fast = max(fast, key=lambda f: f[2])
+            best_fast = max(lex_job.finished, key=lambda f: f[2])
             best_slow = max(slow, key=lambda f: f[2])
             assert req.lexicon.complete(best_fast[0]) == req.lexicon.complete(best_slow[0])
+            # lettura libera "golosa": identica alla ricerca di riferimento con un solo fascio
+            slow_free = rec._search_slow(enc[i:i + 1], 1, req.max_tokens, None, req.charset)
+            best = max(free_job.finished, key=lambda f: rec._rank(f, True))
+            ref = max(slow_free, key=lambda f: rec._rank(f, True))
+            assert best[1] == ref[1] and abs(best[2] - ref[2]) < 1e-3
 
 
-# Soglie minime sul foglio reale (misurate: vedi docstring del modulo del motore).
+@needs_model
+def test_readings_do_not_depend_on_batch_composition():
+    """Ordine dei risultati preservato e lettura di un ritaglio indipendente dagli
+    altri ritagli letti insieme (pesi in float32, nessuna quantizzazione per lotto)."""
+    img, grid, _truth = _synthetic(0)
+    plan = le.plan_page(img, grid)
+    reqs = [r for r in plan.requests if r.key.startswith("rows.")][:4]
+    reqs += [r for r in plan.requests if r.key == "header.lotto"]
+    rec = _real_recognizer()
+    together = rec.read(reqs)
+    alone = [rec.read([r])[0] for r in reversed(reqs)][::-1]
+    for req, a, b in zip(reqs, together, alone):
+        assert [v for v, _ in a.candidates[:3]] == [v for v, _ in b.candidates[:3]], req.key
+        for (_va, la), (_vb, lb) in zip(a.candidates[:3], b.candidates[:3]):
+            assert abs(la - lb) < 1e-3, req.key
+        assert a.free_text == b.free_text, req.key
+
+
+# Soglie minime sul foglio reale (misurate: vedi docstring del modulo del motore;
+# un errore in piu' di quelli misurati e' tollerato per le differenze di arrotondamento
+# fra CPU diverse).
 MIN_ACCURACY = {
-    "orari": 0.90,
-    "ore": 0.90,
+    "orari": 0.94,           # misurato 69/72
+    "ore": 0.94,             # misurato 17/17
     "assenze": 1.0,
     "firme": 1.0,
     "trattini": 1.0,
-    "note": 0.90,
-    "intestazione": 0.85,
+    "note": 0.90,            # misurato 31/31
+    "intestazione": 0.85,    # misurato 10/10
 }
+# Orari corretti ma segnalati come incerti (lavoro di verifica inutile per l'utente):
+# misurati 16 su 69 (prima della conferma per coerenza erano 21).
+MAX_FALSI_INCERTI_ORARI = 18
 
 
 @needs_model
@@ -535,31 +676,33 @@ def test_accuracy_on_real_sample():
     assert res.is_foglio_firma
 
     score: dict[str, list[int]] = {k: [0, 0] for k in MIN_ACCURACY}
-    flagged_errors = errors = 0
+    unflagged: list[tuple] = []          # errori su orari/ore non segnalati
+    false_doubts = 0                     # orari corretti segnalati come incerti
 
-    def add(cat: str, ok: bool, flagged: bool = False) -> None:
-        nonlocal flagged_errors, errors
+    def add(cat: str, ok: bool) -> None:
         score[cat][0] += int(ok)
         score[cat][1] += 1
-        if not ok:
-            errors += 1
-            flagged_errors += int(flagged)
 
     for t, r in zip(truth["rows"], res.rows):
-        for f in TIME_FIELDS:
-            if t[f] is not None or getattr(r, f) is not None:
-                add("orari", getattr(r, f) == t[f], f in r.incerti or f in r.illeggibili)
-        if t["ore_dichiarate"] is not None or r.ore_dichiarate is not None:
-            add("ore", r.ore_dichiarate == t["ore_dichiarate"], "ore_dichiarate" in r.incerti + r.illeggibili)
+        doubtful = set(r.incerti) | set(r.illeggibili)
+        for f in (*TIME_FIELDS, "ore_dichiarate"):
+            if t[f] is None and getattr(r, f) is None and f not in r.illeggibili:
+                continue
+            ok = getattr(r, f) == t[f]
+            add("ore" if f == "ore_dichiarate" else "orari", ok)
+            if not ok and f not in doubtful:
+                unflagged.append((t["giorno"], f, getattr(r, f), t[f]))
+            false_doubts += int(ok and f in doubtful and f != "ore_dichiarate")
         for f in ("assenza_alunno", "assenza_operatore"):
             add("assenze", getattr(r, f) == t[f])
         add("firme", r.firma == t["firma"])
         add("trattini", r.trattino_effettivo == t["trattino_effettivo"])
-        add("note", (r.note or "").upper() == (t["note"] or "").upper(), "note" in r.incerti + r.illeggibili)
+        add("note", (r.note or "").upper() == (t["note"] or "").upper())
     for f in ("lotto", "municipalita", "mese", "anno", "ore_pei", "firma_coordinatore", "timbro_referente",
               "totale_mensile_dichiarato", "anno_scolastico", "sostituzione"):
         add("intestazione", getattr(res.header, f) == truth["header"].get(f))
     for cat, (ok, n) in score.items():
         assert n and ok / n >= MIN_ACCURACY[cat], (cat, ok, n)
-    # gli errori residui sugli orari e sulle ore devono essere segnalati (incerti/illeggibili)
-    assert flagged_errors >= errors - 1
+    # ogni errore residuo su orari e ore deve essere segnalato (incerto o illeggibile)
+    assert not unflagged, unflagged
+    assert false_doubts <= MAX_FALSI_INCERTI_ORARI, false_doubts

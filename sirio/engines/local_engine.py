@@ -11,12 +11,13 @@ Pipeline di una pagina
    dell'intestazione vengono cercati sulle righe di risposta a destra delle
    etichette stampate (posizioni misurate sul modulo reale, affinate con le
    linee trovate nella scansione).
-3. **TrOCR** (``VisionEncoderDecoderModel``): ogni ritaglio e' codificato una
-   sola volta; la decodifica e' *vincolata* al lessico dei valori ammessi
-   (orari HH:MM, ore 0,5-8, mese/anno, numeri, note frequenti...) e affiancata
-   da una lettura libera che misura quanto la scrittura si discosti dal
-   lessico. La cache della cross-attention e' condivisa fra le ipotesi del
-   beam search: molto piu' veloce di ``generate`` su CPU.
+3. **TrOCR** (``VisionEncoderDecoderModel``, pesi in float32): ogni ritaglio e'
+   codificato una sola volta; la decodifica e' *vincolata* al lessico dei valori
+   ammessi (orari HH:MM, ore 0,5-8, mese/anno, numeri, note frequenti...) e
+   affiancata da una lettura libera che misura quanto la scrittura si discosti
+   dal lessico. I ritagli sono letti a lotti di lunghezza simile e il decoder fa
+   avanzare insieme tutte le ricerche del lotto (una chiamata per passo), con le
+   chiavi/valori della cross-attention calcolati una volta per ritaglio.
 4. **Riconciliazione**: per ogni riga si sceglie la combinazione di orari e ore
    piu' probabile *e* coerente (programmato ~ effettivo, uscita - entrata =
    ore); i campi scelti contro la lettura migliore o con bassa probabilita'
@@ -24,16 +25,27 @@ Pipeline di una pagina
    ``illeggibili`` (valore ``None``). Una cella poco leggibile il cui valore e'
    determinato dal resto della riga (es. uscita = entrata + ore) viene
    compilata ma resta "incerta" ed e' elencata in ``ocr_notes``.
+5. **Conferma per coerenza**: una cella incerta *solo* perche' poco leggibile
+   torna sicura se la lettura preferisce comunque quel valore (>= 80% fra i
+   valori ammessi) e una relazione esatta con celle sicure della stessa riga lo
+   impone (uscita = entrata + ore, effettivo = programmato) oppure, per l'orario
+   programmato, lo stesso valore e' letto con sicurezza negli stessi giorni della
+   settimana. Non cambia mai un valore; una differenza programmato/effettivo con
+   l'altro valore fra le letture e senza giustificazione dalle ore viene invece
+   segnalata (scambio di lettura probabile).
 
 Precisione misurata (foglio reale d'esempio, CPU a 4 core)
 ---------------------------------------------------------
-Modello predefinito ``microsoft/trocr-base-handwritten`` (decoder quantizzato
-int8): orari 69/72 (tutti gli errori segnalati come incerti), ore 17/17,
-assenze 62/62, firme 31/31, trattini 31/31, note 31/31, intestazione (lotto,
-municipalita', mese/anno, ore PEI, totale, firma coordinatore, timbro) 10/10;
-i nomi in stampatello sono letti solo in parte e vanno sempre verificati.
-Circa 90 secondi per pagina (~100 campi scritti). A confronto, con la stessa
-pipeline: ``trocr-small`` 33 s/pagina ma orari 63/72 e note 28/31 (richiede
+Modello predefinito ``microsoft/trocr-base-handwritten``: orari 69/72 (tutti
+gli errori segnalati), 16 orari corretti ma segnalati come incerti (erano 21
+prima della conferma per coerenza), ore 17/17, assenze 62/62, firme 31/31,
+trattini 31/31, note 31/31, intestazione (lotto, municipalita', mese/anno, ore
+PEI, totale, firma coordinatore, timbro) 10/10; i nomi in stampatello sono letti
+solo in parte e vanno sempre verificati. Circa 60-70 secondi per pagina (~100
+campi scritti; erano circa 85-90 con la decodifica un ritaglio alla volta e il
+decoder quantizzato int8): l'encoder in float32 da solo richiede circa 35 s,
+gia' vicino al picco di calcolo della CPU. A confronto, con la stessa pipeline
+precedente: ``trocr-small`` 33 s/pagina ma orari 63/72 e note 28/31 (richiede
 anche ``sentencepiece`` e ``protobuf``); ``trocr-large`` 177 s/pagina, orari
 64/72, note 28/31.
 """
@@ -486,18 +498,22 @@ class _DecoderParts:
 class TrOCRRecognizer:
     """TrOCR su CPU con beam search vincolato a un lessico.
 
-    I ritagli sono elaborati a lotti: l'encoder gira una volta per ritaglio, le
-    chiavi/valori della cross-attention sono calcolati una sola volta per
-    ritaglio e il decoder fa avanzare *insieme* le ricerche di tutti i ritagli
-    del lotto (una sola chiamata per passo, con le ipotesi di tutti i ritagli
-    impilate): sulla CPU il costo di un passo dipende poco dal numero di righe,
-    quindi leggere otto ritagli insieme costa poco piu' che leggerne uno. La
-    cross-attention di ogni ipotesi usa le chiavi/valori del proprio ritaglio
-    senza duplicarle. Se la struttura interna del modello non e' quella attesa
-    si ripiega su una decodifica senza cache (lenta ma equivalente).
+    I ritagli sono elaborati a lotti di lunghezza simile: l'encoder gira una
+    volta per ritaglio, le chiavi/valori della cross-attention sono calcolati una
+    sola volta per ritaglio e il decoder fa avanzare *insieme* tutte le ricerche
+    del lotto (vincolate e libere), con una sola chiamata per passo e le ipotesi
+    di tutti i ritagli impilate: sulla CPU un passo costa soprattutto la lettura
+    dei pesi, quasi indipendente dal numero di righe. La cross-attention di ogni
+    ipotesi usa le chiavi/valori del proprio ritaglio senza duplicarle. Pesi in
+    float32: il risultato di ogni ritaglio non dipende dagli altri del lotto.
+    Se la struttura interna del modello non e' quella attesa si ripiega su una
+    decodifica senza cache (lenta ma equivalente).
     """
 
-    ENCODER_BATCH = 8
+    # Ritagli letti insieme (encoder e decoder). Con 8 ritagli le chiavi/valori della
+    # cross-attention occupano circa 450 MB; lotti piu' grandi riducono i passi del
+    # decoder ma non il tempo totale (misurato su CPU a 4 core) e usano piu' memoria.
+    BATCH = 8
 
     def __init__(self, model: Any, processor: Any, model_name: str, device: str = "cpu"):
         import torch  # noqa: PLC0415
@@ -613,16 +629,17 @@ class TrOCRRecognizer:
             return None
 
     def _cross_kv(self, enc: Any) -> list[tuple[Any, Any]]:
-        """Chiavi/valori della cross-attention di ogni livello per i ritagli del lotto."""
+        """Chiavi (trasposte) e valori della cross-attention di ogni livello per i
+        ritagli del lotto, contigui nella disposizione usata a ogni passo."""
         p = self._parts
         assert p is not None
         n, s, _ = enc.shape
         out = []
         for layer in p.layers:
             att = layer.encoder_attn
-            k = att.k_proj(enc).view(n, s, p.heads, p.head_dim).transpose(1, 2)
-            v = att.v_proj(enc).view(n, s, p.heads, p.head_dim).transpose(1, 2)
-            out.append((k, v))
+            k_t = att.k_proj(enc).view(n, s, p.heads, p.head_dim).permute(0, 2, 3, 1).contiguous()
+            v = att.v_proj(enc).view(n, s, p.heads, p.head_dim).transpose(1, 2).contiguous()
+            out.append((k_t, v))
         return out
 
     def _step(self, tokens: Any, pos: int, cache: list[tuple[Any, Any]] | None, cross: list[tuple[Any, Any]],
@@ -669,8 +686,8 @@ class TrOCRRecognizer:
             qp = q.new_zeros(n_crops * wmax, p.heads, p.head_dim)
             qp[flat] = q
             qp = qp.view(n_crops, wmax, p.heads, p.head_dim).transpose(1, 2)
-            ck, cv = cross[li]
-            w = torch.softmax(torch.matmul(qp, ck.transpose(-1, -2)), dim=-1)
+            ck_t, cv = cross[li]
+            w = torch.softmax(torch.matmul(qp, ck_t), dim=-1)
             a = torch.matmul(w, cv).transpose(1, 2).reshape(n_crops * wmax, d)[flat]
             x = layer.encoder_attn_layer_norm(residual + ca.out_proj(a.view(rows, 1, d)))
 
@@ -889,35 +906,34 @@ class TrOCRRecognizer:
                        length_norm=True)
 
     def _read_batch(self, batch: Sequence[ReadRequest], enc: Any) -> list[Reading]:
+        """Letture dei ritagli di un lotto (``enc``: uscite dell'encoder, una per ritaglio)."""
         torch = self.torch
         n = len(batch)
         cross = self._cross_kv(enc)
         start = torch.full((n,), self.start_id, dtype=torch.long, device=self.device)
         crop_ids = torch.arange(n, dtype=torch.long, device=self.device)
         start_lps, start_cache = self._step(start, 0, None, cross, crop_ids)
-        # 1) ricerche vincolate e letture libere sempre necessarie
+        # Le ricerche vincolate e le letture libere avanzano insieme: la lettura
+        # libera di un campo con lessico serve solo se la lettura vincolata non
+        # basta, ma calcolarla in anticipo costa una riga in piu' per ritaglio e
+        # nessun passo in piu' (i passi, non le righe, determinano il tempo).
         lex_jobs: dict[int, _Search] = {}
         free_jobs: dict[int, _Search] = {}
         for i, req in enumerate(batch):
             if req.lexicon is not None:
                 lex_jobs[i] = self._new_job(i, req, True)
-            if req.lexicon is None or (req.free and (req.charset is not None or req.free_beams > 1)):
+            if req.lexicon is None or req.free:
                 free_jobs[i] = self._new_job(i, req, False)
         self._run([*lex_jobs.values(), *free_jobs.values()], start_cache, start_lps, cross)
-        # 2) letture libere che servono solo se la lettura vincolata non basta
-        extra = {i: self._new_job(i, req, False) for i, req in enumerate(batch)
-                 if i not in free_jobs and i in lex_jobs and self._needs_free(req, lex_jobs[i].finished)}
-        if extra:
-            self._run(list(extra.values()), start_cache, start_lps, cross)
-            free_jobs.update(extra)
         out = []
         for i, req in enumerate(batch):
             constrained = lex_jobs[i].finished if i in lex_jobs else []
-            free = free_jobs[i].finished if i in free_jobs else None
+            free = free_jobs[i].finished if i in free_jobs and self._needs_free(req, constrained) else None
             out.append(self._reading(req, constrained, free))
         return out
 
     def _read_slow(self, req: ReadRequest, enc1: Any) -> Reading:
+        """Lettura di un ritaglio con la decodifica di riferimento (ripiego)."""
         constrained: list[Finished] = []
         if req.lexicon is not None:
             constrained = self._search_slow(enc1, max(1, req.beams), req.lexicon.max_chars, req.lexicon, None)
@@ -926,25 +942,41 @@ class TrOCRRecognizer:
             free = self._search_slow(enc1, max(1, req.free_beams), req.max_tokens, None, req.charset)
         return self._reading(req, constrained, free)
 
+    @staticmethod
+    def _decode_length(req: ReadRequest) -> int:
+        """Passi di decodifica massimi di una richiesta (per raggruppare quelle simili)."""
+        steps = req.max_tokens if (req.free or req.lexicon is None) else 0
+        if req.lexicon is not None:
+            steps = max(steps, req.lexicon.max_chars)
+        return steps
+
     def read(self, requests: Sequence[ReadRequest],
              progress: Callable[[int, int], None] | None = None) -> list[Reading]:
         torch = self.torch
-        results: list[Reading] = []
         total = len(requests)
+        results: list[Reading | None] = [None] * total
+        # richieste di lunghezza simile nello stesso gruppo: il numero di passi del
+        # gruppo e' quello della ricerca piu' lunga
+        order = sorted(range(total), key=lambda i: self._decode_length(requests[i]))
+        done = 0
         with self.lock, torch.inference_mode():
-            for b0 in range(0, total, self.ENCODER_BATCH):
-                batch = requests[b0:b0 + self.ENCODER_BATCH]
+            for g0 in range(0, total, self.BATCH):
+                idx = order[g0:g0 + self.BATCH]
+                batch = [requests[i] for i in idx]
                 enc = self.encode([r.image for r in batch])
                 if self._fast and not self._verified:
                     self._fast = self._verify_fast_path(enc)
                     self._verified = True
                 if self._fast:
-                    results += self._read_batch(batch, enc)
+                    readings = self._read_batch(batch, enc)
                 else:
-                    results += [self._read_slow(req, enc[j:j + 1]) for j, req in enumerate(batch)]
+                    readings = [self._read_slow(req, enc[j:j + 1]) for j, req in enumerate(batch)]
+                for i, reading in zip(idx, readings):
+                    results[i] = reading
+                done += len(batch)
                 if progress is not None:
-                    progress(b0 + len(batch), total)
-        return results
+                    progress(done, total)
+        return [r if r is not None else Reading() for r in results]
 
 
 def _to_rgb(img: np.ndarray) -> np.ndarray:
@@ -1150,7 +1182,7 @@ def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_p
     return path
 
 
-def _load_recognizer(path: Path, model_name: str, device: str, quantize: bool = True) -> TrOCRRecognizer:
+def _load_recognizer(path: Path, model_name: str, device: str) -> TrOCRRecognizer:
     torch = importlib.import_module("torch")
     transformers = importlib.import_module("transformers")
     try:
@@ -1177,26 +1209,10 @@ def _load_recognizer(path: Path, model_name: str, device: str, quantize: bool = 
         ) from exc
     model.eval()
     model.to(torch.device(device))
-    if quantize and torch.device(device).type == "cpu":
-        _quantize_decoder(model)
+    # Pesi in float32: la quantizzazione dinamica int8 del decoder (scala unica per
+    # tutto il lotto) renderebbe le letture dipendenti dai ritagli letti insieme e
+    # con la decodifica a lotti non e' piu' necessaria per la velocita'.
     return TrOCRRecognizer(model, processor, model_name, device)
-
-
-def _quantize_decoder(model: Any) -> None:
-    """Quantizzazione dinamica int8 dei livelli lineari del *solo* decoder: circa
-    2x piu' veloce su CPU con letture identiche (l'encoder resta in float32:
-    quantizzato peggiora sensibilmente il riconoscimento)."""
-    import warnings  # noqa: PLC0415
-
-    torch = importlib.import_module("torch")
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            from torch.ao.quantization import quantize_dynamic  # noqa: PLC0415
-
-            model.decoder = quantize_dynamic(model.decoder, {torch.nn.Linear}, dtype=torch.qint8)
-    except Exception:  # noqa: BLE001 - facoltativa: senza quantizzazione funziona comunque
-        log.info("Quantizzazione del decoder non disponibile, uso float32", exc_info=True)
 
 
 # ==========================================================================
@@ -1754,6 +1770,8 @@ W_COLONNA = 1.0          # preferenza per i valori ricorrenti nella stessa colon
 QUOTA_COLONNA = 0.6      # quota oltre la quale un valore "domina" la colonna
 SIMILE_NOTA = 0.8        # somiglianza per agganciare una nota a una formula ricorrente
 SIMILE_NOTA_VICINA = 0.45   # ... o alla nota (sicura) del giorno precedente/successivo
+P_CONFERMA = 0.8         # probabilita' (fra i valori ammessi) minima perche' la coerenza confermi una lettura
+P_ALTERNATIVA = 0.02     # probabilita' oltre la quale un'alternativa letta conta come possibile scambio
 
 
 def _time_minutes(v: str | None) -> int | None:
@@ -2072,6 +2090,159 @@ def _dominant(values: list[Any], own: Any) -> Any:
     return best if others.count(best) >= QUOTA_COLONNA * len(others) else None
 
 
+_TWIN = {"prog_entrata": "eff_entrata", "eff_entrata": "prog_entrata",
+         "prog_uscita": "eff_uscita", "eff_uscita": "prog_uscita"}
+_HOURS_PAIRS = (("eff_entrata", "eff_uscita"), ("prog_entrata", "prog_uscita"))
+CONF_CONFERMA = 0.85     # confidenza attribuita a un valore confermato dalla coerenza della riga
+
+
+@dataclass
+class _CellState:
+    """Valore scelto per una cella di orari/ore e motivi di dubbio."""
+
+    giorno: int
+    field: str
+    value: Any
+    ev: Evidence
+    reasons: set[str]
+    assenza_alunno: bool = False
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return False
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) < 1e-6
+    return bool(a == b)
+
+
+def _relations(f: str, values: dict[str, Any]) -> list[tuple[tuple[str, ...], Any, bool]]:
+    """Relazioni esatte della riga che coinvolgono il campo ``f``.
+
+    Per ogni relazione: (altre celle coinvolte, valore che imporrebbero a ``f``,
+    True se e' la relazione orari effettivi/ore, la cui violazione e' un'incoerenza).
+    Programmato e effettivo uguali e durata programmata = ore sono solo i casi
+    piu' frequenti: se non valgono non e' un errore."""
+    out: list[tuple[tuple[str, ...], Any, bool]] = []
+    twin = _TWIN.get(f)
+    if twin is not None and values.get(twin) is not None:
+        out.append(((twin,), values[twin], False))
+    ore = values.get("ore_dichiarate")
+    for a, b in _HOURS_PAIRS:
+        strict = a == "eff_entrata"
+        if f == a and values.get(b) is not None and ore is not None:
+            out.append(((b, "ore_dichiarate"), _shift(values[b], ore, -1), strict))
+        elif f == b and values.get(a) is not None and ore is not None:
+            out.append(((a, "ore_dichiarate"), _shift(values[a], ore, 1), strict))
+        elif f == "ore_dichiarate" and values.get(a) is not None and values.get(b) is not None:
+            out.append(((a, b), hours_between(values[a], values[b]), strict))
+    return out
+
+
+def _admissible(f: str, value: Any) -> bool:
+    """True se ``value`` e' un valore ammesso dal modulo per il campo ``f``."""
+    if f == "ore_dichiarate":
+        return isinstance(value, (int, float)) and 0 < value <= HOURS_MAX_DAY and abs(value * 2 - round(value * 2)) < 1e-9
+    m = _time_minutes(value) if isinstance(value, str) else None
+    return m is not None and TIME_MIN <= m <= TIME_MAX and m % TIME_STEP == 0
+
+
+def _doubt_reasons(f: str, v: Any, ev: Evidence, p: float, values: dict[str, Any],
+                   column_values: list[Any]) -> set[str]:
+    """Motivi per cui il valore ``v`` scelto per il campo ``f`` va verificato."""
+    reasons: set[str] = set()
+    if ev.coverage < P_LEGGIBILE:
+        reasons.add("dedotto")            # la scrittura somiglia poco a qualsiasi valore ammesso
+    if v != ev.top:
+        reasons.add("alternativa")        # scelto dal contesto contro la lettura migliore
+    if p < P_INCERTO:
+        reasons.add("bassa_prob")
+    dom = _dominant(column_values, ev.top)
+    if dom is not None and dom != v and ev.p(dom) >= P_ALTERNATIVA:
+        reasons.add("colonna")            # diverso dal valore abituale della colonna, che e' fra le letture
+    if ev.free_value is not None and ev.free_value != v:
+        # la lettura libera indica un altro valore: ammesso dal modulo (es. 11:30 invece
+        # di 11:00) oppure no (es. 11:10, minuti non a quarti d'ora: piu' probabilmente
+        # una cifra letta male)
+        reasons.add("lettura_libera" if _admissible(f, ev.free_value) else "lettura_libera_anomala")
+    twin = _TWIN.get(f)
+    tv = values.get(twin) if twin else None
+    if tv is not None and tv != v and ev.p(tv) >= P_ALTERNATIVA:
+        # programmato e effettivo diversi, il valore dell'altro e' fra le letture di
+        # questa cella e nessuna relazione con le ore giustifica la differenza
+        own = [imp for others, imp, _strict in _relations(f, values) if others != (twin,)]
+        if not any(_same_value(imp, v) for imp in own):
+            reasons.add("gemello")
+    return reasons
+
+
+# motivi di dubbio che la coerenza con celle sicure puo' superare (gli altri indicano
+# che la lettura stessa propende per un valore diverso)
+_SUPERABILI = frozenset({"dedotto", "bassa_prob", "colonna", "lettura_libera_anomala"})
+SETTIMANA_MIN = 2        # celle sicure dello stesso giorno della settimana per confermare l'orario programmato
+
+
+def _weekly_support(cs: _CellState, solid_values: dict[tuple[int, str], Any]) -> bool:
+    """L'orario programmato e' settimanale: stesso valore letto con sicurezza negli
+    stessi giorni della settimana (giorno +/- 7, 14...) e nessun valore diverso."""
+    if not cs.field.startswith("prog_"):
+        return False
+    same = [val for (g, f), val in solid_values.items()
+            if f == cs.field and g != cs.giorno and (g - cs.giorno) % 7 == 0]
+    return len(same) >= SETTIMANA_MIN and all(_same_value(x, cs.value) for x in same)
+
+
+def _confirm_by_consensus(states: dict[tuple[int, str], _CellState]) -> set[tuple[int, str]]:
+    """Celle incerte solo perche' poco leggibili il cui valore e' confermato.
+
+    Una cella e' confermata se il valore scelto e' anche quello preferito dalla
+    lettura (probabilita' >= ``P_CONFERMA`` fra i valori ammessi, lettura libera
+    non contraria) e se almeno una relazione esatta con celle *sicure* della
+    stessa riga lo impone (es. uscita effettiva = entrata effettiva + ore, oppure
+    uguale all'uscita programmata), senza relazioni orari/ore violate; per
+    l'orario programmato vale anche lo stesso valore sicuro negli stessi giorni
+    della settimana. Le celle confermate diventano a loro volta sicure
+    (ripetizione fino a stabilita').
+    Il valore non viene mai cambiato: si toglie solo la segnalazione."""
+    by_row: dict[int, dict[str, Any]] = {}
+    for (g, f), cs in states.items():
+        by_row.setdefault(g, {})[f] = cs.value
+    solid = {k for k, cs in states.items() if not cs.reasons}
+    confirmed: set[tuple[int, str]] = set()
+    changed = True
+    while changed:
+        changed = False
+        for key, cs in states.items():
+            if key in solid or not cs.reasons <= _SUPERABILI:
+                continue
+            if not _same_value(cs.value, cs.ev.top) or cs.ev.p(cs.value) < P_CONFERMA:
+                continue
+            holds = violated = 0
+            for others, implied, strict in _relations(cs.field, by_row[cs.giorno]):
+                if not all((cs.giorno, o) in solid for o in others):
+                    continue
+                if _same_value(implied, cs.value):
+                    holds += 1
+                elif strict and not _partial_hours_ok(cs, by_row[cs.giorno]):
+                    violated += 1
+            if not holds and not violated:
+                holds = int(_weekly_support(cs, {k: states[k].value for k in solid}))
+            if holds and not violated:
+                solid.add(key)
+                confirmed.add(key)
+                changed = True
+    return confirmed
+
+
+def _partial_hours_ok(cs: _CellState, values: dict[str, Any]) -> bool:
+    """Con l'alunno assente le ore riconosciute possono essere meno dell'orario effettivo."""
+    if not cs.assenza_alunno:
+        return False
+    d = hours_between(values.get("eff_entrata"), values.get("eff_uscita"))
+    ore = values.get("ore_dichiarate")
+    return d is not None and isinstance(ore, (int, float)) and ore < d
+
+
 def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> ExtractionResult:
     """Costruisce il risultato finale dai riconoscimenti e dall'analisi d'inchiostro."""
     t_lex, h_lex = time_lexicon(), hours_lexicon()
@@ -2098,6 +2269,8 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
     rows: list[DayRow] = []
     confs: list[float] = []
     dedotti: list[str] = []
+    extra_notes: list[str] = []
+    states: dict[tuple[int, str], _CellState] = {}
     for g in range(1, 32):
         st = plan.cells.get(g, {})
         row = DayRow(giorno=g)
@@ -2139,7 +2312,6 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
                     values.pop(f)
                     confs.append(0.0)
                     continue
-                dedotti.append(f"giorno {g} ({etichetta(f)})")
                 p = min(p, 0.2)
             else:
                 # la coerenza con il resto della riga rafforza una lettura gia' preferita
@@ -2147,12 +2319,24 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
             setattr(row, f, v)
             row.confidenza[f] = round(p, 3)
             confs.append(p)
-            dom = _dominant(column[f], ev.top)
-            unusual = dom is not None and dom != v and ev.p(dom) >= 0.02
-            if (deduced or v != ev.top or p < P_INCERTO or unusual
-                    or (ev.free_value is not None and ev.free_value != v)):
-                row.incerti.append(f)
+            reasons = _doubt_reasons(f, v, ev, p, values, column[f])
+            states[(g, f)] = _CellState(g, f, v, ev, reasons, row.assenza_alunno)
         rows.append(row)
+
+    # conferma per coerenza: celle incerte solo per la scarsa leggibilita' il cui
+    # valore e' quello preferito dalla lettura *e* coincide con quanto imposto
+    # dalle celle sicure della stessa riga (es. uscita = entrata + ore)
+    confirmed = _confirm_by_consensus(states)
+    for (g, f), cs in sorted(states.items()):
+        row = rows[g - 1]
+        if cs.reasons and (g, f) not in confirmed:
+            row.incerti.append(f)
+            if "dedotto" in cs.reasons:
+                dedotti.append(f"giorno {g} ({etichetta(f)})")
+        elif (g, f) in confirmed:
+            row.confidenza[f] = round(max(row.confidenza.get(f, 0.0), CONF_CONFERMA), 3)
+    if confirmed:
+        extra_notes.append(f"Valori poco leggibili confermati dalla coerenza della riga: {len(confirmed)}.")
 
     # note: formule ricorrenti, testo letto, nota uguale a quella del giorno vicino
     notes: dict[int, _Field] = {}
@@ -2188,7 +2372,7 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
     detected = bool(grid.detected) or grid.score >= 0.5
     text_conf = float(np.mean(confs)) if confs else 1.0
     confidence = round(max(0.0, min(1.0, 0.85 * text_conf + 0.15 * float(grid.score))), 3)
-    remarks = list(plan.notes)
+    remarks = list(plan.notes) + extra_notes
     if not grid.detected:
         remarks.append("Tabella individuata solo con il modello proporzionale: verificare l'allineamento "
                        "delle righe.")

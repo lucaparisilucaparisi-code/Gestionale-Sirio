@@ -24,7 +24,7 @@ const TOKENS_PER_SHEET = { input: 14000, output: 4000 };
 const REG_FIELDS = [
   { id: 'operatore', label: 'Operatori', one: 'operatore', ph: 'COGNOME NOME dell\'operatore' },
   { id: 'alunno', label: 'Alunni', one: 'alunno', ph: 'COGNOME NOME dell\'alunno' },
-  { id: 'istituto', label: 'Istituti', one: 'istituto', ph: 'es. IC 9 CUOCO-SCHIPA' },
+  { id: 'istituto', label: 'Istituti', one: 'istituto', ph: 'es. IC 12 VITTORIO EMANUELE' },
   { id: 'ente', label: 'Enti', one: 'ente', ph: 'es. COOPERATIVA SOCIALE SIRIO' },
 ];
 

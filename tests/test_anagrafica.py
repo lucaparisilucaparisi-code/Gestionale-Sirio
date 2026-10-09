@@ -49,7 +49,7 @@ def counts(reg: an.Anagrafica, campo: str) -> dict[str, int]:
 
 def test_normalization_and_key() -> None:
     assert an.normalizza("  D'Angelo   Lucà ") == "D ANGELO LUCA"
-    assert an.normalizza("IC.9 Cuoco-Schipa") == "IC 9 CUOCO SCHIPA"
+    assert an.normalizza("IC.12 Vittorio-Emanuele") == "IC 12 VITTORIO EMANUELE"
     assert an.chiave("Mario Rossi") == an.chiave("ROSSI  MARIO") == "MARIO ROSSI"
     assert an.pulisci("  Rossi   Mario ") == "Rossi Mario" and an.pulisci("   ") is None
     assert not an.valido("1") and not an.valido("--") and an.valido("Ro")
