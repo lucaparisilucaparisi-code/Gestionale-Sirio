@@ -59,7 +59,7 @@ def test_weighted_distance() -> None:
     assert an.distanza("ROSSI", "ROSSI") == 0
     assert an.distanza("ROSSI", "R0SSI") == an.COSTO_SIMILE           # O/0 si confondono
     assert an.distanza("ROSSI", "RXSSI") == 1
-    assert an.distanza("TOMBERLI", "TOMBRELI") == 1                    # scambio di lettere adiacenti
+    assert an.distanza("ESPOSITO", "ESPOISTO") == 1                    # scambio di lettere adiacenti
     assert an.distanza("", "ABC") == 3
 
 

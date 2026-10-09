@@ -328,7 +328,7 @@ Fogli:
 2. **Dettaglio giornaliero** — una riga per ogni giorno con dati di ogni documento: operatore,
    alunno, istituto, data, giorno della settimana, orari programmati/effettivi, ore programmate,
    calcolate, dichiarate, differenza, assenze, firma, note, esito, anomalie. Filtri e riquadri bloccati.
-3. **Una scheda per foglio firma** (nome ≤ 31 caratteri, univoco, es. `TOMBERLI A. 02-2026`):
+3. **Una scheda per foglio firma** (nome ≤ 31 caratteri, univoco, es. `ROSSI M. 02-2026`):
    replica fedele del modulo — intestazione, tabella di 31 giorni con data e giorno della settimana,
    weekend/festivi in grigio, celle **illeggibili** (sfondo rosso chiaro, testo "ILLEGGIBILE") e
    **incerte** (sfondo ambra) evidenziate con commento della cella, celle corrette a mano in blu
@@ -490,7 +490,7 @@ scuro. Viste:
 ### 4.13 `sirio/anagrafica.py` — anagrafica appresa
 
 Operatori, alunni, istituti ed enti ricorrono ogni mese: i nomi letti male (soprattutto dal motore
-offline, es. «TOMBREU ALESSIA») vengono ricondotti ai nomi già **confermati dall'utente**.
+offline, es. «R0SSI MAR1O» per «ROSSI MARIO») vengono ricondotti ai nomi già **confermati dall'utente**.
 File `data_dir()/"anagrafica.json"` (scrittura atomica, `threading.RLock`, istanza condivisa per
 cartella dati con `anagrafica_predefinita()`; un file illeggibile viene messo da parte come
 `anagrafica.json.illeggibile-<data>` e si riparte da zero).

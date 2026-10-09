@@ -1,8 +1,8 @@
 """Anagrafica appresa: nomi già confermati dall'utente e correzione delle letture.
 
 Gli stessi operatori, alunni, istituti ed enti ricorrono ogni mese: i nomi letti
-male dal riconoscimento della scrittura (es. «TOMBREU ALESSIA») vengono
-ricondotti ai nomi già confermati nei fogli precedenti («TOMBERLI ALESSIA»).
+male dal riconoscimento della scrittura (es. «R0SSI MAR1O») vengono
+ricondotti ai nomi già confermati nei fogli precedenti («ROSSI MARIO»).
 Il modulo è indipendente dal motore OCR: ``processing`` lo applica al risultato
 di ``engine.extract`` prima della validazione.
 
