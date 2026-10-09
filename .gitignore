@@ -1,0 +1,16 @@
+# Ambiente di esecuzione creato dal programma di avvio
+.runtime/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+# Dati locali e documenti dei clienti: mai nel repository
+/dati/
+/export/
+*.pdf
+!tests/fixtures/*.pdf
+*.xlsx
+!docs/esempio/*.xlsx
