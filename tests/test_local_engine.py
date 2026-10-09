@@ -489,17 +489,22 @@ def test_fast_decoding_matches_reference_search():
     img, grid, _truth = _synthetic(0)
     plan = le.plan_page(img, grid)
     reqs = [r for r in plan.requests if r.key.endswith(("prog_entrata", "ore_dichiarate"))][:4]
-    engine = le.LocalEngine(cache_dir=_hf_cache())
-    rec = engine._ensure_recognizer(lambda *_: None)
+    path = le.local_model_path(le.DEFAULT_MODEL, _hf_cache())
+    # senza quantizzazione: le due decodifiche devono dare gli stessi punteggi
+    rec = le._load_recognizer(path, le.DEFAULT_MODEL, "cpu", quantize=False)
     with torch.inference_mode():
         for req in reqs:
             enc = rec.encode([req.image])
             fast = rec._search(enc, rec._start(enc), 4, req.lexicon.max_chars, req.lexicon, None, False)
             slow = rec._search_slow(enc, 4, req.lexicon.max_chars, req.lexicon, None)
+            slow_scores = {(key, ids): score for key, ids, score in slow}
+            common = [(f, slow_scores[(f[0], f[1])]) for f in fast if (f[0], f[1]) in slow_scores]
+            assert common, req.key
+            for (_key, _ids, score), ref in common:
+                assert abs(score - ref) < 1e-3
             best_fast = max(fast, key=lambda f: f[2])
             best_slow = max(slow, key=lambda f: f[2])
             assert req.lexicon.complete(best_fast[0]) == req.lexicon.complete(best_slow[0])
-            assert abs(best_fast[2] - best_slow[2]) < 0.05
 
 
 # Soglie minime sul foglio reale (misurate: vedi docstring del modulo del motore).

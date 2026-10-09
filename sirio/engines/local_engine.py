@@ -21,7 +21,21 @@ Pipeline di una pagina
    piu' probabile *e* coerente (programmato ~ effettivo, uscita - entrata =
    ore); i campi scelti contro la lettura migliore o con bassa probabilita'
    finiscono in ``incerti``; scrittura presente ma non interpretabile ->
-   ``illeggibili`` (valore ``None``).
+   ``illeggibili`` (valore ``None``). Una cella poco leggibile il cui valore e'
+   determinato dal resto della riga (es. uscita = entrata + ore) viene
+   compilata ma resta "incerta" ed e' elencata in ``ocr_notes``.
+
+Precisione misurata (foglio reale d'esempio, CPU a 4 core)
+---------------------------------------------------------
+Modello predefinito ``microsoft/trocr-base-handwritten`` (decoder quantizzato
+int8): orari 69/72 (tutti gli errori segnalati come incerti), ore 17/17,
+assenze 62/62, firme 31/31, trattini 31/31, note 31/31, intestazione (lotto,
+municipalita', mese/anno, ore PEI, totale, firma coordinatore, timbro) 10/10;
+i nomi in stampatello sono letti solo in parte e vanno sempre verificati.
+Circa 90 secondi per pagina (~100 campi scritti). A confronto, con la stessa
+pipeline: ``trocr-small`` 33 s/pagina ma orari 63/72 e note 28/31 (richiede
+anche ``sentencepiece`` e ``protobuf``); ``trocr-large`` 177 s/pagina, orari
+64/72, note 28/31.
 """
 
 from __future__ import annotations
@@ -1245,7 +1259,10 @@ def header_spots(gray: np.ndarray, grid: TableGrid) -> dict[str, _HeaderSpot]:
             end = max(ln[1] for ln in near)
             # la riga trovata delimita lo spazio della risposta (con un po' di tolleranza)
             if abs(start - ex0) <= 0.06 * tw:
-                ex0 = start - 0.002 * tw
+                # per i campi con etichetta sulla stessa riga la risposta inizia dopo
+                # l'etichetta, cioe' dove inizia la riga; mese/anno non ha etichetta
+                # a sinistra e la scrittura puo' cominciare prima della riga
+                ex0 = min(ex0, start - 0.03 * tw) if name == "mese_anno" else start - 0.002 * tw
             if abs(end - ex1) <= 0.06 * tw and name not in ("operatore", "alunno"):
                 ex1 = max(ex1, end + 0.01 * tw)
         else:

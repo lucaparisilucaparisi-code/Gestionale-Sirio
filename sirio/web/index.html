@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="it" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="sirio-token" content="__SIRIO_TOKEN__">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Sirio OCR — lettura dei fogli firma dell'Assistenza Specialistica e generazione dell'Excel di rendicontazione.">
+  <title>Sirio OCR</title>
+  <link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script>
+    // Tema applicato prima del primo disegno (evita il lampo bianco nel tema scuro).
+    (function () {
+      var tema = "auto";
+      try { tema = localStorage.getItem("sirio.tema") || "auto"; } catch (e) { /* archiviazione non disponibile */ }
+      var scuro = tema === "scuro" || (tema === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.setAttribute("data-theme", scuro ? "dark" : "light");
+    })();
+  </script>
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <div class="splash" id="splash" role="status" aria-live="polite">
+    <div class="splash-inner">
+      <img src="/static/assets/logo.svg" alt="" width="56" height="56">
+      <span>Avvio di Sirio OCR…</span>
+    </div>
+  </div>
+
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar" aria-label="Navigazione principale"></aside>
+    <div class="main">
+      <header class="topbar" id="topbar"></header>
+      <main class="view" id="view" tabindex="-1" aria-live="polite"></main>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+  <div class="tooltip" id="tooltip" role="tooltip"></div>
+  <dialog class="dialog" id="dialog" aria-labelledby="dialog-title"></dialog>
+
+  <input type="file" id="file-input" multiple hidden
+         accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,application/pdf,image/*">
+  <input type="file" id="folder-input" multiple hidden webkitdirectory directory>
+
+  <noscript>
+    <p style="padding:2rem;font-family:sans-serif">Sirio OCR richiede JavaScript attivo per funzionare.</p>
+  </noscript>
+</body>
+</html>
