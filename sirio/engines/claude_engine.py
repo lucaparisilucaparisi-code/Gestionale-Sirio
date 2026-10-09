@@ -506,11 +506,14 @@ def _bool(value: Any) -> bool:
 
 
 def _flag_list(values: Iterable[Any], allowed: Iterable[str]) -> list[str]:
-    ok = set(allowed)
+    """Nomi di campo ammessi, senza duplicati (l'output strutturato non garantisce
+    le maiuscole dei valori enum)."""
+    ok = {a.lower(): a for a in allowed}
     out: list[str] = []
     for v in values or []:
-        if isinstance(v, str) and v in ok and v not in out:
-            out.append(v)
+        name = ok.get(v.strip().lower()) if isinstance(v, str) else None
+        if name is not None and name not in out:
+            out.append(name)
     return out
 
 

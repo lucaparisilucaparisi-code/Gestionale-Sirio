@@ -203,7 +203,9 @@ VERIFY_SCHEMA: dict[str, Any] = _obj(
         "totale_illeggibile": _flag(
             "true se il totale mensile è scritto ma non leggibile (false se non richiesta)."
         ),
-        "ocr_notes": _text("Brevi osservazioni in italiano sulle righe rilette; stringa vuota se nulla da segnalare."),
+        "ocr_notes": _text(
+            "Brevi osservazioni in italiano sulle righe rilette; stringa vuota se nulla da segnalare."
+        ),
     },
     "Rilettura mirata di alcune righe del foglio firma.",
 )
@@ -299,7 +301,7 @@ agli orari, orario effettivo diverso dal programmato, totale mensile diverso dal
 trascrivilo ESATTAMENTE COME SCRITTO. Non correggere, non ricalcolare e non completare \
 mai i dati: le incoerenze vengono segnalate da un controllo automatico successivo.
 - Non ricavare mai un valore assente: se "Tot. Ore effettive" è vuota lascia "" anche se \
-gli orari ci sono; se il totale mensile non è scritto restituisci ""
+gli orari ci sono; se il totale mensile non è scritto restituisci "".
 - Valori corretti o sovrascritti: riporta il valore finale valido (non quello cancellato); \
 se la correzione rende la lettura dubbia segnala il campo come incerto e descrivi \
 brevemente la correzione in ocr_notes.
@@ -318,6 +320,8 @@ modo chiaro e le celle vuote. Nell'intestazione "mese_anno" indica il campo "MES
 
 # RISPOSTA
 
+- Ogni valore testuale assente (cella vuota, trattino, campo illeggibile, dato non \
+compilato) si indica con la stringa vuota "".
 - is_foglio_firma: false se la pagina non è questo modulo (pagina bianca, altro \
 documento, retro): in tal caso intestazione con valori vuoti ("") e false e righe vuote.
 - rows: esattamente 31 oggetti, giorni da 1 a 31 in ordine, uno per ogni riga stampata, \

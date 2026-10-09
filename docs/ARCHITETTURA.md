@@ -221,10 +221,11 @@ def get_engine(settings: Settings) -> OCREngine   # costruisce il motore scelto 
   per Opus 5.5 e Sonnet 5.5 aggiungere `betas=["server-side-fallback-2026-07-01"], fallbacks="default"`
   (NON per Haiku 5.5); controllare `stop_reason` (`refusal`, `max_tokens`) prima di leggere il contenuto;
 * immagini JPEG base64 entro i limiti: lato lungo ≤ 2576 px **e** ≤ 3,75 megapixel per immagine;
-  inviare: pagina intera + 2 ritagli ad alta risoluzione della tabella (giorni 1–16 con intestazione
+  inviare: pagina intera + intestazione + 2 ritagli ad alta risoluzione della tabella (giorni 1–16 con intestazione
   tabella, giorni 16–31 con la riga del totale), ricavati da `TableGrid`;
 * risposta JSON con schema rigoroso (tutti gli oggetti `additionalProperties: false`, tutti i campi in
-  `required`, valori assenti = `null`); per ogni campo: valore normalizzato + elenchi `incerti`
+  `required`; i testi assenti sono la stringa vuota `""` nello schema, convertita in `None` — l'API
+  ammette al massimo 16 proprietà annullabili per richiesta); per ogni campo: valore normalizzato + elenchi `incerti`
   e `illeggibili`;
 * **verifica incrociata** (se `settings.verifica_incrociata`): dopo la prima lettura si esegue
   `validation.validate(...)`; per le righe con anomalie di coerenza, campi incerti o illeggibili si

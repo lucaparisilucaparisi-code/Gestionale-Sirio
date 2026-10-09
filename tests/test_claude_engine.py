@@ -41,10 +41,12 @@ def row_json(g: int, pe: str | None = None, pu: str | None = None, ee: str | Non
              ore: str | None = None, aa: bool = False, ao: bool = False, firma: bool = False,
              note: str | None = None, tr: bool = False, inc: tuple[str, ...] = (),
              ill: tuple[str, ...] = ()) -> dict:
+    # come nello schema: valori testuali assenti = stringa vuota
     return {
-        "giorno": g, "prog_entrata": pe, "prog_uscita": pu, "eff_entrata": ee, "eff_uscita": eu,
-        "ore_dichiarate": ore, "assenza_alunno": aa, "assenza_operatore": ao, "firma": firma,
-        "note": note, "trattino_effettivo": tr, "incerti": list(inc), "illeggibili": list(ill),
+        "giorno": g, "prog_entrata": pe or "", "prog_uscita": pu or "", "eff_entrata": ee or "",
+        "eff_uscita": eu or "", "ore_dichiarate": ore or "", "assenza_alunno": aa, "assenza_operatore": ao,
+        "firma": firma, "note": note or "", "trattino_effettivo": tr, "incerti": list(inc),
+        "illeggibili": list(ill),
     }
 
 
@@ -58,12 +60,12 @@ def header_json(**kw: Any) -> dict:
     h = {
         "anno_scolastico": "2025/2026", "lotto": "1", "municipalita": "2", "ente": "Cooperativa di Prova",
         "istituto": "IC 1 Esempio", "operatore": "rossi mario", "alunno": "bianchi luca",
-        "mese_anno": "02/2026", "ore_pei": "15", "sostituzione": None, "data_compilazione": None,
+        "mese_anno": "02/2026", "ore_pei": "15", "sostituzione": "", "data_compilazione": "",
         "firma_coordinatore": True, "timbro_referente": True, "totale_mensile_dichiarato": "60",
         "incerti": [], "illeggibili": [],
     }
     h.update(kw)
-    return h
+    return {k: "" if v is None else v for k, v in h.items()}
 
 
 def first_json(rows: dict[int, dict] | None = None, header: dict | None = None, is_form: bool = True,
@@ -76,14 +78,14 @@ def first_json(rows: dict[int, dict] | None = None, header: dict | None = None, 
         "header": header or header_json(),
         "rows": [by_day.get(g, row_json(g)) for g in range(1, 32)],
         "confidence": confidence,
-        "ocr_notes": notes,
+        "ocr_notes": notes or "",
     }
 
 
 def verify_json(rows: list[dict], totale: str | None = None, inc: bool = False, ill: bool = False,
                 notes: str | None = None) -> dict:
-    return {"rows": rows, "totale_mensile_dichiarato": totale, "totale_incerto": inc,
-            "totale_illeggibile": ill, "ocr_notes": notes}
+    return {"rows": rows, "totale_mensile_dichiarato": totale or "", "totale_incerto": inc,
+            "totale_illeggibile": ill, "ocr_notes": notes or ""}
 
 
 def usage(inp: int = 1000, out: int = 500, created: int | None = 0, read: int | None = 0, **kw: Any) -> SimpleNamespace:
@@ -226,6 +228,21 @@ def test_schema_strict(schema: dict) -> None:
             assert sorted(node["required"]) == sorted(node["properties"]), path
             assert len(node["required"]) == len(set(node["required"])), path
     assert objects >= 2
+
+
+@pytest.mark.parametrize("schema", [prompts.SCHEMA, prompts.VERIFY_SCHEMA], ids=["lettura", "verifica"])
+def test_schema_within_api_complexity_limits(schema: dict) -> None:
+    # limiti dell'API per richiesta: <= 16 proprieta' con tipi unione, <= 24 facoltative
+    unions = optional = 0
+    for path, node in _walk(schema):
+        if path.endswith(".properties"):
+            for prop in node.values():
+                if "anyOf" in prop or isinstance(prop.get("type"), list):
+                    unions += 1
+        if isinstance(node.get("properties"), dict) and not path.endswith(".properties"):
+            optional += len(set(node["properties"]) - set(node.get("required", [])))
+    assert unions <= 16 and optional <= 24
+    assert unions == 0            # valori assenti = "" (nessun tipo unione)
 
 
 def test_schema_mirrors_models() -> None:
@@ -397,6 +414,10 @@ def test_normalization() -> None:
     assert h.sostituzione == "SI" and h.data_compilazione == "05/03/2026" and h.anno_scolastico == "2025/2026"
     assert h.ore_pei == 12.5 and h.totale_mensile_dichiarato == 49.5
     assert res.confidence == 0.85 and res.is_foglio_firma is True
+    assert res.ocr_notes is None and rows[1].note is None and rows[1].prog_entrata is None
+    assert h.sostituzione == "SI"
+    assert ce.normalize_header(header_json(sostituzione="", data_compilazione="__/__/____")).sostituzione is None
+    assert ce.normalize_row({"incerti": ["Eff_Uscita", "boh"], "eff_uscita": "11:00"}, 2).incerti == ["eff_uscita"]
 
 
 def test_normalization_rows_missing_duplicated_or_unordered() -> None:
