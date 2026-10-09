@@ -15,8 +15,10 @@ Applicazione desktop "a un clic" che:
    — Comune di Napoli* (modello con intestazione Lotto, Municipalità, Ente,
    Istituto, Operatore, Alunno, Mese/Anno, Ore da PEI, Sostituzione e tabella
    giornaliera 1–31);
-2. legge la scrittura a mano con il miglior OCR disponibile
-   (**Claude Vision**, cloud) o con un **motore locale offline** (OpenCV + TrOCR);
+2. legge la scrittura a mano con il **motore locale offline** (OpenCV + TrOCR,
+   **predefinito**: gratuito, nessuna chiave API, i documenti non lasciano mai il
+   computer) oppure, in alternativa facoltativa, con **Claude Vision** (cloud, a pagamento,
+   precisione superiore);
 3. valida i dati (coerenza orari/ore, totali, firme, festività, ore PEI…),
    evidenziando campi **incerti** e **illeggibili**;
 4. mostra i dati in una **griglia stile Excel modificabile** accanto alla
@@ -103,7 +105,7 @@ def logs_dir() -> Path          # data_dir()/"log"
 def export_dir() -> Path        # platformdirs.user_documents_dir()/"Sirio OCR"/"Export"; override env SIRIO_EXPORT_DIR
 
 class Settings(BaseModel):
-    engine: Literal["claude", "locale"] = "claude"
+    engine: Literal["claude", "locale"] = "locale"   # predefinito: offline gratuito
     claude_model: str = "claude-opus-5-5"
     claude_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
     verifica_incrociata: bool = True     # seconda lettura mirata delle righe dubbie (solo Claude)
@@ -457,8 +459,10 @@ scuro. Viste:
 * **Anteprima Excel**: visualizzazione a schede dei fogli che verranno generati (Riepilogo,
   Dettaglio giornaliero, Anomalie) in griglia, con modifica diretta dei valori del dettaglio
   (scrive sul documento con `PUT`), poi "Genera Excel" → apri file / apri cartella / esportazioni precedenti.
-* **Impostazioni**: motore OCR (Claude consigliato / Locale offline), chiave API (campo password,
-  verifica), modello, effort, verifica incrociata, concorrenza, tema, cartelle dati/export, nota privacy.
+* **Impostazioni**: motore OCR — **Locale offline (predefinito, gratuito, privacy totale)** oppure
+  Claude Vision (facoltativo, a pagamento, precisione superiore); la sezione chiave API/modello/effort/
+  verifica incrociata è visibile solo se si sceglie Claude; concorrenza, tema, cartelle dati/export,
+  nota privacy. Nessun banner "configura la chiave API" quando il motore è quello locale.
 
 ## 5. Avvio "a un clic"
 

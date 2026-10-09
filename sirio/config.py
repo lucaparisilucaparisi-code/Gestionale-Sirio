@@ -76,7 +76,8 @@ def export_dir() -> Path:
 
 
 class Settings(BaseModel):
-    engine: Literal["claude", "locale"] = "claude"
+    # Motore predefinito: locale offline (gratuito, i documenti non lasciano il computer).
+    engine: Literal["claude", "locale"] = "locale"
     claude_model: str = "claude-opus-5-5"
     claude_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
     verifica_incrociata: bool = True

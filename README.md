@@ -32,19 +32,24 @@ dedicata (Microsoft Edge o Google Chrome in modalità applicazione).
 > *Ulteriori informazioni → Esegui comunque* (succede con i file scaricati da Internet).
 > **macOS:** la prima volta apri il file con *clic destro → Apri*.
 
-## Configurazione (una sola volta)
+## Motore di lettura
 
-Il motore di lettura consigliato è **Claude Vision** di Anthropic, oggi il sistema
-più accurato nella lettura della scrittura a mano su moduli.
+Sirio OCR funziona **subito, senza configurazione**: il motore predefinito è il
+**motore locale offline** (OpenCV + TrOCR), gratuito, senza chiave API e senza
+abbonamenti. I fogli firma **non lasciano mai il computer**. Al primo utilizzo
+viene scaricato una sola volta il modello di riconoscimento della scrittura a mano;
+da quel momento il programma funziona anche senza Internet.
 
-1. Crea una chiave API su [console.anthropic.com](https://console.anthropic.com)
-   (*Settings → API Keys → Create Key*) e ricarica un piccolo credito.
-2. In Sirio OCR apri **Impostazioni**, incolla la chiave e premi **Verifica chiave**.
-   La chiave viene conservata nel portachiavi protetto del sistema operativo.
+La scrittura a mano è difficile da leggere per qualunque sistema automatico: per
+questo ogni valore viene controllato (coerenza tra orari e ore, totali, firme…) e
+i campi **incerti** o **illeggibili** vengono evidenziati per una rapida verifica
+nella griglia di revisione, prima di generare l'Excel.
 
-In alternativa è disponibile il **motore locale offline** (OpenCV + TrOCR): i
-documenti non lasciano mai il computer e non ci sono costi, ma la precisione sulla
-scrittura a mano è inferiore e la revisione manuale è più impegnativa.
+**Facoltativo — Claude Vision (a pagamento).** Per una precisione superiore sulla
+scrittura difficile, in *Impostazioni* si può scegliere il motore cloud Claude di
+Anthropic: serve una chiave API da [console.anthropic.com](https://console.anthropic.com)
+(*Settings → API Keys*) con un piccolo credito. In questo caso le immagini dei
+fogli vengono inviate ad Anthropic (vedi *Privacy*).
 
 ## Come si usa
 
@@ -94,9 +99,11 @@ Per ogni foglio vengono verificati, tra gli altri:
 - prestazioni programmate ma non svolte (es. *Ponte di Carnevale*);
 - intestazione incompleta, campi incerti o illeggibili.
 
-## Costi indicativi (motore Claude)
+## Costi
 
-Il costo dipende dal modello scelto e da quanto è fitta la scrittura; l'applicazione
+Con il motore locale offline (predefinito) il programma è **completamente gratuito**.
+
+Solo se si sceglie il motore facoltativo Claude, il costo dipende dal modello scelto e da quanto è fitta la scrittura; l'applicazione
 mostra il costo effettivo di ogni foglio. Stime indicative per foglio firma:
 
 | Modello | Precisione | Costo stimato per foglio |
@@ -125,8 +132,9 @@ particolari di dati, art. 9 GDPR).
   sono in `.runtime/avvio.log` nella cartella del programma.
 - **Reinstallare da zero:** chiudi il programma, elimina la cartella `.runtime`
   e riavvia.
-- **Non installare il motore offline** (risparmia ~1 GB): imposta la variabile
-  d'ambiente `SIRIO_SENZA_OFFLINE=1` prima del primo avvio.
+- **Installazione senza motore offline** (solo per chi usa esclusivamente Claude,
+  risparmia ~1 GB): imposta la variabile d'ambiente `SIRIO_SENZA_OFFLINE=1` prima
+  del primo avvio.
 - **Registro dell'applicazione:** `sirio.log` nella cartella dati
   (Windows: `%LOCALAPPDATA%\SirioOCR\log`).
 
