@@ -288,13 +288,20 @@ Codici anomalia (gravità tra parentesi). Messaggi sempre in italiano, concreti,
 | `W09_TIMBRO_REFERENTE_MANCANTE` | attenzione | — |
 | `W10_TOTALE_MENSILE_ASSENTE` | attenzione | totale mensile non scritto |
 | `W11_DOPPIA_ASSENZA` | attenzione | crocette in entrambe le colonne assenza |
+| `W12_ORE_NON_INDICATE` | attenzione | orari effettivi presenti ma colonna "Tot. ore" vuota (ore ricavate dagli orari) |
 | `I01_ASSENZA_ALUNNO` | info | assenza alunno (con ore riconosciute e % sul programmato) |
 | `I02_ASSENZA_OPERATORE` | info | assenza operatore (con eventuale nota, es. 104) |
 | `I03_ORARIO_DIVERSO` | info | orario effettivo diverso dal programmato |
 | `I04_ORE_SENZA_PROGRAMMATO` | info | orario effettivo senza orario programmato |
+| `I05_NON_SVOLTO` | info | prestazione programmata ma non svolta (senza ore né assenze), con l'eventuale nota |
 
 `Totals.stato`: `errori` se n_errori > 0; altrimenti `da_verificare` se n_attenzioni > 0 o campi
 incerti/illeggibili > 0; altrimenti `ok`. Le settimane vanno da lunedì a domenica, troncate al mese.
+`WeekTotal.ore_pei` sono le ore PEI **attese** nella settimana, proporzionate ai giorni scolastici
+che la settimana contiene nel mese (W06 confronta invece con le ore PEI settimanali piene). Con
+assenza alunno sono ammesse ore dichiarate inferiori all'orario effettivo. Dal 2026 il 4 ottobre
+(San Francesco) è di nuovo festa nazionale (L. 151/2025). Helper per Excel e interfaccia:
+`CODICI` (legenda), `esito_riga`, `stato_campo` ("illeggibile" | "incerto" | ""), `etichetta_campo`.
 
 ### 4.7 `sirio/excel_export.py`
 
