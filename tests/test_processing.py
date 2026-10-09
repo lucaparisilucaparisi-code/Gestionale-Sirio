@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -13,13 +14,13 @@ import cv2
 import numpy as np
 import pytest
 
-from sirio import config
+from sirio import anagrafica, config
 from sirio.config import Settings
 from sirio.engines.base import EngineError
 from sirio.processing import GENERIC_ERROR, WAITING_NO_KEY, Processor, waiting_message
 from sirio.store import DocumentStore
 from tests.fake_engine import FakeEngine
-from tests.synthetic import make_synthetic_sheet
+from tests.synthetic import default_data, make_synthetic_sheet
 
 
 @pytest.fixture(autouse=True)
@@ -299,3 +300,83 @@ def test_stop_leaves_running_document_for_next_start(make_env, png: bytes) -> No
     wait_for(lambda: env.status(doc_id) == "in_lavorazione")
     env.processor.stop(timeout=0.2)
     assert env.status(doc_id) == "in_lavorazione"
+
+
+# --------------------------------------------------------------------------
+# Anagrafica: nomi letti male ricondotti a quelli gia' confermati
+# --------------------------------------------------------------------------
+
+def test_registry_corrects_misread_names(make_env, png: bytes) -> None:
+    reg = anagrafica.anagrafica_predefinita()          # quella della cartella dei dati del test
+    reg.aggiungi("operatore", "ROSSI MARIO")
+    reg.aggiungi("operatore", "ESPOSITO ANNA")
+    data = default_data()
+    data["header"]["operatore"] = "R0SSI MAR1O"         # lettura OCR rovinata
+    env = make_env(FakeEngine(delay=0.05, truths={"foglio.png": data}))
+    assert env.processor.anagrafica is reg
+    (doc_id,) = env.add(png)
+    wait_for(lambda: env.status(doc_id) == "completato")
+    doc = env.store.get(doc_id)
+    assert doc.header.operatore == "ROSSI MARIO"
+    assert "operatore" in doc.header.incerti            # sostituito ma da verificare (somiglianza 85%)
+    assert "Operatore riconosciuto dall'anagrafica" in doc.ocr_notes
+    assert "letto «R0SSI MAR1O»" in doc.ocr_notes and doc.ocr_notes.startswith("Lettura simulata")
+    # la lettura originale e' nelle note, non fra le correzioni dell'utente
+    assert doc.ocr_originali == {} and doc.user_edited == []
+    assert any(a.codice == "W04_CAMPO_INCERTO" and a.campo == "operatore" for a in doc.anomalies)
+    # nessun apprendimento dalla lettura grezza
+    assert reg.valori("operatore") == ["ESPOSITO ANNA", "ROSSI MARIO"]
+    assert reg.valori("alunno") == []
+
+
+def test_explicit_registry_is_used(tmp_path: Path, png: bytes) -> None:
+    reg = anagrafica.Anagrafica(tmp_path / "altra" / "anagrafica.json")
+    reg.aggiungi("alunno", "BIANCHI LUCA")
+    data = default_data()
+    data["header"]["alunno"] = "BlANCHI LUKA"
+    store = DocumentStore(tmp_path / "documenti")
+    proc = Processor(store, lambda: Settings(engine="claude"),
+                     lambda _s: FakeEngine(delay=0.02, truths={"f.png": data}), anagrafica=reg)
+    proc.start()
+    try:
+        doc_id = store.add_file("f.png", png, on_document=lambda d: proc.enqueue(d.id))[0].id
+        wait_for(lambda: store.get(doc_id).status == "completato")
+        assert store.get(doc_id).header.alunno == "BIANCHI LUCA"
+    finally:
+        proc.stop()
+
+
+def test_registry_failure_does_not_break_processing(make_env, png: bytes, monkeypatch: pytest.MonkeyPatch,
+                                                   caplog: pytest.LogCaptureFixture) -> None:
+    def broken(_self, _header):
+        raise RuntimeError("anagrafica danneggiata")
+
+    monkeypatch.setattr(anagrafica.Anagrafica, "correggi", broken)
+    env = make_env(FakeEngine(delay=0.05))
+    with caplog.at_level(logging.ERROR, logger="sirio.processing"):
+        (doc_id,) = env.add(png)
+        wait_for(lambda: env.status(doc_id) == "completato")
+    assert env.store.get(doc_id).header.operatore == "ROSSI MARIO"
+    assert any("anagrafica" in r.getMessage() for r in caplog.records)
+
+
+def test_reprocess_detaches_document_but_keeps_learned_names(make_env, png: bytes) -> None:
+    engine = FakeEngine(delay=0.05)
+    env = make_env(engine)
+    (doc_id,) = env.add(png)
+    wait_for(lambda: env.status(doc_id) == "completato")
+    reg = env.processor.anagrafica
+
+    def confirm(d) -> None:
+        d.user_verified = True
+
+    reg.impara_documento(env.store.update(doc_id, confirm))
+    assert reg.valori("operatore") == ["ROSSI MARIO"]
+    env.processor.enqueue(doc_id)
+    wait_for(lambda: len(engine.calls) == 2 and env.status(doc_id) == "completato")
+    wait_for(lambda: doc_id not in json.loads(reg.path.read_text(encoding="utf-8"))["documenti"])
+    doc = env.store.get(doc_id)
+    assert doc.user_verified is False
+    # la nuova lettura (non confermata) non ritira quanto appreso
+    assert reg.impara_documento(doc) is False
+    assert reg.valori("operatore") == ["ROSSI MARIO"] and reg.valori("alunno") == ["BIANCHI LUCA"]

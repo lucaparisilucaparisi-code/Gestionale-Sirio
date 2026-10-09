@@ -6,7 +6,7 @@
 # programma. Nessun privilegio di amministratore richiesto.
 #
 # Variabili d'ambiente facoltative:
-#   SIRIO_SENZA_OFFLINE=1   non installa il motore OCR offline (PyTorch/TrOCR, ~1 GB)
+#   SIRIO_SENZA_OFFLINE=1   non installa il motore OCR offline (PyTorch e modello TrOCR, ~2 GB)
 #   SIRIO_REINSTALLA=1      forza la reinstallazione delle dipendenze
 # Opzioni: --solo-installa  installa/aggiorna senza aprire l'applicazione
 set -euo pipefail
@@ -145,18 +145,31 @@ installa_dipendenze() {
     fi
 }
 
+scarica_modello() {
+    # Modello del motore offline scaricato subito (con l'avanzamento): il primo foglio
+    # non deve attenderlo. Un errore qui non impedisce l'avvio: il motore lo scarica
+    # comunque al primo utilizzo.
+    [ "${SIRIO_SENZA_OFFLINE:-0}" = "1" ] && return 0
+    echo
+    passo "Scarico il modello di riconoscimento della scrittura (circa 1,3 GB, solo la prima volta)..."
+    if ! (cd "$ROOT" && "$PY" -m sirio --scarica-modello); then
+        nota "Download del modello non completato: verrà scaricato automaticamente al primo utilizzo."
+    fi
+}
+
 PY="$VENV/bin/python"
 IMPRONTA="$(impronta)"
 if [ "${SIRIO_REINSTALLA:-0}" = "1" ] || [ ! -x "$PY" ] || [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$IMPRONTA" ]; then
     if [ ! -x "$PY" ]; then
         passo "Primo avvio: preparo il programma. Serve la connessione a Internet."
-        nota "Lo scaricamento avviene una sola volta (circa 1 GB con il motore offline)."
+        nota "Lo scaricamento avviene una sola volta (circa 2 GB con il motore offline, modello incluso)."
         echo
     else
         passo "Aggiornamento dei componenti..."
     fi
     installa_dipendenze
     printf '%s' "$IMPRONTA" > "$STAMP"
+    scarica_modello
     echo
     passo "Installazione completata."
 fi

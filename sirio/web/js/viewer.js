@@ -30,7 +30,8 @@ export class ScanViewer {
     this.stage.className = 'viewer-stage';
     this.img = document.createElement('img');
     this.img.alt = 'Scansione del foglio firma';
-    this.img.decoding = 'async';
+    // decodifica sincrona: evita che Chrome mostri la pagina vuota durante lo zoom (checker-imaging)
+    this.img.decoding = 'sync';
     this.svg = document.createElementNS(NS, 'svg');
     this.svg.setAttribute('class', 'viewer-overlay');
     this.svg.setAttribute('preserveAspectRatio', 'none');
@@ -67,7 +68,8 @@ export class ScanViewer {
     this.ready = false;
     this.stage.style.visibility = 'hidden';
     return new Promise((resolve, reject) => {
-      this.img.onload = () => {
+      this.img.onload = async () => {
+        try { await this.img.decode(); } catch { /* già decodificata o non necessario */ }
         this.natW = this.img.naturalWidth;
         this.natH = this.img.naturalHeight;
         this.stage.style.width = `${this.natW}px`;

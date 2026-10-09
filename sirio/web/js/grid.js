@@ -68,9 +68,23 @@ export class SheetGrid {
     document.addEventListener('paste', this._onPaste);
 
     this.render();
+    if (opts.excel) {
+      // righe vuote di riempimento (come in Excel) adattate all'altezza disponibile
+      this.ro = new ResizeObserver(() => {
+        if (this.rows.length <= VIRTUAL_THRESHOLD && this.fillerCount() !== this.fillers && !this.editing) this.renderBody(true);
+      });
+      this.ro.observe(host);
+    }
+  }
+
+  fillerCount() {
+    if (!this.opts.excel || !this.rows.length || this.rows.length > VIRTUAL_THRESHOLD) return 0;
+    const free = this.host.clientHeight - this.headH - this.rows.length * this.rowH;
+    return Math.max(0, Math.ceil(free / this.rowH));
   }
 
   destroy() {
+    this.ro?.disconnect();
     this.cancelEdit();
     this.hideError();
     const h = this.host;
@@ -193,6 +207,13 @@ export class SheetGrid {
       if (start > 0) parts.push(`<tr class="spacer" aria-hidden="true"><td colspan="${span}" style="height:${start * this.rowH}px;padding:0;border:0"></td></tr>`);
       for (let r = start; r < end; r++) parts.push(this.rowHTML(r));
       if (end < this.rows.length) parts.push(`<tr class="spacer" aria-hidden="true"><td colspan="${span}" style="height:${(this.rows.length - end) * this.rowH}px;padding:0;border:0"></td></tr>`);
+      this.fillers = this.fillerCount();
+      if (this.fillers) {
+        const empty = this.cols.slice(1).map(() => '<td class="filler"></td>').join('');
+        for (let i = 0; i < this.fillers; i++) {
+          parts.push(`<tr class="filler-row" aria-hidden="true"><td class="rowhead is-excel">${this.rows.length + i + 2}</td>${empty}</tr>`);
+        }
+      }
     }
     this.tbody.innerHTML = parts.join('');
     this.applyActive(false);
@@ -217,7 +238,7 @@ export class SheetGrid {
       return `<td class="rowhead is-excel" data-c="${c}">${r + 2}</td>`;
     }
     const st = this.opts.cellState ? this.opts.cellState(row, col) : null;
-    let cls = col.align ? `ta-${col.align}` : (col.type === 'bool' || col.type === 'time' ? 'ta-c' : (col.type === 'hours' || col.type === 'num' ? 'ta-r' : ''));
+    let cls = col.align ? `ta-${col.align}` : (col.type === 'bool' || col.type === 'time' ? 'ta-c' : (col.type === 'hours' || col.type === 'num' || col.type === 'calc' ? 'ta-r' : ''));
     if (col.type === 'rowhead') cls += ' rowhead';
     if (col.cls) cls += ' ' + col.cls;
     if (!this.isEditable(c, row) && col.type !== 'rowhead') cls += col.type === 'calc' ? ' is-calc' : ' is-ro';
@@ -291,6 +312,8 @@ export class SheetGrid {
     const fresh = document.createElement('tbody');
     fresh.innerHTML = this.rowHTML(r);
     tr.replaceWith(fresh.firstElementChild);
+    if (this.active?.r === r) this.applyActive(false);
+    if (this.hoverKey !== null && this.hoverKey !== undefined) this.setHoverRow(this.hoverKey);
   }
 
   refreshRowByKey(key) {
@@ -300,7 +323,11 @@ export class SheetGrid {
 
   /* ============================================================ selezione */
   applyActive(scroll = true) {
-    this.host.querySelectorAll('td.is-active').forEach((td) => td.classList.remove('is-active'));
+    this.host.querySelectorAll('td.is-active').forEach((td) => {
+      td.classList.remove('is-active');
+      td.removeAttribute('id');
+      td.removeAttribute('aria-selected');
+    });
     this.host.querySelectorAll('tr.is-active-row').forEach((tr) => tr.classList.remove('is-active-row'));
     this.host.querySelectorAll('th.is-active-col').forEach((th) => th.classList.remove('is-active-col'));
     if (!this.active) return;
@@ -308,7 +335,13 @@ export class SheetGrid {
     const tr = this.trAt(r);
     if (tr) {
       tr.classList.add('is-active-row');
-      tr.querySelector(`td[data-c="${c}"]`)?.classList.add('is-active');
+      const td = tr.querySelector(`td[data-c="${c}"]`);
+      if (td) {
+        td.classList.add('is-active');
+        td.id = `${this.id}-active`;
+        td.setAttribute('aria-selected', 'true');
+        this.host.setAttribute('aria-activedescendant', td.id);
+      }
     }
     this.colHeads[c]?.classList.add('is-active-col');
     this.letterHeads[c]?.classList.add('is-active-col');
@@ -590,6 +623,10 @@ export class SheetGrid {
     const ed = this.editing;
     if (!ed) return;
     const k = e.key;
+    // i tasti gestiti dall'editor non devono arrivare alla griglia (altrimenti Invio
+    // riaprirebbe subito l'editor sulla cella successiva); passano solo le scorciatoie globali
+    const global = k === 'F8' || e.altKey || ((e.ctrlKey || e.metaKey) && k === 'Enter');
+    if (!global) e.stopPropagation();
     const move = (dr, dc, wrap = false) => {
       e.preventDefault();
       if (this.commitEdit()) { this.move(dr, dc, { wrap }); this.focus(); }
@@ -605,7 +642,6 @@ export class SheetGrid {
       if (this.commitEdit()) this.focus();
       this.opts.onSaveShortcut?.();
     }
-    e.stopPropagation();
   }
 
   parseFor(col, text) {
@@ -633,7 +669,6 @@ export class SheetGrid {
   commitEdit({ keepOnError = true } = {}) {
     const ed = this.editing;
     if (!ed) return true;
-    const row = this.rows[ed.r];
     const col = this.cols[ed.c];
     const parsed = this.parseFor(col, ed.input.value);
     if (!parsed.ok) {

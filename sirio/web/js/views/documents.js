@@ -32,7 +32,7 @@ function isDone(d) { return d.status === 'completato' && d.is_foglio_firma !== f
 
 /** Elenco degli id nell'ordine mostrato (per «precedente/successivo» nella revisione). */
 export function reviewOrder() {
-  const all = store.documents.filter((d) => d.status !== 'in_coda' && d.status !== 'in_lavorazione');
+  const all = store.documents;
   const list = (store.navList || []).filter((id) => all.some((d) => d.id === id));
   return list.length ? list : all.map((d) => d.id);
 }
@@ -273,6 +273,7 @@ export function mount(root, { navigate, query }) {
     const allOn = list.length > 0 && list.every((d) => state.selected.has(d.id));
     const someOn = list.some((d) => state.selected.has(d.id));
     setHTML(body, html`<div class="card table-card"><div class="table-wrap"><table class="table">
+      <colgroup><col style="width:44px"><col style="width:54px"><col><col style="width:13%"><col style="width:13%"><col style="width:124px"><col style="width:62px"><col style="width:128px"><col style="width:124px"><col style="width:84px"><col style="width:48px"></colgroup>
       <thead><tr>
         <th class="col-check"><label class="check" aria-label="Seleziona tutti"><input type="checkbox" data-check="__all" ${allOn ? raw('checked') : ''}><span class="check-box">${raw('<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>')}</span></label></th>
         <th class="col-thumb"></th>

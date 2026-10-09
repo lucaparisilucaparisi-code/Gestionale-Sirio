@@ -13,6 +13,7 @@ export const store = {
   loaded: false,
   uploading: false,
   connection: 'ok',        // 'ok' | 'lost'
+  registry: null,          // anagrafica dei nomi confermati (GET /api/anagrafica)
 };
 
 export function subscribe(fn) {
@@ -107,6 +108,19 @@ export async function saveSettings(patch) {
   store.settings = data;
   emit('settings');
   return data;
+}
+
+/* ------------------------------------------------------------------ anagrafica */
+// Nomi già confermati (operatori, alunni, istituti, enti): suggerimenti nell'intestazione
+// e gestione nelle impostazioni. Facoltativa: se il server non la espone resta vuota.
+let registryPromise = null;
+export function loadRegistry(force = false) {
+  if (!registryPromise || force) {
+    registryPromise = get('/api/anagrafica')
+      .then((data) => { store.registry = data; emit('registry'); return data; })
+      .catch(() => { store.registry = store.registry || null; return store.registry; });
+  }
+  return registryPromise;
 }
 
 export function setUploading(v) {

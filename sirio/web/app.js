@@ -26,8 +26,8 @@ const app = { current: null, route: null, name: null, railPref: storageGet('siri
 const media = window.matchMedia('(prefers-color-scheme: dark)');
 export function applyTheme(tema) {
   const t = tema || 'auto';
-  storageSet('sirio.tema', t);
-  try { localStorage.setItem('sirio.tema', t); } catch { /* ignorato */ }
+  // valore semplice (non JSON): lo legge anche lo script iniziale di index.html
+  try { localStorage.setItem('sirio.tema', t); } catch { /* archiviazione non disponibile */ }
   const dark = t === 'scuro' || (t === 'auto' && media.matches);
   document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
 }
@@ -102,7 +102,10 @@ function navItem(route, label, ic) {
 function applyRail() {
   const shell = document.getElementById('app');
   const narrow = window.innerWidth < 1240;
-  const wantRail = app.route?.rail ? !app.railOverride || app.railPref : (narrow || app.railPref);
+  let wantRail;
+  if (app.railOverride) wantRail = app.railPref;          // scelta esplicita dell'utente in questa vista
+  else if (app.route?.rail) wantRail = true;              // revisione: più spazio alla scansione e alla griglia
+  else wantRail = narrow || app.railPref;
   shell.classList.toggle('is-rail', !!wantRail);
   document.querySelectorAll('.nav-item').forEach((a) => {
     if (wantRail) a.setAttribute('data-tip', a.dataset.tipLabel || '');

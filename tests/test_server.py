@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -20,12 +21,13 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from sirio import anagrafica
 from sirio import app as sirio_app
 from sirio import config, server
 from sirio.processing import Processor
 from sirio.store import DocumentStore
 from tests.fake_engine import FakeEngine
-from tests.synthetic import make_synthetic_sheet, sheet_to_pdf
+from tests.synthetic import default_data, make_synthetic_sheet, sheet_to_pdf
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "token-di-prova-1234567890"
@@ -870,3 +872,216 @@ def test_dev_server_runs(tmp_path: Path) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
+
+
+# ==========================================================================
+# Anagrafica
+# ==========================================================================
+
+def _registry_values(env: Env, campo: str) -> list[str]:
+    r = env.client.get("/api/anagrafica")
+    assert r.status_code == 200, r.text
+    return [v["valore"] for v in r.json()["campi"][campo]]
+
+
+def test_registry_endpoints_require_token_and_local_host(env: Env) -> None:
+    assert env.anon.get("/api/anagrafica").status_code == 403
+    assert env.anon.post("/api/anagrafica", json={"campo": "operatore", "valore": "ROSSI MARIO"}).status_code == 403
+    assert env.anon.delete("/api/anagrafica/operatore/ROSSI%20MARIO").status_code == 403
+    # il cookie della pagina non basta per le modifiche
+    env.anon.cookies.set("sirio_token", TOKEN)
+    assert env.anon.post("/api/anagrafica", json={"campo": "operatore", "valore": "X Y"}).status_code == 403
+    r = env.client.get("/api/anagrafica", headers={"Host": "attaccante.example:8123"})
+    assert r.status_code == 403
+    assert _registry_values(env, "operatore") == []
+
+
+def test_registry_endpoints(env: Env) -> None:
+    r = env.client.get("/api/anagrafica")
+    assert r.json() == {"campi": {c: [] for c in anagrafica.CAMPI}, "associazioni": []}
+    r = env.client.post("/api/anagrafica", json={"campo": "istituto", "valore": "  IC 1 Verdi/Bis "})
+    assert r.status_code == 200, r.text
+    (voce,) = r.json()["campi"]["istituto"]
+    assert voce["valore"] == "IC 1 Verdi/Bis" and voce["conteggio"] == 0 and voce["manuale"] is True
+    env.client.post("/api/anagrafica", json={"campo": "operatore", "valore": "ROSSI MARIO"})
+    for payload, needle in (
+        ({"campo": "mese", "valore": "ROSSI"}, "sconosciuto"),
+        ({"campo": "operatore", "valore": "1"}, "almeno due lettere"),
+        ({"campo": "operatore"}, "Dati non validi"),
+    ):
+        r = env.client.post("/api/anagrafica", json=payload)
+        assert r.status_code == 422 and needle in r.json()["detail"], (payload, r.text)
+    # eliminazione (anche con barre e spazi nel valore, senza distinzione di maiuscole)
+    r = env.client.delete("/api/anagrafica/istituto/ic%201%20verdi%2Fbis")
+    assert r.status_code == 200 and r.json()["campi"]["istituto"] == []
+    r = env.client.delete("/api/anagrafica/istituto/IC%201%20VERDI")
+    assert r.status_code == 404 and "non è presente" in r.json()["detail"]
+    assert env.client.delete("/api/anagrafica/lotto/1").status_code == 422
+    assert _registry_values(env, "operatore") == ["ROSSI MARIO"]
+
+
+def test_put_learns_only_trusted_values_and_corrects_next_sheets(env: Env, png: bytes, pdf: bytes) -> None:
+    doc_id = env.completed_doc(png)
+    # nulla viene appreso dalla sola lettura OCR
+    assert _registry_values(env, "operatore") == []
+    # correzione a mano dell'operatore: si apprende il nuovo valore, non quello letto
+    d = env.client.put(f"/api/documents/{doc_id}", json={"header": {"operatore": "ROSSINI MARIO"}}).json()
+    assert d["ocr_originali"] == {"header.operatore": "ROSSI MARIO"}
+    assert _registry_values(env, "operatore") == ["ROSSINI MARIO"]
+    assert _registry_values(env, "alunno") == []
+    # conferma del documento: tutta l'intestazione e l'associazione
+    env.client.put(f"/api/documents/{doc_id}", json={"user_verified": True})
+    data = env.client.get("/api/anagrafica").json()
+    assert [v["valore"] for v in data["campi"]["alunno"]] == ["BIANCHI LUCA"]
+    assert [v["valore"] for v in data["campi"]["istituto"]] == ["IC 1 VERDI"]
+    (assoc,) = data["associazioni"]
+    assert (assoc["operatore"], assoc["alunno"], assoc["ore_pei"]) == ("ROSSINI MARIO", "BIANCHI LUCA", 15.0)
+    # il foglio del mese successivo, letto male, viene ricondotto ai nomi confermati
+    nxt = default_data()
+    nxt["header"].update(operatore="R0SSINI MAR1O", alunno="BlANCHI LUKA")
+    env.engine.truths["altro.pdf"] = nxt
+    other = env.upload(("altro.pdf", pdf)).json()["documents"][0]["id"]
+    env.wait_status(other)
+    d = env.doc(other)
+    assert (d["header"]["operatore"], d["header"]["alunno"]) == ("ROSSINI MARIO", "BIANCHI LUCA")
+    assert "letto «R0SSINI MAR1O»" in d["ocr_notes"] and "associazione nota" in d["ocr_notes"]
+    assert d["stati_intestazione"]["operatore"] == "incerto"
+    # una correzione successiva sullo stesso documento sostituisce il valore appreso
+    env.client.put(f"/api/documents/{doc_id}", json={"header": {"operatore": "ROSSINI MARIA"}})
+    assert _registry_values(env, "operatore") == ["ROSSINI MARIA"]
+    # l'eliminazione dei documenti non cancella quanto appreso
+    assert env.client.delete(f"/api/documents/{doc_id}").status_code == 200
+    assert env.client.delete("/api/documents").status_code == 200
+    assert _registry_values(env, "operatore") == ["ROSSINI MARIA"]
+    assert _registry_values(env, "alunno") == ["BIANCHI LUCA"]
+
+
+# ==========================================================================
+# Download del modello offline (--scarica-modello)
+# ==========================================================================
+
+def _fake_model(cache: Path, model: str = "microsoft/trocr-base-handwritten") -> Path:
+    repo = cache / ("models--" + model.replace("/", "--"))
+    snap = repo / "snapshots" / "0123abcd"
+    snap.mkdir(parents=True)
+    for name in ("config.json", "preprocessor_config.json", "vocab.json", "model.safetensors"):
+        (snap / name).write_text("{}", encoding="utf-8")
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("0123abcd", encoding="utf-8")
+    return snap
+
+
+class _Console(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_parse_args_download_option() -> None:
+    assert sirio_app.parse_args([]).scarica_modello is None
+    assert sirio_app.parse_args(["--scarica-modello"]).scarica_modello == ""
+    assert sirio_app.parse_args(["--scarica-modello", "org/modello"]).scarica_modello == "org/modello"
+
+
+def test_download_model_cli_progress_and_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from sirio.engines import local_engine as le
+    from sirio.engines.base import EngineError
+
+    monkeypatch.setenv("SIRIO_DATA_DIR", str(tmp_path / "dati"))
+    calls: list[tuple[str, Path]] = []
+
+    def fake_download(name: str, cache: Path, progress) -> Path:
+        calls.append((name, cache))
+        progress(0.0, "Connessione a huggingface.co per scaricare il modello TrOCR base…")
+        for done in ("0", "335", "670", "1.340"):
+            mb = float(done.replace(".", ""))
+            progress(0.99 * mb / 1340,
+                     f"Download del modello TrOCR base (solo al primo utilizzo): {done} MB di 1.340 MB…")
+        progress(1.0, "Modello TrOCR base scaricato.")
+        return _fake_model(cache)
+
+    monkeypatch.setattr(le, "download_model", fake_download)
+    console = _Console()
+    assert sirio_app.download_model_cli(stream=console) == 0
+    # modello delle impostazioni, nella cartella predefinita (dati/modelli)
+    assert calls == [(le.DEFAULT_MODEL, tmp_path / "dati" / "modelli")]
+    text = console.getvalue()
+    assert "Connessione a huggingface.co" in text
+    assert "\r     Download del modello TrOCR base:  49%  (670 MB di 1.340 MB)" in text
+    assert "100%" in text and text.rstrip().endswith("scaricato in " + str(calls[0][1] / "models--microsoft--"
+                                                                            "trocr-base-handwritten" / "snapshots"
+                                                                            / "0123abcd"))
+    # gia' presente: nessun download
+    console = _Console()
+    assert sirio_app.download_model_cli(stream=console) == 0
+    assert "Modello già presente: TrOCR base" in console.getvalue() and len(calls) == 1
+    # senza console (output reindirizzato): una riga ogni 10%, senza ritorni a capo sul posto
+    plain = io.StringIO()
+    assert sirio_app.download_model_cli("microsoft/trocr-small-handwritten", cache_dir=tmp_path / "c",
+                                        stream=plain) == 0
+    assert "\r" not in plain.getvalue() and plain.getvalue().count("Download del modello") == 5   # 0, 24, 49, 99, 100%
+
+    def failing(*_a, **_k):
+        raise EngineError("Impossibile scaricare il modello per il riconoscimento offline: nessuna connessione.")
+
+    monkeypatch.setattr(le, "download_model", failing)
+    err = io.StringIO()
+    assert sirio_app.download_model_cli(cache_dir=tmp_path / "vuota", stream=io.StringIO(), error_stream=err) == 1
+    assert err.getvalue().strip() == ("Download del modello non riuscito: Impossibile scaricare il modello per il "
+                                      "riconoscimento offline: nessuna connessione.")
+
+
+def _cli_env() -> dict[str, str]:
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env.pop("SIRIO_DATA_DIR", None)
+    return env
+
+
+def test_cli_download_model_when_already_present(tmp_path: Path) -> None:
+    data = tmp_path / "dati"
+    _fake_model(data / "modelli")
+    res = subprocess.run([sys.executable, "-m", "sirio", "--scarica-modello", "--cartella-dati", str(data)],
+                         cwd=ROOT, env=_cli_env(), capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stderr
+    assert "Modello già presente: TrOCR base" in res.stdout
+    # nessun server avviato
+    assert not (data / "istanza.json").exists() and not (data / "istanza.lock").exists()
+
+
+def test_cli_download_model_error(tmp_path: Path) -> None:
+    env = {**_cli_env(), "HF_HUB_OFFLINE": "1"}        # nessun accesso alla rete
+    res = subprocess.run([sys.executable, "-m", "sirio", "--scarica-modello", "sirio-prova/modello-inesistente",
+                          "--cartella-dati", str(tmp_path / "dati")],
+                         cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+    assert res.returncode == 1
+    assert "Download del modello non riuscito" in res.stderr
+    assert "Impossibile scaricare il modello" in res.stderr or "non è disponibile" in res.stderr
+    assert "Traceback" not in res.stdout + res.stderr
+
+
+def test_cli_download_model_with_cached_real_model(tmp_path: Path) -> None:
+    from sirio.engines import local_engine as le
+
+    raw = os.environ.get("SIRIO_HF_CACHE")
+    if not raw or le.local_model_path(le.DEFAULT_MODEL, Path(raw)) is None:
+        pytest.skip("modello TrOCR non presente nella cache SIRIO_HF_CACHE")
+    data = tmp_path / "dati"
+    data.mkdir()
+    try:
+        (data / "modelli").symlink_to(Path(raw), target_is_directory=True)
+    except OSError:
+        pytest.skip("collegamenti simbolici non disponibili")
+    res = subprocess.run([sys.executable, "-m", "sirio", "--scarica-modello", "--cartella-dati", str(data)],
+                         cwd=ROOT, env=_cli_env(), capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stderr
+    assert "Modello già presente: TrOCR base" in res.stdout
+
+
+def test_launchers_prefetch_model() -> None:
+    sh = (ROOT / "launcher" / "avvia.sh").read_text(encoding="utf-8")
+    assert '"$PY" -m sirio --scarica-modello' in sh and "SIRIO_SENZA_OFFLINE" in sh
+    if subprocess.run(["bash", "--version"], capture_output=True).returncode == 0:
+        assert subprocess.run(["bash", "-n", str(ROOT / "launcher" / "avvia.sh")]).returncode == 0
+    raw = (ROOT / "launcher" / "avvia.ps1").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf") and raw.count(b"\r\n") == raw.count(b"\n")   # UTF-8 con BOM, CRLF
+    ps1 = raw.decode("utf-8-sig")
+    assert "-m sirio --scarica-modello" in ps1 and "Save-ModelloOffline" in ps1

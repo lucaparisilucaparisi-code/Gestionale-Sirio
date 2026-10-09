@@ -47,6 +47,7 @@ sirio/
   validation.py                parsing orari/ore, controlli, totali
   excel_export.py              generazione del file .xlsx
   store.py                     archivio documenti su disco
+  anagrafica.py                anagrafica appresa (nomi confermati) e correzione dei nomi letti
   processing.py                coda di elaborazione (thread)
   server.py                    API FastAPI + file statici dell'interfaccia
   vision/
@@ -365,7 +366,9 @@ Thread-safe (`threading.RLock`). Id documento: `uuid4().hex[:12]`.
 ```python
 class Processor:
     def __init__(self, store: DocumentStore, settings_provider: Callable[[], Settings],
-                 engine_factory: Callable[[Settings], OCREngine] = get_engine)
+                 engine_factory: Callable[[Settings], OCREngine] = get_engine,
+                 anagrafica: Anagrafica | None = None)      # None = anagrafica_predefinita()
+    anagrafica: Anagrafica                                   # proprietà: quella usata (condivisa col server)
     def start(self) -> None          # avvia i worker; rimette in coda i documenti rimasti "in_lavorazione"/"in_coda"
     def stop(self) -> None
     def enqueue(self, doc_id: str) -> None
@@ -374,15 +377,19 @@ class Processor:
 ```
 
 Ciclo per documento: `in_lavorazione` → carica pagina e griglia → `engine.extract` (avanzamento
-→ `doc.progress`, `doc.status_message`, salvataggio con frequenza limitata) →
+→ `doc.progress`, `doc.status_message`, salvataggio con frequenza limitata) → **anagrafica**
+(`anagrafica.applica_al_risultato`: nomi letti male ricondotti a quelli già confermati, per
+qualunque motore; un suo errore viene registrato e non blocca la lettura) →
 `doc.apply_extraction` → `validate_document` → `completato` (o `scartato` se non è un foglio firma,
-`errore` con messaggio in caso di eccezione). Se il motore non è disponibile, i documenti restano
+`errore` con messaggio in caso di eccezione). Dopo una rilettura il contributo del documento
+all'anagrafica viene scollegato (`scollega_documento`): quanto appreso resta. Se il motore non è disponibile, i documenti restano
 `in_coda` con `status_message` esplicativo finché `kick()`.
 Concorrenza: `settings.concorrenza` per Claude, 1 per il motore locale.
 
 ### 4.10 `sirio/server.py` — API HTTP (FastAPI)
 
-`create_app(store, processor, token: str, on_shutdown: Callable | None = None) -> FastAPI`.
+`create_app(store, processor, token: str, on_shutdown: Callable | None = None, ..., anagrafica: Anagrafica | None = None) -> FastAPI`
+(anagrafica predefinita: `processor.anagrafica`).
 Ascolto solo su `127.0.0.1`. Ogni richiesta `/api/*` deve avere l'header `X-Sirio-Token: <token>`
 (403 altrimenti) e un header `Host` locale (`127.0.0.1:<porta>` o `localhost:<porta>`). La pagina
 `index.html` è servita con il token inserito in `<meta name="sirio-token" content="...">`
@@ -410,6 +417,9 @@ Risposte JSON; errori `{"detail": "messaggio italiano"}`.
 | `GET /api/exports` | — | `[{"filename", "path", "size", "created_at", "url"}]` |
 | `GET /api/exports/{filename}` | — | download `.xlsx` (solo file nella cartella export) |
 | `POST /api/open` | `{"target": "export_dir" \| "file", "filename"?: str}` | apre cartella/file con il programma predefinito del sistema |
+| `GET /api/anagrafica` | — | `{"campi": {"operatore"\|"alunno"\|"istituto"\|"ente": [{"valore", "conteggio", "ultimo_uso", "manuale"}]}, "associazioni": [{"operatore", "alunno", "istituto", "ente", "lotto", "municipalita", "ore_pei", "conteggio", "ultimo_uso"}]}` |
+| `POST /api/anagrafica` | `{"campo", "valore"}` (aggiunta manuale) | come GET; 422 se campo sconosciuto o valore non valido |
+| `DELETE /api/anagrafica/{campo}/{valore}` | valore codificato nell'URL (può contenere `/`; maiuscole, accenti e ordine dei nomi indifferenti) | come GET; 404 se la voce non esiste |
 | `POST /api/heartbeat` | — | `{"ok": true}` |
 | `POST /api/bye` | — | `{"ok": true}` (la finestra si sta chiudendo) |
 
@@ -425,10 +435,22 @@ campi_illeggibili, stato}, "cost_usd", "thumb_url"}`.
 Modifica (`PUT`): i campi cambiati rispetto al valore precedente vengono aggiunti a
 `user_edited` (chiavi `header.<campo>` / `rows.<giorno>.<campo>`), il valore OCR originale viene
 memorizzato in `ocr_originali` (solo la prima volta) e il campo viene tolto da `incerti`/`illeggibili`.
+Dopo ogni `PUT` riuscito il documento viene passato a `Anagrafica.impara_documento` (vedi 4.13: se
+confermato si apprende l'intera intestazione, altrimenti solo i campi anagrafici corretti a mano).
+L'eliminazione di documenti (`DELETE /api/documents[/{id}]`) scollega i loro contributi senza
+cancellare quanto appreso.
 
 ### 4.11 `sirio/app.py` — avvio e ciclo di vita
 
-`python -m sirio [--porta N] [--senza-finestra] [--cartella-dati DIR]`:
+`python -m sirio [--porta N] [--senza-finestra] [--cartella-dati DIR]`
+
+`python -m sirio --scarica-modello [MODELLO] [--cartella-dati DIR]`: scarica soltanto il modello del
+motore offline (predefinito quello di `settings.local_model`) in `local_engine.default_cache_dir()`
+con una riga d'avanzamento aggiornata sul posto (percentuale e MB) e termina, senza server né
+finestra né lucchetto d'istanza. Uscita 0 se il modello è disponibile (anche "Modello già presente"),
+1 con il messaggio d'errore in italiano su stderr. Registro solo su file. Usato dai programmi di avvio.
+
+Avvio normale:
 
 1. istanza singola: file `data_dir()/istanza.json` `{port, pid, token}`; se un'istanza risponde a
    `/api/health`, apre solo una nuova finestra verso di essa ed esce;
@@ -465,6 +487,82 @@ scuro. Viste:
   verifica incrociata è visibile solo se si sceglie Claude; concorrenza, tema, cartelle dati/export,
   nota privacy. Nessun banner "configura la chiave API" quando il motore è quello locale.
 
+### 4.13 `sirio/anagrafica.py` — anagrafica appresa
+
+Operatori, alunni, istituti ed enti ricorrono ogni mese: i nomi letti male (soprattutto dal motore
+offline, es. «TOMBREU ALESSIA») vengono ricondotti ai nomi già **confermati dall'utente**.
+File `data_dir()/"anagrafica.json"` (scrittura atomica, `threading.RLock`, istanza condivisa per
+cartella dati con `anagrafica_predefinita()`; un file illeggibile viene messo da parte come
+`anagrafica.json.illeggibile-<data>` e si riparte da zero).
+
+```python
+CAMPI = ("operatore", "alunno", "istituto", "ente")
+CAMPI_ASSOCIAZIONE = ("alunno", "istituto", "ente", "lotto", "municipalita", "ore_pei")
+class Anagrafica:
+    def __init__(self, path: Path)
+    def impara_documento(self, doc: Document) -> bool        # idempotente; True se cambiata
+    def scollega_documento(self, doc_id: str) -> None        # documento eliminato/riletto: quanto appreso resta
+    def scollega_tutti(self) -> None
+    def correggi(self, header: Header) -> list[Riconoscimento]   # modifica header (valori, incerti, illeggibili)
+    def aggiungi(self, campo: str, valore: str) -> dict      # ValueError (italiano) se non valido
+    def rimuovi(self, campo: str, valore: str) -> bool       # anche dalle associazioni
+    def valori(self, campo: str) -> list[str]                # per uso decrescente
+    def esporta(self) -> dict                                # contenuto di GET /api/anagrafica
+def applica_al_risultato(result: ExtractionResult, anagrafica: Anagrafica) -> list[Riconoscimento]
+    # correggi(result.header) + frasi aggiunte a result.ocr_notes
+def note(decisioni) -> list[str]
+def normalizza(testo) -> str ; def chiave(testo) -> str ; def confronta(letto, noto) -> Somiglianza
+def anagrafica_predefinita() -> Anagrafica
+```
+
+**Apprendimento solo da dati affidabili** (mai dalla lettura OCR grezza): documento confermato
+(`user_verified`) → i quattro campi anagrafici e l'associazione operatore → {alunno, istituto, ente,
+lotto, municipalità, ore PEI} (chiave operatore+alunno: un operatore può seguire più alunni; vale
+l'ultimo valore confermato); documento non confermato → solo i campi anagrafici corretti a mano
+(`header.<campo>` in `user_edited`); aggiunta manuale. Il contributo di ogni documento è
+memorizzato (`documenti`): il ricalcolo a ogni salvataggio è idempotente, una correzione
+successiva sostituisce il valore appreso prima dallo stesso documento (gli errori di battitura
+corretti non restano), togliere la conferma ritira ciò che non è stato scritto a mano. Il
+`conteggio` di una voce è il numero di documenti che la confermano; le voci manuali restano anche
+con conteggio 0.
+
+**Somiglianza** (`confronta`): testi normalizzati (maiuscole, senza accenti/punteggiatura, spazi
+compattati, ordine dei nomi «NOME COGNOME»/«COGNOME NOME» indifferente — rotazioni delle parole);
+`valore` = media fra `difflib.SequenceMatcher.ratio` e una distanza di modifica pesata (scambi di
+lettere adiacenti, confusioni tipiche come O/0, I/1, M/H, U/N a costo 0,5); `copertura` = parola
+peggio ritrovata (ricerca approssimata di ogni parola di ≥ 3 lettere nell'altro testo, in entrambe
+le direzioni); `sospetta` = differiscono solo per vocali finali (MARIO/MARIA) o numeri diversi
+(«IC 9»/«IC 10»).
+
+**Regole di decisione** (`SOGLIE`, calibrate su letture reali del motore locale e ~1.700 letture
+simulate: ~72% dei nomi letti male ricondotti alla voce giusta, nessuna sostituzione errata, < 1%
+di persone nuove sostituite — e comunque segnalate incerte):
+
+| Campo | sostituzione (punteggio) | copertura (con associazione) | suggerimento |
+|---|---|---|---|
+| operatore, alunno | 0,72 | 0,60 (0,40) | 0,70 |
+| istituto | 0,62 | 0,35 (0,25) | 0,55 |
+| ente | 0,70 | 0,55 (0,30) | 0,55 |
+
+* lettura identica a una voce (a meno di maiuscole/accenti/ordine): si usa la voce, il campo non è
+  più incerto ("lettura confermata" nelle note se il motore lo aveva segnalato);
+* punteggio = somiglianza + bonus d'associazione (0,10 se la voce è associata all'operatore — o
+  all'alunno — riconosciuto, 0,15 se alla coppia operatore+alunno); se ≥ soglia, copertura
+  sufficiente, distacco ≥ `MARGINE` (0,08) dal secondo candidato e non `sospetta` → **sostituita**;
+  resta incerta se somiglianza < `CERTEZZA` (0,90), copertura < 0,80 o numeri diversi. Nota:
+  «Operatore riconosciuto dall'anagrafica (somiglianza 92%): letto «…», usato «…».» (la lettura
+  originale sta in `ocr_notes`, non in `ocr_originali`, che resta riservato alle correzioni
+  dell'utente);
+* candidati troppo vicini (**ambiguo**) o un solo candidato sopra la soglia di suggerimento ma non
+  sostituibile (**simile**): lettura invariata, campo incerto, candidati nelle note;
+* sotto la soglia di suggerimento: nome nuovo, nessuna modifica;
+* ordine: operatore, alunno (con l'associazione dell'operatore), di nuovo l'operatore con
+  l'associazione dell'alunno se non era stato riconosciuto, istituto ed ente;
+* campi **illeggibili** (valore `None` e in `illeggibili`) proposti solo da un'associazione
+  univoca dell'operatore/alunno riconosciuti (es. un solo alunno noto per quell'operatore; anche
+  operatore, istituto, ente, lotto, municipalità, ore PEI): il campo passa da `illeggibili` a
+  `incerti`.
+
 ## 5. Avvio "a un clic"
 
 * Windows: doppio clic su `Avvia Sirio OCR.bat` → `launcher/avvia.ps1`.
@@ -472,6 +570,9 @@ scuro. Viste:
 
 Il bootstrap scarica **uv** (Astral) nella cartella `.runtime/` del programma, che installa Python
 3.12 gestito e tutte le dipendenze (`uv sync --extra offline`, PyTorch solo CPU) in
-`.runtime/venv`; ai successivi avvii verifica solo che tutto sia aggiornato (pochi secondi). Ripiego:
+`.runtime/venv`; subito dopo un'installazione riuscita (salvo `SIRIO_SENZA_OFFLINE=1`) esegue
+`<python> -m sirio --scarica-modello` per scaricare il modello di riconoscimento (circa 1,3 GB, con
+l'avanzamento in console): un errore non blocca l'avvio, il modello verrà scaricato al primo
+utilizzo. Ai successivi avvii verifica solo che tutto sia aggiornato (pochi secondi). Ripiego:
 Python di sistema ≥ 3.10 + `venv` + `pip`. Al primo avvio su Windows crea il collegamento "Sirio OCR"
 sul desktop con icona. Nessun privilegio di amministratore richiesto.

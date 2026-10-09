@@ -4,10 +4,10 @@
 import { authUrl, del, get, post, put } from '../api.js';
 import { SheetGrid } from '../grid.js';
 import { ART, icon } from '../icons.js';
-import { docById, pokePolling, refreshState, store } from '../state.js';
+import { docById, loadRegistry, pokePolling, refreshState, store } from '../state.js';
 import { confirmDialog, dialog, emptyState, showMenu, statusBadge, toast, toastError } from '../ui.js';
 import {
-  $, $$, MESI, capitalize, clamp, debounce, esc, fmtOre, fmtPeriodo, fmtSigned, fmtTime, hoursBetween,
+  $, MESI, capitalize, clamp, debounce, esc, fmtOre, fmtPeriodo, fmtSigned, fmtTime, hoursBetween,
   html, isTypingTarget, parseHours, plural, raw, setHTML, storageGet, storageSet,
 } from '../util.js';
 import { ScanViewer } from '../viewer.js';
@@ -21,7 +21,7 @@ const LABELS = {
   assenza_operatore: 'Assenza operatore', firma: 'Firma operatore', note: 'Note', trattino_effettivo: 'Trattino negli orari effettivi',
   anno_scolastico: 'Anno scolastico', lotto: 'Lotto', municipalita: 'Municipalità', ente: 'Ente',
   istituto: 'Istituto scolastico', operatore: 'Operatore', alunno: 'Alunno', mese: 'Mese', anno: 'Anno',
-  ore_pei: 'Ore da PEI', sostituzione: 'Sostituzione', data_compilazione: 'Data di compilazione',
+  ore_pei: 'Ore PEI', sostituzione: 'Sostituzione', data_compilazione: 'Data di compilazione',
   firma_coordinatore: 'Firma coordinatore', timbro_referente: 'Timbro referente', totale_mensile_dichiarato: 'Totale mensile',
 };
 // campi dell'intestazione nell'ordine del modulo (per F8 e per il modulo)
@@ -83,6 +83,7 @@ class Review {
     this.focusArea = 'grid';
     this.scheduleSave = debounce(() => this.flush(), 450);
     this.build();
+    loadRegistry().then(() => { if (this.doc) this.renderHeader(); });
     this._key = (e) => this.onKey(e);
     document.addEventListener('keydown', this._key);
   }
@@ -149,7 +150,7 @@ class Review {
                   <span class="legend-item"><span class="legend-sw sw-weekend"></span>Festivo</span>
                 </div>
               </div>
-              <div id="rv-grid" style="flex:1;min-height:0;display:flex"></div>
+              <div id="rv-grid"></div>
             </div>
             <div class="card totals" id="rv-totals"></div>
             <div id="rv-overlay"></div>
@@ -237,19 +238,19 @@ class Review {
   buildGrid() {
     const host = $('#rv-grid', this.root);
     const columns = [
-      { key: 'giorno', label: 'Giorno', type: 'rowhead', width: 48, render: (row) => String(row.giorno), cellTip: (row, info) => info?.tip || '' },
-      { key: 'gg', label: 'Gg', type: 'ro', width: 44, align: 'c', render: (row) => this.renderWeekday(row) },
-      { key: 'prog_entrata', group: 'Orario programmato', label: 'Entrata', type: 'time', width: 62 },
-      { key: 'prog_uscita', group: 'Orario programmato', label: 'Uscita', type: 'time', width: 62 },
-      { key: 'eff_entrata', group: 'Orario effettivo', label: 'Entrata', type: 'time', width: 62 },
-      { key: 'eff_uscita', group: 'Orario effettivo', label: 'Uscita', type: 'time', width: 62 },
-      { key: 'ore_dichiarate', group: 'Ore', label: 'Dichiarate', type: 'hours', width: 72, tip: 'Colonna «Tot. ore effettive» scritta sul foglio' },
-      { key: 'ore_calcolate', group: 'Ore', label: 'Calcolate', type: 'calc', width: 72, tip: 'Calcolate dagli orari effettivi (uscita − entrata)', render: (row) => this.renderCalc(row) },
-      { key: 'assenza_alunno', group: 'Assenza', label: 'Alunno', type: 'bool', variant: 'cross', width: 54 },
-      { key: 'assenza_operatore', group: 'Assenza', label: 'Operat.', type: 'bool', variant: 'cross', width: 54, tip: 'Assenza dell\'operatore' },
+      { key: 'giorno', label: 'Giorno', type: 'rowhead', width: 56, render: (row) => String(row.giorno), cellTip: (row, info) => info?.tip || '' },
+      { key: 'gg', label: 'Gg', type: 'ro', width: 44, align: 'c', cls: 'is-tight', render: (row) => this.renderWeekday(row), tip: 'Giorno della settimana' },
+      { key: 'prog_entrata', group: 'Programmato', label: 'Entrata', type: 'time', width: 60 },
+      { key: 'prog_uscita', group: 'Programmato', label: 'Uscita', type: 'time', width: 60 },
+      { key: 'eff_entrata', group: 'Effettivo', label: 'Entrata', type: 'time', width: 60 },
+      { key: 'eff_uscita', group: 'Effettivo', label: 'Uscita', type: 'time', width: 60 },
+      { key: 'ore_dichiarate', group: 'Ore', label: 'Dichiar.', type: 'hours', width: 66, tip: 'Ore dichiarate: colonna «Tot. ore effettive» scritta sul foglio' },
+      { key: 'ore_calcolate', group: 'Ore', label: 'Calcol.', type: 'calc', width: 64, tip: 'Ore calcolate dagli orari effettivi (uscita − entrata)', render: (row) => this.renderCalc(row) },
+      { key: 'assenza_alunno', group: 'Assenza', label: 'Alunno', type: 'bool', variant: 'cross', width: 56 },
+      { key: 'assenza_operatore', group: 'Assenza', label: 'Operat.', type: 'bool', variant: 'cross', width: 58, tip: 'Assenza dell\'operatore' },
       { key: 'firma', label: 'Firma', type: 'bool', variant: 'sign', width: 52, tip: 'Firma dell\'operatore' },
-      { key: 'note', label: 'Note', type: 'text', minWidth: 100, maxLength: 500 },
-      { key: 'esito', label: 'Esito', type: 'ro', width: 108, render: (row) => this.renderEsito(row) },
+      { key: 'note', label: 'Note', type: 'text', minWidth: 96, maxLength: 500 },
+      { key: 'esito', label: 'Esito', type: 'ro', width: 112, render: (row) => this.renderEsito(row) },
     ];
     this.grid = new SheetGrid(host, {
       columns,
@@ -347,9 +348,10 @@ class Review {
       if (!this.anomByDay.has(a.giorno)) this.anomByDay.set(a.giorno, []);
       this.anomByDay.get(a.giorno).push(a);
     }
+    if (!fresh && data.grid && JSON.stringify(data.grid) !== JSON.stringify(this.viewer.grid)) this.viewer.setGrid(data.grid);
+    this.grid.readOnly = !this.editable();
     if (this.grid.editing) this.needsGridRefresh = true;
     else this.grid.setRows(data.rows);
-    if (fresh) this.grid.readOnly = false;
     this.renderTitle();
     this.renderHeader();
     this.renderAnoms();
@@ -444,9 +446,10 @@ class Review {
     el.className = `save-ind is-${state}`;
     if (state === 'saving') setHTML(el, html`<span class="spinner"></span>Salvataggio…`);
     else if (state === 'dirty') setHTML(el, html`${icon('edit')}Modifiche in sospeso`);
-    else if (state === 'saved') setHTML(el, html`${icon('check-circle')}Salvato alle ${fmtTime(this.lastSaved || new Date())}`);
+    else if (state === 'saved') setHTML(el, html`${icon('check-circle')}<span class="txt">Salvato alle ${fmtTime(this.lastSaved || new Date())}</span>`);
     else if (state === 'error') setHTML(el, html`${icon('alert-circle')}<span data-tip="${err?.message || ''}">Non salvato</span><button type="button" class="link-btn" data-retry>Riprova</button>`);
-    else setHTML(el, html`${icon('check')}<span>Salvataggio automatico</span>`);
+    else setHTML(el, html`${icon('check')}<span class="txt">Salvataggio automatico</span>`);
+    el.setAttribute('data-tip', state === 'saved' ? `Tutte le modifiche sono salvate (${fmtTime(this.lastSaved || new Date())})` : 'Le modifiche vengono salvate automaticamente');
   }
 
   /* ============================================================ valori e stati delle celle */
@@ -521,15 +524,15 @@ class Review {
     const info = this.giorni.get(row.giorno);
     const text = info?.esito || '';
     if (!text) return '';
-    let tone = 'tone-ok'; let label = 'OK'; let ic = 'check';
-    if (text.startsWith('Errore')) { tone = 'tone-err'; label = 'Errore'; ic = 'x-circle'; }
-    else if (text.startsWith('Da verificare')) { tone = 'tone-warn'; label = 'Da verificare'; ic = 'alert-triangle'; }
-    else if (text === 'Assenza operatore') { tone = 'tone-neutral'; label = 'Ass. operatore'; ic = 'user'; }
-    else if (text === 'Assenza alunno') { tone = 'tone-info'; label = 'Ass. alunno'; ic = 'user'; }
-    else if (text === 'Non svolto') { tone = 'tone-neutral'; label = 'Non svolto'; ic = 'dash'; }
+    let tone = 'tone-ok'; let label = 'OK';
+    if (text.startsWith('Errore')) { tone = 'tone-err'; label = 'Errore'; }
+    else if (text.startsWith('Da verificare')) { tone = 'tone-warn'; label = 'Da verificare'; }
+    else if (text === 'Assenza operatore') { tone = 'tone-neutral'; label = 'Ass. operatore'; }
+    else if (text === 'Assenza alunno') { tone = 'tone-info'; label = 'Ass. alunno'; }
+    else if (text === 'Non svolto') { tone = 'tone-neutral'; label = 'Non svolto'; }
     const anoms = (this.anomByDay?.get(row.giorno) || []).map((a) => `• ${a.messaggio}`).join('\n');
     const tip = anoms ? `${text}\n${anoms}` : text;
-    return `<span class="esito ${tone}" data-tip="${esc(tip)}">${icon(ic)}${esc(label)}</span>`;
+    return `<span class="esito ${tone}" data-tip="${esc(tip)}">${esc(label)}</span>`;
   }
 
   /* ============================================================ modifica della griglia */
@@ -554,8 +557,14 @@ class Review {
         continue;
       }
       patch[key] = ch.value === undefined ? null : ch.value;
+      const local = { [key]: patch[key] };
+      if ((key === 'eff_entrata' || key === 'eff_uscita') && patch[key] === null && ch.old === '-') {
+        // cancellato il trattino: la prestazione non è più segnata come «non svolta»
+        patch.trattino_effettivo = false;
+        local.trattino_effettivo = false;
+      }
       this.pending.rows.set(g, patch);
-      this.applyRowPatch(this.doc, g, { [key]: patch[key] });
+      this.applyRowPatch(this.doc, g, local);
     }
     this.markDirty();
     this.renderTotals();
@@ -580,7 +589,8 @@ class Review {
       }
       this.track(doc, row, key, `rows.${g}.${key}`, row[key] ?? null, value);
     }
-    if (dash) row.trattino_effettivo = true;
+    if ('trattino_effettivo' in patch) row.trattino_effettivo = !!patch.trattino_effettivo;
+    else if (dash) row.trattino_effettivo = true;
     else if ((row.eff_entrata || row.eff_uscita) && ('eff_entrata' in patch || 'eff_uscita' in patch)) row.trattino_effettivo = false;
   }
 
@@ -686,6 +696,9 @@ class Review {
     if (flagged.some((k) => HEADER_MORE.has(k))) this.hdrMore = true;
     const active = document.activeElement;
     const focusedKey = this.hdrEl.contains(active) ? active.dataset.key : null;
+    // testo che l'utente sta digitando (non ancora confermato): va conservato
+    const typing = focusedKey && active.matches('input.input') && active.value !== (active.dataset.orig ?? '')
+      ? { value: active.value, start: active.selectionStart, end: active.selectionEnd } : null;
     const ro = !this.editable();
     const label = (key) => {
       const st = this.headerState(key);
@@ -697,23 +710,25 @@ class Review {
     const cls = (key) => { const st = this.headerState(key); return st ? ` is-${st}` : ''; };
     const confirmBtn = (key) => (this.headerState(key) === 'uncert' && !ro
       ? html`<button type="button" class="btn btn-sm btn-ghost btn-icon input-addon" data-confirm="${key}" aria-label="Conferma il valore letto" data-tip="Conferma il valore letto">${icon('check')}</button>` : '');
+    const reg = store.registry?.campi || {};
     const text = (key, span, ph = '') => {
       const v = h[key] ?? '';
       const st = this.headerState(key);
-      return html`<div class="field span-${span}">${label(key)}<div class="input-group">
-        <input class="input${cls(key)}" id="hf-${key}" data-key="${key}" data-kind="text" value="${v}" data-orig="${v}" placeholder="${st === 'illeg' ? 'Illeggibile' : ph}" autocomplete="off" spellcheck="false" ${ro ? raw('readonly') : ''}>
+      const list = reg[key]?.length ? raw(` list="dl-${key}"`) : '';
+      return html`<div class="field span-${span} f-${key}">${label(key)}<div class="input-group">
+        <input class="input${cls(key)}" id="hf-${key}" data-key="${key}" data-kind="text" value="${v}" data-orig="${v}" placeholder="${st === 'illeg' ? 'Illeggibile' : ph}" autocomplete="off" spellcheck="false"${list} ${ro ? raw('readonly') : ''}>
         ${confirmBtn(key)}</div></div>`;
     };
     const hours = (key, span) => {
       const v = h[key] === null || h[key] === undefined ? '' : fmtOre(h[key]);
       const st = this.headerState(key);
-      return html`<div class="field span-${span}">${label(key)}<div class="input-group">
+      return html`<div class="field span-${span} f-${key}">${label(key)}<div class="input-group">
         <input class="input num${cls(key)}" id="hf-${key}" data-key="${key}" data-kind="hours" value="${v}" data-orig="${v}" inputmode="decimal" placeholder="${st === 'illeg' ? 'Illeggibile' : '—'}" autocomplete="off" ${ro ? raw('readonly') : ''}>
         ${confirmBtn(key)}</div></div>`;
     };
     const toggle = (key, span) => {
       const st = this.headerState(key);
-      return html`<div class="field span-${span}">${label(key)}
+      return html`<div class="field span-${span} f-${key}">${label(key)}
         <label class="toggle-field${st ? ` is-${st}` : ''}">
           <span>${h[key] ? 'Presente' : 'Assente'}</span>
           <span class="switch is-sm"><input type="checkbox" id="hf-${key}" data-key="${key}" data-kind="bool" ${h[key] ? raw('checked') : ''} ${ro ? raw('disabled') : ''}><span class="switch-track"></span></span>
@@ -737,10 +752,10 @@ class Review {
         ${text('alunno', 3, 'Cognome e nome')}
         ${text('istituto', 3)}
         ${text('ente', 3)}
-        <div class="field span-2">${label('mese')}<select class="select${cls('mese')}" id="hf-mese" data-key="mese" data-kind="month" ${ro ? raw('disabled') : ''}>${monthOpts}</select></div>
-        <div class="field span-1">${label('anno')}<input class="input num${cls('anno')}" id="hf-anno" data-key="anno" data-kind="year" value="${h.anno ?? ''}" data-orig="${h.anno ?? ''}" inputmode="numeric" maxlength="4" autocomplete="off" ${ro ? raw('readonly') : ''}></div>
+        <div class="field span-2 f-mese">${label('mese')}<select class="select${cls('mese')}" id="hf-mese" data-key="mese" data-kind="month" ${ro ? raw('disabled') : ''}>${monthOpts}</select></div>
+        <div class="field span-1 f-anno">${label('anno')}<input class="input num${cls('anno')}" id="hf-anno" data-key="anno" data-kind="year" value="${h.anno ?? ''}" data-orig="${h.anno ?? ''}" inputmode="numeric" maxlength="4" autocomplete="off" ${ro ? raw('readonly') : ''}></div>
         ${hours('ore_pei', 1)}
-        <div class="field span-2">${label('sostituzione')}<select class="select${cls('sostituzione')}" id="hf-sostituzione" data-key="sostituzione" data-kind="sost" ${ro ? raw('disabled') : ''}>
+        <div class="field span-2 f-sostituzione">${label('sostituzione')}<select class="select${cls('sostituzione')}" id="hf-sostituzione" data-key="sostituzione" data-kind="sost" ${ro ? raw('disabled') : ''}>
           <option value="" ${!h.sostituzione ? raw('selected') : ''}>—</option><option value="NO" ${h.sostituzione === 'NO' ? raw('selected') : ''}>No</option><option value="SI" ${h.sostituzione === 'SI' ? raw('selected') : ''}>Sì</option></select></div>
         ${hours('totale_mensile_dichiarato', 2)}
         ${toggle('firma_coordinatore', 2)}
@@ -751,10 +766,17 @@ class Review {
           ${text('anno_scolastico', 3, 'es. 2025/2026')}
           ${text('data_compilazione', 3, 'gg/mm/aaaa')}
         </div>
-      </div>`);
+      </div>
+      ${['operatore', 'alunno', 'istituto', 'ente'].filter((k) => reg[k]?.length).map((k) => html`<datalist id="dl-${k}">${reg[k].map((e) => html`<option value="${e.valore}"></option>`)}</datalist>`)}`);
     if (focusedKey) {
       const el = this.hdrEl.querySelector(`[data-key="${focusedKey}"]`);
-      if (el && el !== active) el.focus();
+      if (el && el !== active) {
+        el.focus();
+        if (typing && el.matches('input.input')) {
+          el.value = typing.value;
+          try { el.setSelectionRange(typing.start, typing.end); } catch { /* campo senza selezione */ }
+        }
+      }
     }
   }
 
@@ -848,6 +870,12 @@ class Review {
   /* ============================================================ scansione */
   syncScan(row = this.grid.activeRow, col = this.grid.activeCol) {
     if (!row || !col || !this.viewer.ready) return;
+    if (this.doc && (this.doc.is_foglio_firma === false || this.doc.status === 'scartato')) {
+      // pagina non riconosciuta: nessuna tabella da evidenziare
+      this.viewer.highlight({});
+      $('#rv-tag', this.root).textContent = '';
+      return;
+    }
     const g = row.giorno;
     let cellBox = null;
     if (DAY_COLS.includes(col.key)) cellBox = this.viewer.cellBox(g, col.key);
@@ -866,6 +894,7 @@ class Review {
 
   updateMarks() {
     if (!this.doc || !this.viewer.ready) return;
+    if (this.doc.is_foglio_firma === false || this.doc.status === 'scartato') { this.viewer.setMarks([]); return; }
     const marks = [];
     for (const row of this.doc.rows) {
       for (const key of row.illeggibili || []) marks.push({ kind: 'illeggibile', box: this.viewer.cellBox(row.giorno, key) });
@@ -1025,15 +1054,15 @@ class Review {
     const tot = d.header?.totale_mensile_dichiarato;
     const diff = tot === null || tot === undefined ? null : Math.round((dich - tot) * 100) / 100;
     const diffCls = diff === null ? '' : (Math.abs(diff) > 0.01 ? 'is-bad' : 'is-good');
-    const calcWarn = Math.abs(calc - dich) > 0.01 && calc > 0;
+    const calcWarn = (d.anomalies || []).some((a) => a.codice === 'E01_ORE_NON_COERENTI');
     setHTML($('#rv-totals', this.root), html`
       <div class="total"><span class="total-label">Ore dichiarate</span><span class="total-value">${fmtOre(dich) || '0'}</span></div>
-      <div class="total ${calcWarn ? 'is-warn' : ''}" ${calcWarn ? raw(`data-tip="Somma delle ore calcolate dagli orari effettivi: differisce di ${esc(fmtSigned(calc - dich))} ore dalle ore dichiarate (assenze dell'alunno e giorni senza orario incluse)."`) : ''}><span class="total-label">Ore calcolate</span><span class="total-value">${fmtOre(calc) || '0'}</span></div>
+      <div class="total ${calcWarn ? 'is-warn' : ''}" ${calcWarn ? raw('data-tip="In almeno un giorno le ore dichiarate non corrispondono agli orari effettivi (vedi le anomalie)."') : ''}><span class="total-label">Ore calcolate</span><span class="total-value">${fmtOre(calc) || '0'}</span></div>
       <div class="total" data-tip="Per ogni giorno: ore dichiarate, oppure calcolate dagli orari se mancanti; zero con assenza dell'operatore."><span class="total-label">Ore riconosciute</span><span class="total-value">${fmtOre(ric) || '0'}</span></div>
       <div class="total ${tot === null || tot === undefined ? 'is-warn' : ''}"><span class="total-label">Totale mensile</span><span class="total-value">${tot === null || tot === undefined ? raw('<small>non indicato</small>') : fmtOre(tot)}</span></div>
       <div class="total ${diffCls}" data-tip="Ore dichiarate meno il totale mensile scritto sul foglio"><span class="total-label">Differenza</span><span class="total-value">${diff === null ? '—' : fmtSigned(diff)}${diffCls === 'is-good' ? icon('check-circle', 'icon-sm') : ''}${diffCls === 'is-bad' ? icon('alert-triangle', 'icon-sm') : ''}</span></div>
       <div class="total"><span class="total-label">Giorni lavorati</span><span class="total-value">${lav}</span></div>
-      <div class="total" data-tip="Assenze dell'alunno · assenze dell'operatore"><span class="total-label">Assenze alunno · operat.</span><span class="total-value">${aa}<small>·</small>${ao}</span></div>`);
+      <div class="total" data-tip="${aa} ${aa === 1 ? 'assenza' : 'assenze'} dell'alunno · ${ao} ${ao === 1 ? 'assenza' : 'assenze'} dell'operatore"><span class="total-label">Assenze al. · op.</span><span class="total-value">${aa}<small>·</small>${ao}</span></div>`);
   }
 
   /* ============================================================ stato del documento */
@@ -1110,6 +1139,7 @@ class Review {
     this.renderTitle();
     await this.flush();
     if (this.saveState === 'error') return;
+    loadRegistry(true);
     if (verify) {
       const next = this.nextToVerify();
       toast({

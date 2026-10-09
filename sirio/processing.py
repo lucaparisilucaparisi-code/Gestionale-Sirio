@@ -5,7 +5,8 @@ documento, fino al limite di concorrenza (``settings.concorrenza`` per Claude,
 1 per il motore locale). Ciclo di un documento::
 
     in_coda -> in_lavorazione -> engine.extract (avanzamento salvato al massimo
-    4 volte al secondo) -> apply_extraction -> validate_document
+    4 volte al secondo) -> anagrafica (nomi letti male ricondotti a quelli gia'
+    confermati, vedi ``sirio.anagrafica``) -> apply_extraction -> validate_document
             -> completato | scartato (non e' un foglio firma) | errore
 
 Se il motore scelto non e' disponibile (es. manca la chiave API) i documenti
@@ -26,6 +27,7 @@ from collections import deque
 from collections.abc import Callable
 
 from sirio import config
+from sirio.anagrafica import Anagrafica, anagrafica_predefinita, applica_al_risultato
 from sirio.config import Settings
 from sirio.engines.base import EngineError, OCREngine, PageInput, get_engine
 from sirio.models import Document, ExtractionResult
@@ -163,10 +165,12 @@ class Processor:
         store: DocumentStore,
         settings_provider: Callable[[], Settings],
         engine_factory: Callable[[Settings], OCREngine] = get_engine,
+        anagrafica: Anagrafica | None = None,
     ):
         self.store = store
         self._settings_provider = settings_provider
         self._engine_factory = engine_factory
+        self._anagrafica = anagrafica
 
         # coda e lavori in corso
         self._cond = threading.Condition(threading.RLock())
@@ -361,6 +365,24 @@ class Processor:
         if not ok and kind == "claude" and not config.get_api_key():
             return False, MESSAGE_NO_KEY
         return ok, message
+
+    # ================================================================ anagrafica
+    @property
+    def anagrafica(self) -> Anagrafica:
+        """Anagrafica usata per correggere i nomi letti (predefinita: quella della cartella dei dati)."""
+        return self._anagrafica if self._anagrafica is not None else anagrafica_predefinita()
+
+    def _apply_registry(self, doc_id: str, result: ExtractionResult) -> None:
+        """Riconduce i nomi letti a quelli gia' confermati; un problema dell'anagrafica non
+        deve mai far fallire la lettura (il risultato resta quello del motore)."""
+        try:
+            decisions = applica_al_risultato(result, self.anagrafica)
+        except Exception:  # noqa: BLE001
+            log.exception("Applicazione dell'anagrafica non riuscita per %s", doc_id)
+            return
+        changed = [d.campo for d in decisions if d.esito in ("sostituito", "dedotto")]
+        if changed:
+            log.info("Documento %s: anagrafica applicata a %s", doc_id, ", ".join(changed))
 
     # ================================================================ motore
     def _settings(self) -> Settings:
@@ -582,6 +604,7 @@ class Processor:
             self._fail(doc_id, gen, GENERIC_ERROR)
             return
         sink.close()
+        self._apply_registry(doc_id, result)
         elapsed = round(time.monotonic() - started, 2)
 
         def finish(doc: Document) -> None:
@@ -612,6 +635,12 @@ class Processor:
             return
         if done is not None:
             log.info("Documento %s: %s in %.1f s (%s)", doc_id, done.status, elapsed, done.totals.stato)
+            # le correzioni precedenti sono state sostituite dalla nuova lettura: quanto
+            # appreso da questo documento resta nell'anagrafica ma non e' piu' legato a esso
+            try:
+                self.anagrafica.scollega_documento(doc_id)
+            except Exception:  # noqa: BLE001
+                log.exception("Aggiornamento dell'anagrafica non riuscito per %s", doc_id)
 
     def _fail(self, doc_id: str, gen: int, message: str) -> None:
         def mark(doc: Document) -> None:

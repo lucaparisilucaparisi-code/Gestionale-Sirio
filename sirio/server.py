@@ -45,6 +45,7 @@ from starlette.staticfiles import StaticFiles
 
 from sirio import __version__, calendario, config, pdf_io
 from sirio import validation as val
+from sirio.anagrafica import Anagrafica, anagrafica_predefinita
 from sirio.models import DAY_FIELDS, HEADER_FIELDS, DayRow, Document, Header
 from sirio.processing import Processor
 from sirio.store import DocumentNotFound, DocumentStore, PartialImportError
@@ -846,6 +847,12 @@ class KeyTestRequest(BaseModel):
     model: str | None = None
 
 
+class RegistryEntryRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    campo: str
+    valore: str
+
+
 def _call(callback: Callable[[], Any] | None, what: str) -> None:
     if callback is None:
         return
@@ -862,8 +869,12 @@ def create_app(
     on_shutdown: Callable[[], Any] | None = None,
     on_heartbeat: Callable[[], Any] | None = None,
     on_bye: Callable[[], Any] | None = None,
+    anagrafica: Anagrafica | None = None,
 ) -> FastAPI:
-    """Crea l'applicazione FastAPI (vedi docs/ARCHITETTURA.md, 4.10)."""
+    """Crea l'applicazione FastAPI (vedi docs/ARCHITETTURA.md, 4.10).
+
+    ``anagrafica``: predefinita quella della coda di elaborazione (la stessa che corregge i
+    nomi letti), quindi quella della cartella dei dati."""
     if not token:
         raise ValueError("Token di sessione mancante.")
     app = FastAPI(title="Sirio OCR", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
@@ -895,6 +906,29 @@ def create_app(
     async def _unexpected(_request: Request, exc: Exception) -> JSONResponse:
         log.error("Errore non gestito", exc_info=exc)
         return _json({"detail": "Errore interno: l'operazione non è riuscita. Dettagli nel registro sirio.log."}, 500)
+
+    def _registry() -> Anagrafica:
+        if anagrafica is not None:
+            return anagrafica
+        shared = getattr(processor, "anagrafica", None)
+        return shared if isinstance(shared, Anagrafica) else anagrafica_predefinita()
+
+    def _learn(doc: Document) -> None:
+        """Apprende i valori affidabili del documento (confermato o corretto a mano):
+        un problema dell'anagrafica non deve mai impedire il salvataggio del documento."""
+        try:
+            _registry().impara_documento(doc)
+        except Exception:  # noqa: BLE001
+            log.exception("Aggiornamento dell'anagrafica non riuscito per il documento %s", doc.id)
+
+    def _forget(doc_id: str | None = None) -> None:
+        try:
+            if doc_id is None:
+                _registry().scollega_tutti()
+            else:
+                _registry().scollega_documento(doc_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Aggiornamento dell'anagrafica non riuscito")
 
     def _doc_or_404(doc_id: str) -> Document:
         doc = store.get(doc_id)
@@ -1033,6 +1067,7 @@ def create_app(
         processor.discard_all()
         store.clear()
         pages.drop()
+        _forget()          # quanto appreso resta nell'anagrafica
         return _json({"ok": True})
 
     @app.get("/api/documents/{doc_id}")
@@ -1047,6 +1082,7 @@ def create_app(
         updated = store.update(doc_id, lambda d: apply_document_update(d, payload))
         if updated is None:
             raise ApiError(404, "Documento non trovato: potrebbe essere stato eliminato.")
+        _learn(updated)
         grid = store.load_grid(doc_id)
         return _json(document_payload(updated, grid.to_dict() if grid else None))
 
@@ -1062,6 +1098,7 @@ def create_app(
         if not store.delete(doc_id):
             raise ApiError(404, "Documento non trovato: potrebbe essere già stato eliminato.")
         pages.drop(doc_id)
+        _forget(doc_id)    # quanto appreso resta nell'anagrafica
         return _json({"ok": True})
 
     @app.get("/api/documents/{doc_id}/image")
@@ -1130,6 +1167,31 @@ def create_app(
         else:
             docs = [d for d in docs if _exportable(d)]
         return _json(preview_payload(docs, giorni_vuoti=giorni_vuoti))
+
+    # ------------------------------------------------------------ anagrafica
+    def _registry_change(action: Callable[[Anagrafica], Any]) -> Any:
+        try:
+            return action(_registry())
+        except ValueError as exc:
+            raise ApiError(422, str(exc)) from None
+        except OSError as exc:
+            log.exception("Salvataggio dell'anagrafica non riuscito")
+            raise ApiError(500, f"Impossibile salvare l'anagrafica: {exc.strerror or exc}.") from None
+
+    @app.get("/api/anagrafica")
+    def get_registry() -> JSONResponse:
+        return _json(_registry().esporta())
+
+    @app.post("/api/anagrafica")
+    def add_registry_entry(body: RegistryEntryRequest) -> JSONResponse:
+        _registry_change(lambda reg: reg.aggiungi(body.campo.strip(), body.valore))
+        return _json(_registry().esporta())
+
+    @app.delete("/api/anagrafica/{campo}/{valore:path}")
+    def delete_registry_entry(campo: str, valore: str) -> JSONResponse:
+        if not _registry_change(lambda reg: reg.rimuovi(campo, valore)):
+            raise ApiError(404, f"«{_short(valore)}» non è presente nell'anagrafica.")
+        return _json(_registry().esporta())
 
     # ------------------------------------------------------------ impostazioni
     def _engines() -> dict:

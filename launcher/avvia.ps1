@@ -6,7 +6,7 @@
 # controlla in pochi secondi che sia tutto aggiornato e apre l'applicazione.
 #
 # Variabili d'ambiente facoltative:
-#   SIRIO_SENZA_OFFLINE=1   non installa il motore OCR offline (PyTorch/TrOCR, ~1 GB)
+#   SIRIO_SENZA_OFFLINE=1   non installa il motore OCR offline (PyTorch e modello TrOCR, ~2 GB)
 #   SIRIO_REINSTALLA=1      forza la reinstallazione delle dipendenze
 
 param(
@@ -174,6 +174,31 @@ function New-CollegamentoDesktop {
     }
 }
 
+function Save-ModelloOffline {
+    # Modello del motore offline scaricato subito (con l'avanzamento): il primo foglio
+    # non deve attenderlo. Un errore qui non impedisce l'avvio: il motore lo scarica
+    # comunque al primo utilizzo.
+    if ($env:SIRIO_SENZA_OFFLINE -eq '1') { return }
+    $python = Join-Path $Venv 'Scripts\python.exe'
+    if (-not (Test-Path $python)) { return }
+    Write-Host ''
+    Write-Passo 'Scarico il modello di riconoscimento della scrittura (circa 1,3 GB, solo la prima volta)...'
+    $ErrorActionPreference = 'Continue'   # i messaggi su stderr non devono interrompere lo script
+    $esito = 1
+    Push-Location $Root
+    try {
+        & $python -m sirio --scarica-modello
+        $esito = $LASTEXITCODE
+    } catch {
+        $esito = 1
+    } finally {
+        Pop-Location
+    }
+    if ($esito -ne 0) {
+        Write-Nota 'Download del modello non completato: verrà scaricato automaticamente al primo utilizzo.'
+    }
+}
+
 try {
     Write-Titolo
     $pythonw = Join-Path $Venv 'Scripts\pythonw.exe'
@@ -184,7 +209,7 @@ try {
         $primo = -not (Test-Path $pythonw)
         if ($primo) {
             Write-Passo 'Primo avvio: preparo il programma. Serve la connessione a Internet.'
-            Write-Nota 'Lo scaricamento avviene una sola volta (circa 1 GB con il motore offline).'
+            Write-Nota 'Lo scaricamento avviene una sola volta (circa 2 GB con il motore offline, modello incluso).'
             Write-Host ''
         } else {
             Write-Passo 'Aggiornamento dei componenti...'
@@ -192,6 +217,7 @@ try {
         Install-Dipendenze
         Set-Content -Path $Stamp -Value $impronta -Encoding ASCII
         New-CollegamentoDesktop
+        Save-ModelloOffline
         Write-Host ''
         Write-Passo 'Installazione completata.'
     }

@@ -451,12 +451,50 @@ class _Hyp:
         self.score = score
 
 
+Finished = tuple[str, tuple[int, ...], float]
+
+
+@dataclass(eq=False)
+class _Search:
+    """Una ricerca a fascio (vincolata a un lessico o libera) su un ritaglio del lotto."""
+
+    crop: int                         # indice del ritaglio nel lotto
+    width: int
+    max_steps: int
+    lexicon: Lexicon | None
+    allowed: Any = None               # id ammessi nella ricerca libera
+    length_norm: bool = False
+    live: list[_Hyp] = field(default_factory=lambda: [_Hyp((), "", 0.0)])
+    rows: list[int] = field(default_factory=list)   # riga del lotto di ogni ipotesi viva
+    finished: list[Finished] = field(default_factory=list)
+    done: bool = False
+
+
+@dataclass
+class _DecoderParts:
+    """Moduli del decoder TrOCR usati dalla decodifica a lotti."""
+
+    embed_tokens: Any
+    embed_positions: Any
+    layernorm_embedding: Any
+    layers: list[Any]
+    lm_head: Any
+    heads: int
+    head_dim: int
+
+
 class TrOCRRecognizer:
     """TrOCR su CPU con beam search vincolato a un lessico.
 
-    Per ogni ritaglio: l'encoder gira una volta (a lotti), il decoder elabora
-    il token iniziale una volta sola e le chiavi/valori della cross-attention
-    vengono riusati da tutte le ipotesi (``EncoderDecoderCache``).
+    I ritagli sono elaborati a lotti: l'encoder gira una volta per ritaglio, le
+    chiavi/valori della cross-attention sono calcolati una sola volta per
+    ritaglio e il decoder fa avanzare *insieme* le ricerche di tutti i ritagli
+    del lotto (una sola chiamata per passo, con le ipotesi di tutti i ritagli
+    impilate): sulla CPU il costo di un passo dipende poco dal numero di righe,
+    quindi leggere otto ritagli insieme costa poco piu' che leggerne uno. La
+    cross-attention di ogni ipotesi usa le chiavi/valori del proprio ritaglio
+    senza duplicarle. Se la struttura interna del modello non e' quella attesa
+    si ripiega su una decodifica senza cache (lenta ma equivalente).
     """
 
     ENCODER_BATCH = 8
@@ -501,7 +539,9 @@ class TrOCRRecognizer:
         self._lex_tokens: dict[str, list[tuple[int, str]]] = {}
         self._allowed: dict[tuple[str, str], Any] = {}
         self._charset_ids: dict[frozenset[str] | None, Any] = {}
-        self._fast = True
+        self._parts = self._decoder_parts()
+        self._fast = self._parts is not None
+        self._verified = False
         self.lock = threading.Lock()
 
     # ------------------------------------------------------------- vincoli
@@ -549,150 +589,231 @@ class TrOCRRecognizer:
             hidden = self._enc_proj(hidden)
         return hidden
 
-    # ------------------------------------------------------------ decoder
-    def _caches(self) -> tuple[Any, Any, Any]:
-        from transformers.cache_utils import (  # noqa: PLC0415
-            DynamicCache,
-            EncoderDecoderCache,
-        )
+    # ------------------------------------------------- decoder a lotti
+    def _decoder_parts(self) -> _DecoderParts | None:
+        """Moduli interni del decoder TrOCR (``None`` se la struttura non e' quella attesa)."""
+        try:
+            core = self.decoder.model.decoder
+            layers = list(core.layers)
+            lm_head = self.decoder.output_projection
+            first = layers[0]
+            heads = int(first.self_attn.num_heads)
+            head_dim = int(first.self_attn.head_dim)
+            for layer in layers:
+                for name in ("self_attn", "encoder_attn", "self_attn_layer_norm", "encoder_attn_layer_norm",
+                             "fc1", "fc2", "final_layer_norm", "activation_fn"):
+                    getattr(layer, name)
+                for attn in (layer.self_attn, layer.encoder_attn):
+                    for name in ("q_proj", "k_proj", "v_proj", "out_proj", "scaling"):
+                        getattr(attn, name)
+            return _DecoderParts(core.embed_tokens, core.embed_positions, getattr(core, "layernorm_embedding", None),
+                                 layers, lm_head, heads, head_dim)
+        except (AttributeError, IndexError, TypeError):
+            log.info("Struttura del decoder non riconosciuta: decodifica senza lotti", exc_info=True)
+            return None
 
-        return DynamicCache, EncoderDecoderCache, self.decoder.config
+    def _cross_kv(self, enc: Any) -> list[tuple[Any, Any]]:
+        """Chiavi/valori della cross-attention di ogni livello per i ritagli del lotto."""
+        p = self._parts
+        assert p is not None
+        n, s, _ = enc.shape
+        out = []
+        for layer in p.layers:
+            att = layer.encoder_attn
+            k = att.k_proj(enc).view(n, s, p.heads, p.head_dim).transpose(1, 2)
+            v = att.v_proj(enc).view(n, s, p.heads, p.head_dim).transpose(1, 2)
+            out.append((k, v))
+        return out
 
-    def _start(self, enc1: Any) -> tuple[list[tuple[Any, Any]], list[tuple[Any, Any]], Any]:
-        """Elabora il token iniziale: (chiavi/valori self-attn, cross-attn, log-prob)."""
+    def _step(self, tokens: Any, pos: int, cache: list[tuple[Any, Any]] | None, cross: list[tuple[Any, Any]],
+              row_crop: Any) -> tuple[Any, list[tuple[Any, Any]]]:
+        """Un passo del decoder per tutte le ipotesi del lotto.
+
+        ``tokens``: un token per riga; ``cache``: chiavi/valori della self-attention
+        di ogni livello (righe, teste, passi, dim) o ``None`` al primo passo;
+        ``row_crop``: ritaglio di ogni riga (righe ordinate per ritaglio).
+        Restituisce le log-probabilita' del token successivo e la cache aggiornata."""
         torch = self.torch
-        dyn, encdec, cfg = self._caches()
-        cache = encdec(dyn(config=cfg), dyn(config=cfg))
-        ids = torch.tensor([[self.start_id]], dtype=torch.long, device=self.device)
-        out = self.decoder(input_ids=ids, encoder_hidden_states=enc1, past_key_values=cache, use_cache=True)
-        lp = torch.log_softmax(out.logits[:, -1, :].float(), dim=-1)[0]
-        self_kv = [(layer.keys, layer.values) for layer in cache.self_attention_cache.layers]
-        cross_kv = [(layer.keys, layer.values) for layer in cache.cross_attention_cache.layers]
-        if not self_kv or not cross_kv or len(self_kv) != len(cross_kv):
-            raise RuntimeError("cache del decoder in formato inatteso")
-        return self_kv, cross_kv, lp
+        p = self._parts
+        assert p is not None
+        rows = int(tokens.shape[0])
+        n_crops = int(cross[0][0].shape[0])
+        ids = tokens.view(rows, 1)
+        x = p.embed_tokens(ids) + p.embed_positions(ids, past_key_values_length=pos).to(ids.device)
+        if p.layernorm_embedding is not None:
+            x = p.layernorm_embedding(x)
+        # posto di ogni riga nella matrice (ritaglio, ipotesi) della cross-attention
+        counts = torch.bincount(row_crop, minlength=n_crops)
+        wmax = max(1, int(counts.max()))
+        first = torch.cumsum(counts, 0) - counts
+        flat = row_crop * wmax + (torch.arange(rows, device=row_crop.device) - first[row_crop])
+        d = p.heads * p.head_dim
+        new_cache: list[tuple[Any, Any]] = []
+        for li, layer in enumerate(p.layers):
+            sa = layer.self_attn
+            residual = x
+            q = (sa.q_proj(x) * sa.scaling).view(rows, 1, p.heads, p.head_dim).transpose(1, 2)
+            k = sa.k_proj(x).view(rows, 1, p.heads, p.head_dim).transpose(1, 2)
+            v = sa.v_proj(x).view(rows, 1, p.heads, p.head_dim).transpose(1, 2)
+            if cache is not None:
+                k = torch.cat([cache[li][0], k], dim=2)
+                v = torch.cat([cache[li][1], v], dim=2)
+            new_cache.append((k, v))
+            w = torch.softmax(torch.matmul(q, k.transpose(-1, -2)), dim=-1)
+            a = torch.matmul(w, v).transpose(1, 2).reshape(rows, 1, d)
+            x = layer.self_attn_layer_norm(residual + sa.out_proj(a))
 
-    def _make_cache(self, self_kv: list[tuple[Any, Any]], cross_kv: list[tuple[Any, Any]], width: int) -> Any:
-        """Cache per ``width`` ipotesi: le chiavi/valori della cross-attention (uguali
-        per tutte) vengono copiati una volta sola, non ricalcolati a ogni passo."""
-        dyn, encdec, _ = self._caches()
-        cross = [(k.expand(width, -1, -1, -1), v.expand(width, -1, -1, -1)) for k, v in cross_kv]
-        selfc = [(k.expand(width, -1, -1, -1), v.expand(width, -1, -1, -1)) for k, v in self_kv]
-        cache = encdec(dyn(selfc), dyn(cross))
-        for i in range(len(cross)):
-            cache.is_updated[i] = True
-        return cache
+            ca = layer.encoder_attn
+            residual = x
+            q = (ca.q_proj(x) * ca.scaling).view(rows, p.heads, p.head_dim)
+            qp = q.new_zeros(n_crops * wmax, p.heads, p.head_dim)
+            qp[flat] = q
+            qp = qp.view(n_crops, wmax, p.heads, p.head_dim).transpose(1, 2)
+            ck, cv = cross[li]
+            w = torch.softmax(torch.matmul(qp, ck.transpose(-1, -2)), dim=-1)
+            a = torch.matmul(w, cv).transpose(1, 2).reshape(n_crops * wmax, d)[flat]
+            x = layer.encoder_attn_layer_norm(residual + ca.out_proj(a.view(rows, 1, d)))
 
-    def _search(self, enc1: Any, start: tuple[Any, Any, Any], width: int, max_steps: int,
-                lexicon: Lexicon | None, charset: frozenset[str] | None,
-                length_norm: bool) -> list[tuple[str, tuple[int, ...], float]]:
-        """Beam search (vincolato al lessico o al set di caratteri).
+            residual = x
+            x = layer.final_layer_norm(residual + layer.fc2(layer.activation_fn(layer.fc1(x))))
+        logits = p.lm_head(x[:, -1, :])
+        return torch.log_softmax(logits.float(), dim=-1), new_cache
 
-        Restituisce le ipotesi concluse: (chiave del testo, token, log-prob totale)."""
+    def _verify_fast_path(self, enc: Any) -> bool:
+        """Confronta il primo passo della decodifica a lotti con quello del modello
+        originale: se differiscono (versione di transformers diversa) si usa il ripiego."""
         torch = self.torch
-        self_kv, cross_kv, lp0 = start
-        live = [_Hyp((), "", 0.0)]
-        lps = lp0.unsqueeze(0)
-        finished: list[tuple[str, tuple[int, ...], float]] = []
-        cache = None
-        enc_view = None
+        try:
+            ids = torch.tensor([[self.start_id]], dtype=torch.long, device=self.device)
+            ref = self.decoder(input_ids=ids, encoder_hidden_states=enc[:1], use_cache=False)
+            ref_lp = torch.log_softmax(ref.logits[:, -1, :].float(), dim=-1)
+            row_crop = torch.zeros(1, dtype=torch.long, device=self.device)
+            lp, _ = self._step(ids.view(1), 0, None, self._cross_kv(enc[:1]), row_crop)
+            diff = float((lp - ref_lp).abs().max())
+        except Exception:  # noqa: BLE001 - API interna di transformers cambiata
+            log.warning("Decodifica a lotti non disponibile, uso il ripiego lento", exc_info=True)
+            return False
+        if not math.isfinite(diff) or diff > 1e-3:
+            log.warning("Decodifica a lotti non coerente con il modello (scarto %.2g): uso il ripiego lento", diff)
+            return False
+        return True
+
+    # ------------------------------------------------------- beam search
+    def _advance(self, job: _Search, lps: Any, step: int) -> list[tuple[int, int, _Hyp]]:
+        """Un passo della ricerca ``job``: aggiorna le ipotesi concluse e restituisce
+        le nuove ipotesi vive come (riga madre, token, ipotesi)."""
+        torch = self.torch
+        lex = job.lexicon
         eos = self.eos_id
-        static_ids = None if lexicon is not None else self._charset_for(charset)
-        for step in range(max_steps + 1):
-            cand_scores = []
-            cand_parent = []
-            cand_tok = []
-            for i, h in enumerate(live):
-                if not math.isfinite(h.score):
-                    continue
-                if lexicon is not None:
-                    allowed = self._allowed_for(lexicon, h.key)
-                    eos_ok = lexicon.complete(h.key) is not None
-                else:
-                    allowed = static_ids
-                    eos_ok = bool(h.key)
-                if eos_ok:
-                    finished.append((h.key, h.ids, h.score + float(lps[i, eos])))
-                if allowed.numel() and step < max_steps:
-                    cand_scores.append(lps[i, allowed] + h.score)
-                    cand_parent.append(torch.full((allowed.numel(),), i, dtype=torch.long))
-                    cand_tok.append(allowed)
-            if not cand_scores:
-                break
-            scores = torch.cat(cand_scores)
-            parents = torch.cat(cand_parent)
-            toks = torch.cat(cand_tok)
-            k = min(width * 4 if lexicon is not None else width, int(scores.numel()))
-            top_s, top_i = torch.topk(scores, k)
-            best_live = float(top_s[0])
-            if len(finished) >= width:
-                if lexicon is not None:
-                    # conta i valori distinti gia' conclusi (le varianti di scrittura non contano)
-                    best_by_value: dict[Any, float] = {}
-                    for fk, _fi, fs in finished:
-                        fv = lexicon.complete(fk)
-                        best_by_value[fv] = max(fs, best_by_value.get(fv, -math.inf))
-                    ranked = sorted(best_by_value.values(), reverse=True)
-                else:
-                    ranked = sorted((self._rank(f, length_norm) for f in finished), reverse=True)
-                bound = best_live if not length_norm else best_live / (step + 2)
-                if len(ranked) >= width and ranked[width - 1] >= bound:
-                    break
-            new_live: list[_Hyp] = []
-            sel_parents: list[int] = []
-            sel_tokens: list[int] = []
-            seen: set[str] = set()
-            for s, j in zip(top_s.tolist(), top_i.tolist()):
-                if not math.isfinite(s):
-                    continue
-                p = int(parents[j])
-                t = int(toks[j])
-                h = live[p]
-                key = h.key + self.tok_key[t]
-                if lexicon is not None:
-                    # una sola ipotesi per "contenuto": le varianti (8:00 / 8.00 / 8,00)
-                    # non devono occupare tutto il beam a scapito di valori diversi
-                    sig = lexicon.signature(key)
-                    if sig in seen:
-                        continue
-                    seen.add(sig)
-                new_live.append(_Hyp(h.ids + (t,), key, s))
-                sel_parents.append(p)
-                sel_tokens.append(t)
-                if len(new_live) >= width:
-                    break
-            if not new_live:
-                break
-            # larghezza fissa: le posizioni libere ripetono l'ultima ipotesi (punteggio -inf)
-            while len(new_live) < width:
-                new_live.append(_Hyp(new_live[-1].ids, new_live[-1].key, -math.inf))
-                sel_parents.append(sel_parents[-1])
-                sel_tokens.append(sel_tokens[-1])
-            idx = torch.tensor(sel_parents, dtype=torch.long, device=self.device)
-            if cache is None:
-                cache = self._make_cache([(k_.index_select(0, idx[:1]), v_.index_select(0, idx[:1]))
-                                          for k_, v_ in self_kv], cross_kv, width)
-                enc_view = enc1.expand(width, -1, -1)
+        cand_scores = []
+        cand_parent = []
+        cand_tok = []
+        for i, h in enumerate(job.live):
+            if not math.isfinite(h.score):
+                continue
+            row = job.rows[i]
+            if lex is not None:
+                allowed = self._allowed_for(lex, h.key)
+                eos_ok = lex.complete(h.key) is not None
             else:
-                cache.self_attention_cache.batch_select_indices(idx)
-            inp = torch.tensor(sel_tokens, dtype=torch.long, device=self.device).unsqueeze(1)
-            out = self.decoder(input_ids=inp, encoder_hidden_states=enc_view, past_key_values=cache,
-                               use_cache=True)
-            lps = torch.log_softmax(out.logits[:, -1, :].float(), dim=-1)
-            live = new_live
-        return finished
+                allowed = job.allowed
+                eos_ok = bool(h.key)
+            if eos_ok:
+                job.finished.append((h.key, h.ids, h.score + float(lps[row, eos])))
+            if allowed.numel() and step < job.max_steps:
+                cand_scores.append(lps[row, allowed] + h.score)
+                cand_parent.append(torch.full((allowed.numel(),), i, dtype=torch.long))
+                cand_tok.append(allowed)
+        if not cand_scores:
+            return []
+        scores = torch.cat(cand_scores)
+        parents = torch.cat(cand_parent)
+        toks = torch.cat(cand_tok)
+        k = min(job.width * 4 if lex is not None else job.width, int(scores.numel()))
+        top_s, top_i = torch.topk(scores, k)
+        best_live = float(top_s[0])
+        if len(job.finished) >= job.width:
+            if lex is not None:
+                # conta i valori distinti gia' conclusi (le varianti di scrittura non contano)
+                best_by_value: dict[Any, float] = {}
+                for fk, _fi, fs in job.finished:
+                    fv = lex.complete(fk)
+                    best_by_value[fv] = max(fs, best_by_value.get(fv, -math.inf))
+                ranked = sorted(best_by_value.values(), reverse=True)
+            else:
+                ranked = sorted((self._rank(f, job.length_norm) for f in job.finished), reverse=True)
+            bound = best_live if not job.length_norm else best_live / (step + 2)
+            if len(ranked) >= job.width and ranked[job.width - 1] >= bound:
+                return []
+        out: list[tuple[int, int, _Hyp]] = []
+        seen: set[str] = set()
+        for s, j in zip(top_s.tolist(), top_i.tolist()):
+            if not math.isfinite(s):
+                continue
+            i = int(parents[j])
+            t = int(toks[j])
+            h = job.live[i]
+            key = h.key + self.tok_key[t]
+            if lex is not None:
+                # una sola ipotesi per "contenuto": le varianti (8:00 / 8.00 / 8,00)
+                # non devono occupare tutto il beam a scapito di valori diversi
+                sig = lex.signature(key)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+            out.append((job.rows[i], t, _Hyp(h.ids + (t,), key, s)))
+            if len(out) >= job.width:
+                break
+        return out
+
+    def _run(self, jobs: Sequence[_Search], start_cache: list[tuple[Any, Any]], start_lps: Any,
+             cross: list[tuple[Any, Any]]) -> None:
+        """Fa avanzare insieme tutte le ricerche (una chiamata al decoder per passo)."""
+        torch = self.torch
+        for job in jobs:
+            job.rows = [job.crop]
+        active = [j for j in jobs if not j.done]
+        lps = start_lps
+        cache = start_cache
+        step = 0
+        while active:
+            parents: list[int] = []
+            tokens: list[int] = []
+            crops: list[int] = []
+            still: list[_Search] = []
+            # righe ordinate per ritaglio (richiesto dalla cross-attention a lotti)
+            for job in sorted(active, key=lambda j: j.crop):
+                nxt = self._advance(job, lps, step)
+                if not nxt:
+                    job.done = True
+                    continue
+                job.live = [h for _r, _t, h in nxt]
+                job.rows = list(range(len(parents), len(parents) + len(nxt)))
+                parents += [r for r, _t, _h in nxt]
+                tokens += [t for _r, t, _h in nxt]
+                crops += [job.crop] * len(nxt)
+                still.append(job)
+            active = still
+            if not active:
+                break
+            idx = torch.tensor(parents, dtype=torch.long, device=self.device)
+            cache = [(k.index_select(0, idx), v.index_select(0, idx)) for k, v in cache]
+            tok = torch.tensor(tokens, dtype=torch.long, device=self.device)
+            row_crop = torch.tensor(crops, dtype=torch.long, device=self.device)
+            lps, cache = self._step(tok, step + 1, cache, cross, row_crop)
+            step += 1
 
     @staticmethod
-    def _rank(item: tuple[str, tuple[int, ...], float], length_norm: bool) -> float:
+    def _rank(item: Finished, length_norm: bool) -> float:
         _, ids, score = item
         return score / (len(ids) + 1) if length_norm else score
 
     def _search_slow(self, enc1: Any, width: int, max_steps: int, lexicon: Lexicon | None,
-                     charset: frozenset[str] | None) -> list[tuple[str, tuple[int, ...], float]]:
-        """Ripiego senza cache (usato solo se l'API della cache cambia)."""
+                     charset: frozenset[str] | None) -> list[Finished]:
+        """Decodifica di riferimento senza cache (ripiego se l'API interna del modello cambia)."""
         torch = self.torch
         live = [_Hyp((), "", 0.0)]
-        finished: list[tuple[str, tuple[int, ...], float]] = []
+        finished: list[Finished] = []
         static_ids = None if lexicon is not None else self._charset_for(charset)
         for step in range(max_steps + 1):
             seqs = torch.tensor([[self.start_id, *h.ids] for h in live], dtype=torch.long, device=self.device)
@@ -724,51 +845,86 @@ class TrOCRRecognizer:
         text = self.tokenizer.decode(list(ids), skip_special_tokens=True, clean_up_tokenization_spaces=False)
         return " ".join(text.split())
 
-    def _read_one(self, enc1: Any, req: ReadRequest) -> Reading:
+    @staticmethod
+    def _needs_free(req: ReadRequest, constrained: Sequence[Finished]) -> bool:
+        """La lettura libera serve se richiesta e se non coincide gia' con la migliore
+        sequenza vincolata (probabilita' > 1/2: e' per forza anche la lettura "golosa")."""
+        if req.lexicon is None:
+            return True
+        if not req.free:
+            return False
+        best = max(constrained, key=lambda f: f[2], default=None)
+        return not (best is not None and best[2] > math.log(0.5) and req.charset is None and req.free_beams <= 1)
+
+    def _reading(self, req: ReadRequest, constrained: Sequence[Finished], free: Sequence[Finished] | None) -> Reading:
         reading = Reading()
-        start = None
-        if self._fast:
-            try:
-                start = self._start(enc1)
-            except Exception:  # noqa: BLE001 - API interna di transformers cambiata: ripiego lento
-                log.warning("Decodifica rapida non disponibile, uso il ripiego lento", exc_info=True)
-                self._fast = False
         lex = req.lexicon
         if lex is not None:
-            steps = lex.max_chars
-            if start is not None:
-                fin = self._search(enc1, start, max(1, req.beams), steps, lex, None, False)
-            else:
-                fin = self._search_slow(enc1, max(1, req.beams), steps, lex, None)
             by_value: dict[Any, list[float]] = {}
-            for key, _ids, score in fin:
+            for key, _ids, score in constrained:
                 value = lex.complete(key)
                 if value is not None:
                     by_value.setdefault(value, []).append(score)
             cands = [(v, _logsumexp(s)) for v, s in by_value.items()]
             cands.sort(key=lambda c: c[1], reverse=True)
             reading.candidates = cands
-            best = max(fin, key=lambda f: f[2], default=None)
-            if (best is not None and best[2] > math.log(0.5) and req.charset is None
-                    and req.free_beams <= 1):
-                # una sequenza con probabilita' > 1/2 e' per forza quella della lettura
-                # libera "golosa": inutile ricalcolarla
+            if free is None and req.free:
+                best = max(constrained, key=lambda f: f[2])
                 reading.free_text = self._decode_ids(best[1])
                 reading.free_logprob = best[2]
                 reading.free_tokens = len(best[1])
                 return reading
-        if req.free or lex is None:
-            width = max(1, req.free_beams)
-            if start is not None:
-                fin = self._search(enc1, start, width, req.max_tokens, None, req.charset, True)
-            else:
-                fin = self._search_slow(enc1, width, req.max_tokens, None, req.charset)
-            if fin:
-                best = max(fin, key=lambda f: self._rank(f, True))
-                reading.free_text = self._decode_ids(best[1])
-                reading.free_logprob = best[2]
-                reading.free_tokens = len(best[1])
+        if free:
+            best = max(free, key=lambda f: self._rank(f, True))
+            reading.free_text = self._decode_ids(best[1])
+            reading.free_logprob = best[2]
+            reading.free_tokens = len(best[1])
         return reading
+
+    def _new_job(self, crop: int, req: ReadRequest, constrained: bool) -> _Search:
+        if constrained:
+            assert req.lexicon is not None
+            return _Search(crop, max(1, req.beams), req.lexicon.max_chars, req.lexicon)
+        return _Search(crop, max(1, req.free_beams), req.max_tokens, None, allowed=self._charset_for(req.charset),
+                       length_norm=True)
+
+    def _read_batch(self, batch: Sequence[ReadRequest], enc: Any) -> list[Reading]:
+        torch = self.torch
+        n = len(batch)
+        cross = self._cross_kv(enc)
+        start = torch.full((n,), self.start_id, dtype=torch.long, device=self.device)
+        crop_ids = torch.arange(n, dtype=torch.long, device=self.device)
+        start_lps, start_cache = self._step(start, 0, None, cross, crop_ids)
+        # 1) ricerche vincolate e letture libere sempre necessarie
+        lex_jobs: dict[int, _Search] = {}
+        free_jobs: dict[int, _Search] = {}
+        for i, req in enumerate(batch):
+            if req.lexicon is not None:
+                lex_jobs[i] = self._new_job(i, req, True)
+            if req.lexicon is None or (req.free and (req.charset is not None or req.free_beams > 1)):
+                free_jobs[i] = self._new_job(i, req, False)
+        self._run([*lex_jobs.values(), *free_jobs.values()], start_cache, start_lps, cross)
+        # 2) letture libere che servono solo se la lettura vincolata non basta
+        extra = {i: self._new_job(i, req, False) for i, req in enumerate(batch)
+                 if i not in free_jobs and i in lex_jobs and self._needs_free(req, lex_jobs[i].finished)}
+        if extra:
+            self._run(list(extra.values()), start_cache, start_lps, cross)
+            free_jobs.update(extra)
+        out = []
+        for i, req in enumerate(batch):
+            constrained = lex_jobs[i].finished if i in lex_jobs else []
+            free = free_jobs[i].finished if i in free_jobs else None
+            out.append(self._reading(req, constrained, free))
+        return out
+
+    def _read_slow(self, req: ReadRequest, enc1: Any) -> Reading:
+        constrained: list[Finished] = []
+        if req.lexicon is not None:
+            constrained = self._search_slow(enc1, max(1, req.beams), req.lexicon.max_chars, req.lexicon, None)
+        free = None
+        if self._needs_free(req, constrained):
+            free = self._search_slow(enc1, max(1, req.free_beams), req.max_tokens, None, req.charset)
+        return self._reading(req, constrained, free)
 
     def read(self, requests: Sequence[ReadRequest],
              progress: Callable[[int, int], None] | None = None) -> list[Reading]:
@@ -779,10 +935,15 @@ class TrOCRRecognizer:
             for b0 in range(0, total, self.ENCODER_BATCH):
                 batch = requests[b0:b0 + self.ENCODER_BATCH]
                 enc = self.encode([r.image for r in batch])
-                for j, req in enumerate(batch):
-                    results.append(self._read_one(enc[j:j + 1], req))
-                    if progress is not None:
-                        progress(b0 + j + 1, total)
+                if self._fast and not self._verified:
+                    self._fast = self._verify_fast_path(enc)
+                    self._verified = True
+                if self._fast:
+                    results += self._read_batch(batch, enc)
+                else:
+                    results += [self._read_slow(req, enc[j:j + 1]) for j, req in enumerate(batch)]
+                if progress is not None:
+                    progress(b0 + len(batch), total)
         return results
 
 

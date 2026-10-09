@@ -7,7 +7,7 @@ import { ART, icon } from '../icons.js';
 import { refreshState, saveSettings, store } from '../state.js';
 import { emptyState, statusKey, statusLabel, toast, toastError } from '../ui.js';
 import {
-  $, $$, capitalize, colLetter, debounce, esc, fmtBytes, fmtDateISO, fmtDateTime, fmtOre, fmtPeriodo, fmtSigned,
+  $, capitalize, colLetter, debounce, esc, fmtBytes, fmtDateISO, fmtDateTime, fmtOre, fmtPeriodo, fmtSigned,
   hoursBetween, html, plural, raw, setHTML, storageGet, storageSet,
 } from '../util.js';
 
@@ -46,7 +46,10 @@ class Preview {
     this.exports = [];
     this.lastRevision = null;
     this.scheduleSave = debounce(() => this.flush(), 450);
-    this.scheduleReload = debounce(() => this.load(), 500);
+    this.scheduleReload = debounce(() => {
+      if (this.grid?.editing || this.pending.size || this.saving) { this.scheduleReload(); return; }
+      this.load();
+    }, 500);
     this.build();
     this.setScope(ctx.query);
     this.loadExports();
@@ -73,15 +76,15 @@ class Preview {
             <div id="xl-scope" style="margin-left:auto"></div>
           </div>
           <div class="formula-bar" aria-live="polite"><div class="formula-ref" id="xl-ref">—</div><div class="formula-fx">fx</div><div class="formula-val" id="xl-val"></div></div>
-          <div id="xl-grid" style="flex:1;min-height:0;display:flex"></div>
+          <div id="xl-grid"></div>
           <div class="xl-tabs" role="tablist" id="xl-tabs"></div>
         </section>
         <aside class="xl-side">
+          <div id="xl-result"></div>
           <section class="card" aria-labelledby="xl-gen-title">
             <div class="card-head"><div><div class="card-title" id="xl-gen-title">Genera Excel</div><div class="card-sub">File .xlsx con formule, pronto per la rendicontazione</div></div></div>
             <div class="card-body xl-options" id="xl-options"></div>
           </section>
-          <div id="xl-result"></div>
           <section class="card" aria-labelledby="xl-prev-title">
             <div class="card-head"><div style="flex:1"><div class="card-title" id="xl-prev-title">Esportazioni precedenti</div></div>
               <button type="button" class="btn btn-sm btn-ghost" data-act="open-dir">${icon('folder-open')}Apri cartella</button></div>
@@ -113,14 +116,27 @@ class Preview {
     if (ids) params.set('ids', ids.join(',') || '-');
     if (this.options.giorni_vuoti) params.set('giorni_vuoti', 'true');
     this.lastRevision = store.revision;
+    let data;
     try {
-      const data = await get(`/api/preview?${params}`);
+      data = await get(`/api/preview?${params}`);
       if (ids && !ids.length) { data.documenti = []; data.dettaglio = []; data.anomalie = []; }
-      this.data = data;
     } catch (err) {
       toastError(err, 'Anteprima non disponibile');
-      this.data = this.data || { documenti: [], dettaglio: [], anomalie: [], kpi: {} };
+      data = this.data || { documenti: [], dettaglio: [], anomalie: [], kpi: {} };
     }
+    if (this.grid?.editing) {
+      // si aggiorna al termine della modifica in corso
+      this.deferred = data;
+      return;
+    }
+    this.data = data;
+    this.renderAll();
+  }
+
+  applyDeferred() {
+    if (!this.deferred) return;
+    this.data = this.deferred;
+    this.deferred = null;
     this.renderAll();
   }
 
@@ -155,15 +171,25 @@ class Preview {
   }
 
   /* ============================================================ griglie */
-  renderGrid() {
+  renderGrid(force = false) {
+    const host = $('#xl-grid', this.root);
+    const d = this.data;
+    if (d.documenti.length && this.grid && this.gridTab === this.tab && !force) {
+      // stessi fogli e stessa scheda: aggiorna i dati mantenendo selezione e scorrimento
+      const cfg = this.tab === 'dettaglio' ? this.detailConfig() : this.tab === 'anomalie' ? this.anomConfig() : this.summaryConfig();
+      Object.assign(this.grid.opts, cfg);
+      this.grid.setRows(cfg.rows);
+      this.updateFormula();
+      this.renderStatus();
+      return;
+    }
     this.grid?.destroy();
     this.grid = null;
-    const host = $('#xl-grid', this.root);
+    this.gridTab = null;
     host.className = '';
     host.innerHTML = '';
-    const d = this.data;
     if (!d.documenti.length) {
-      setHTML(host, html`<div style="flex:1;display:grid;place-items:center">${emptyState({
+      setHTML(host, html`<div style="height:100%;display:grid;place-items:center">${emptyState({
         art: ART.sheet,
         title: 'Nessun foglio firma pronto per l\'Excel',
         text: this.onlyVerified
@@ -184,10 +210,10 @@ class Preview {
       label: TABS.find((t) => t.id === this.tab)?.label,
       onActiveChange: () => this.updateFormula(),
       onSaveShortcut: () => this.flush(),
+      onEditEnd: () => setTimeout(() => this.applyDeferred(), 0),
       ...cfg,
     });
-    host.style.flex = '1';
-    host.style.minHeight = '0';
+    this.gridTab = this.tab;
     if (this.activeKey && this.activeKey.tab === this.tab) {
       this.grid.selectByKey(this.activeKey.row, this.activeKey.col, { scroll: true });
     } else this.grid.select(0, 1, { scroll: false });
@@ -264,7 +290,7 @@ class Preview {
       { key: 'operatore', label: 'Operatore', width: 170, type: 'ro', get: (row) => row.header?.operatore || (row.__total ? '' : row.display_name), render: (row) => (row.__total ? '<b>TOTALE</b>' : esc(row.header?.operatore || row.display_name)) },
       { key: 'alunno', label: 'Alunno', width: 150, type: 'ro', get: H('alunno') },
       { key: 'istituto', label: 'Istituto', width: 150, type: 'ro', get: H('istituto') },
-      { key: 'periodo', label: 'Mese', width: 112, type: 'ro', get: (row) => (row.__total ? '' : capitalize(fmtPeriodo(row.header?.mese, row.header?.anno, ''))) },
+      { key: 'periodo', label: 'Mese', width: 128, type: 'ro', get: (row) => (row.__total ? '' : capitalize(fmtPeriodo(row.header?.mese, row.header?.anno, ''))) },
       { key: 'ore_pei', label: 'Ore PEI', width: 70, type: 'calc', get: H('ore_pei'), tip: 'Ore settimanali previste dal PEI' },
       { key: 'giorni_lavorati', label: 'Giorni lav.', width: 82, type: 'ro', align: 'r', get: T('giorni_lavorati') },
       num('ore_dichiarate', 'Ore dich.', 82, 'Somma della colonna «Tot. ore effettive»'),
@@ -307,8 +333,8 @@ class Preview {
       { key: 'operatore', label: 'Operatore', width: 150, type: 'ro' },
       { key: 'alunno', label: 'Alunno', width: 136, type: 'ro' },
       { key: 'istituto', label: 'Istituto', width: 130, type: 'ro' },
-      { key: 'data', label: 'Data', width: 90, type: 'ro', align: 'c', get: (row) => fmtDateISO(row.data) || `g. ${row.giorno}` },
-      { key: 'giorno_settimana', label: 'Gg', width: 46, type: 'ro', align: 'c', render: (row) => `<span class="gg${row.tipo_giorno && row.tipo_giorno !== 'feriale' ? ' is-we' : ''}">${esc(row.giorno_settimana || '—')}</span>${row.tipo_giorno === 'festivo' ? '<span class="gg-fest"></span>' : ''}` },
+      { key: 'data', label: 'Data', width: 100, type: 'ro', align: 'c', get: (row) => fmtDateISO(row.data) || `g. ${row.giorno}` },
+      { key: 'giorno_settimana', label: 'Gg', width: 48, type: 'ro', align: 'c', cls: 'is-tight', render: (row) => `<span class="gg${row.tipo_giorno && row.tipo_giorno !== 'feriale' ? ' is-we' : ''}">${esc(row.giorno_settimana || '—')}</span>${row.tipo_giorno === 'festivo' ? '<span class="gg-fest"></span>' : ''}` },
       { key: 'prog_entrata', label: 'Prog. entrata', width: 92, type: 'time' },
       { key: 'prog_uscita', label: 'Prog. uscita', width: 88, type: 'time' },
       { key: 'eff_entrata', label: 'Eff. entrata', width: 86, type: 'time' },
@@ -416,7 +442,13 @@ class Preview {
       } else {
         patch[key] = ch.value;
         if ((key === 'eff_entrata' || key === 'eff_uscita') && ch.value === '-') { row[key] = null; row.trattino_effettivo = true; }
-        else row[key] = ch.value;
+        else {
+          row[key] = ch.value;
+          if ((key === 'eff_entrata' || key === 'eff_uscita') && ch.value === null && ch.old === '-') {
+            patch.trattino_effettivo = false;
+            row.trattino_effettivo = false;
+          }
+        }
         row.stati[key] = 'corretto';
         row.ore_calcolate = hoursBetween(row.eff_entrata, row.eff_uscita);
         row.ore_programmate = hoursBetween(row.prog_entrata, row.prog_uscita);
@@ -472,9 +504,9 @@ class Preview {
     if (withErr) notes.push(html`<li>${plural(withErr, 'foglio con errori', 'fogli con errori')} di coerenza</li>`);
     if (notVerified) notes.push(html`<li>${plural(notVerified, 'foglio non ancora confermato', 'fogli non ancora confermati')}</li>`);
     setHTML($('#xl-options', this.root), html`
-      <label class="opt"><span><span class="opt-title">Una scheda per ogni foglio firma</span><br><span class="opt-text">Replica del modulo con celle evidenziate e formule</span></span>
+      <label class="opt"><span><span class="opt-title">Una scheda per ogni foglio firma</span><br><span class="opt-text">Replica del modulo con le celle evidenziate</span></span>
         <span class="switch"><input type="checkbox" data-opt="fogli_per_documento" ${o.fogli_per_documento ? raw('checked') : ''}><span class="switch-track"></span></span></label>
-      <label class="opt"><span><span class="opt-title">Includi i giorni senza dati</span><br><span class="opt-text">Nel dettaglio giornaliero, anche weekend e giorni vuoti</span></span>
+      <label class="opt"><span><span class="opt-title">Includi i giorni senza dati</span><br><span class="opt-text">Anche weekend e giorni vuoti nel dettaglio</span></span>
         <span class="switch"><input type="checkbox" data-opt="giorni_vuoti" ${o.giorni_vuoti ? raw('checked') : ''}><span class="switch-track"></span></span></label>
       ${this.ids ? '' : html`<label class="opt"><span><span class="opt-title">Solo documenti confermati</span><br><span class="opt-text">Esclude i fogli non ancora verificati</span></span>
         <span class="switch"><input type="checkbox" data-opt="solo_confermati" ${this.onlyVerified ? raw('checked') : ''}><span class="switch-track"></span></span></label>`}
@@ -498,6 +530,7 @@ class Preview {
       const res = await post('/api/export', body);
       this.result = res;
       this.renderResult();
+      $('#xl-result .export-done', this.root)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       toast({ type: 'success', title: 'Excel generato', message: res.filename });
       this.loadExports();
     } catch (err) {
@@ -512,7 +545,7 @@ class Preview {
     const r = this.result;
     const el = $('#xl-result', this.root);
     if (!r) { el.innerHTML = ''; return; }
-    setHTML(el, html`<section class="card export-done" aria-live="polite">
+    setHTML(el, html`<section class="card export-done" aria-live="polite" tabindex="-1">
       <div class="export-done-head">
         <span class="export-done-icon">${icon('check')}</span>
         <div style="min-width:0"><div class="export-done-name">${r.filename}</div>
@@ -561,7 +594,7 @@ class Preview {
       this.tab = tab.dataset.tab;
       storageSet('sirio.xl.tab', this.tab);
       this.renderTabs();
-      this.renderGrid();
+      this.renderGrid(true);
       this.grid?.focus();
       return;
     }

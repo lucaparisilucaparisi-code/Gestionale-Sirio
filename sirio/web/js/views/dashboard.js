@@ -85,6 +85,14 @@ export function mount(root, { navigate }) {
     } else if (t.dataset.open) navigate(`#/revisione/${encodeURIComponent(t.dataset.open)}`);
   });
 
+  root.addEventListener('keydown', (e) => {
+    const item = e.target.closest?.('.queue-item[data-open]');
+    if (item && e.target === item && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      navigate(`#/revisione/${encodeURIComponent(item.dataset.open)}`);
+    }
+  });
+
   const offUpload = onUpload(() => renderUpload(root));
   renderAll(root);
   renderUpload(root);
@@ -150,7 +158,7 @@ function renderKpis(root) {
   const cards = [
     kpiCard({
       tone: 'k-blue', ic: 'documents', label: 'Fogli firma', value: fmtInt(k.documenti || 0),
-      foot: inLettura ? `${fmtInt(k.completati || 0)} letti · ${fmtInt(inLettura)} in lettura` : `${fmtInt(k.completati || 0)} letti${k.scartati ? ` · ${fmtInt(k.scartati)} scartati` : ''}`,
+      foot: inLettura ? `${plural(k.completati || 0, 'letto', 'letti')} · ${fmtInt(inLettura)} in lettura` : `${plural(k.completati || 0, 'letto', 'letti')}${k.scartati ? ` · ${plural(k.scartati, 'scartato', 'scartati')}` : ''}`,
       nav: '#/documenti',
     }),
     kpiCard({
@@ -175,7 +183,7 @@ function renderKpis(root) {
     }),
     kpiCard({
       tone: 'k-slate', ic: 'coin', label: 'Costo stimato', value: fmtUSD(k.costo_usd || 0),
-      foot: engine === 'claude' ? 'Claude Vision · a consumo' : 'Motore locale · gratuito',
+      foot: engine === 'claude' ? 'Letture con Claude Vision' : 'Motore locale gratuito',
       tip: 'Stima del costo delle letture con Claude Vision (prezzi pubblici di Anthropic). Il motore locale non ha costi.',
     }),
   ];
@@ -199,8 +207,8 @@ function renderQueue(root) {
   else sub.textContent = 'In attesa di documenti';
 
   const summary = [];
-  if (q.completati) summary.push(html`<span class="badge badge-sm tone-ok">${fmtInt(q.completati)} letti</span>`);
-  if (q.errori) summary.push(html`<span class="badge badge-sm tone-err">${fmtInt(q.errori)} errori</span>`);
+  if (q.completati) summary.push(html`<span class="badge badge-sm tone-ok">${plural(q.completati, 'letto', 'letti')}</span>`);
+  if (q.errori) summary.push(html`<span class="badge badge-sm tone-err">${plural(q.errori, 'errore', 'errori')}</span>`);
   setHTML($('#queue-summary', root), summary);
 
   const el = $('#queue-list', root);

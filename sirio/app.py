@@ -2,6 +2,11 @@
 
 ``python -m sirio [--porta N] [--senza-finestra] [--cartella-dati DIR] [--log-level LIVELLO]``
 
+``python -m sirio --scarica-modello [MODELLO]`` scarica soltanto il modello del motore
+offline (quello delle impostazioni, se non indicato) e termina: lo usano i programmi
+di avvio subito dopo l'installazione delle dipendenze. Codice d'uscita 0 se il modello
+è disponibile (anche se era già presente), 1 in caso d'errore.
+
 1. istanza singola: un lucchetto su ``data_dir()/istanza.lock`` e il file
    ``istanza.json`` ``{port, pid, token}``; se un'istanza e' gia' attiva si apre
    solo una nuova finestra verso di essa e si esce;
@@ -20,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -60,8 +66,9 @@ _LOG_MARK = "_sirio_handler"
 # Registro
 # ==========================================================================
 
-def setup_logging(level: str = "INFO") -> Path | None:
-    """Registro su ``logs_dir()/sirio.log`` (rotazione 2 MB x 5) e su stderr se disponibile."""
+def setup_logging(level: str = "INFO", console: bool = True) -> Path | None:
+    """Registro su ``logs_dir()/sirio.log`` (rotazione 2 MB x 5) e su stderr se disponibile
+    (``console=False``: solo su file, es. durante il download del modello dal programma di avvio)."""
     root = logging.getLogger()
     for handler in list(root.handlers):
         if getattr(handler, _LOG_MARK, False):
@@ -78,7 +85,7 @@ def setup_logging(level: str = "INFO") -> Path | None:
         root.addHandler(fh)
     except OSError:
         log_file = None
-    if sys.stderr is not None:
+    if console and sys.stderr is not None:
         sh = logging.StreamHandler(sys.stderr)
         sh.setFormatter(fmt)
         setattr(sh, _LOG_MARK, True)
@@ -506,6 +513,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO", type=str.upper,
                         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
                         help="livello di dettaglio del registro (predefinito: INFO)")
+    parser.add_argument("--scarica-modello", nargs="?", const="", default=None, metavar="MODELLO",
+                        help="scarica il modello del motore offline (predefinito: quello delle "
+                             "impostazioni) e termina, senza avviare l'applicazione")
     args = parser.parse_args(argv)
     if not 0 <= args.porta <= 65535:
         parser.error("la porta deve essere compresa tra 1 e 65535")
@@ -518,6 +528,139 @@ def _say(text: str) -> None:
             print(text, flush=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+# ==========================================================================
+# Download del modello offline (--scarica-modello)
+# ==========================================================================
+
+_MB_RE = re.compile(r"(\d[\d.]*)\s*MB\s+di\s+(\d[\d.]*)\s*MB")
+
+
+def _fmt_mb(mb: float) -> str:
+    return f"{mb:,.0f} MB".replace(",", ".")
+
+
+class _DownloadPrinter:
+    """Riga di avanzamento del download aggiornata sul posto (``\r``) in una console;
+    senza console (output reindirizzato) una riga ogni 10%."""
+
+    def __init__(self, label: str, size_mb: float | None, stream: Any):
+        self.label = label
+        self.size_mb = size_mb
+        self.stream = stream
+        self.tty = bool(getattr(stream, "isatty", lambda: False)())
+        self._last_pct = -1
+        self._last_step = -1
+        self._width = 0
+        self._started = False
+
+    def _write(self, text: str) -> None:
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except Exception:  # noqa: BLE001 - l'avanzamento non deve interrompere il download
+            pass
+
+    def __call__(self, fraction: float, message: str) -> None:
+        try:
+            frac = min(1.0, max(0.0, float(fraction)))
+        except (TypeError, ValueError):
+            frac = 0.0
+        if not self._started:
+            self._started = True
+            if frac <= 0.0 and message and "MB" not in message:
+                self._write(f"     {message.strip()}\n")
+                return
+        pct = int(frac * 100)
+        found = _MB_RE.search(message or "")
+        if found:
+            mb = f"{found.group(1)} MB di {found.group(2)} MB"
+        elif self.size_mb:
+            mb = f"{_fmt_mb(self.size_mb * frac)} di circa {_fmt_mb(self.size_mb)}"
+        else:
+            mb = ""
+        line = f"     Download del modello {self.label}: {pct:3d}%" + (f"  ({mb})" if mb else "")
+        if self.tty:
+            if pct == self._last_pct and not found:
+                return
+            pad = max(0, self._width - len(line))
+            self._width = len(line)
+            self._write("\r" + line + " " * pad)
+        else:
+            step = pct // 10
+            if step == self._last_step:
+                return
+            self._last_step = step
+            self._write(line + "\n")
+        self._last_pct = pct
+
+    def end(self) -> None:
+        if self.tty and self._width:
+            self._write("\n")
+            self._width = 0
+
+
+def download_model_cli(model_name: str | None = None, cache_dir: Path | None = None,
+                       stream: Any = None, error_stream: Any = None) -> int:
+    """Scarica il modello del motore offline (``--scarica-modello``). 0 = disponibile, 1 = errore."""
+    out = stream if stream is not None else sys.stdout
+    err = error_stream if error_stream is not None else sys.stderr
+
+    def say(text: str, to: Any = None) -> None:
+        target = to if to is not None else out
+        if target is None:
+            return
+        try:
+            print(text, file=target, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        from sirio.engines import local_engine  # noqa: PLC0415
+        from sirio.engines.base import EngineError  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Motore offline non importabile")
+        say(f"   Il motore offline non è installato correttamente: {exc}", err)
+        return 1
+    name = (model_name or "").strip()
+    if not name:
+        try:
+            name = (config.load_settings().local_model or "").strip()
+        except Exception:  # noqa: BLE001
+            name = ""
+    name = name or local_engine.DEFAULT_MODEL
+    info = local_engine.KNOWN_MODELS.get(name, {})
+    label = str(info.get("label") or Path(name).name or name)
+    try:
+        cache = cache_dir if cache_dir is not None else local_engine.default_cache_dir()
+        present = local_engine.local_model_path(name, cache)
+    except OSError as exc:
+        say(f"   Impossibile preparare la cartella dei modelli: {exc}", err)
+        return 1
+    if present is not None:
+        say(f"   Modello già presente: {label} ({present})")
+        return 0
+    size_mb = float(info["mb"]) if info.get("mb") else None
+    printer = _DownloadPrinter(label, size_mb, out)
+    try:
+        path = local_engine.download_model(name, cache, printer)
+    except EngineError as exc:
+        printer.end()
+        say(f"   Download del modello non riuscito: {exc}", err)
+        return 1
+    except KeyboardInterrupt:
+        printer.end()
+        say("   Download del modello interrotto: verrà completato al primo utilizzo del motore offline.", err)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        printer.end()
+        log.exception("Download del modello %s non riuscito", name)
+        say(f"   Download del modello non riuscito per un errore imprevisto: {exc}", err)
+        return 1
+    printer.end()
+    say(f"   Modello {label} scaricato in {path}")
+    return 0
 
 
 def _delegate_to(info: dict, with_window: bool) -> int:
@@ -556,6 +699,12 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         show_error(f"Impossibile creare la cartella dei dati: {exc}")
         return 1
+    if args.scarica_modello is not None:
+        # nessun server né finestra: solo il modello, con l'avanzamento sulla console
+        # (registro e avvisi delle librerie solo su file, per non sporcare la console)
+        setup_logging(args.log_level, console=False)
+        logging.captureWarnings(True)
+        return download_model_cli(args.scarica_modello or None)
     log_file = setup_logging(args.log_level)
     log.info("Avvio di Sirio OCR %s (Python %s, %s) - dati in %s", __version__,
              sys.version.split()[0], sys.platform, data_dir)
@@ -694,6 +843,7 @@ __all__ = [
     "InstanceLock",
     "Lifecycle",
     "browser_candidates",
+    "download_model_cli",
     "find_browser",
     "main",
     "open_window",

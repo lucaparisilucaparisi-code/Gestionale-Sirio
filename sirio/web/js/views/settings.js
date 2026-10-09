@@ -3,9 +3,9 @@
 
 import { del, post } from '../api.js';
 import { icon } from '../icons.js';
-import { loadSettings, refreshState, saveSettings, store } from '../state.js';
+import { loadRegistry, loadSettings, refreshState, saveSettings, store } from '../state.js';
 import { confirmDialog, toast, toastError } from '../ui.js';
-import { $, esc, fmtUSD, html, raw, setHTML } from '../util.js';
+import { $, esc, fmtDateTime, fmtUSD, html, plural, raw, setHTML } from '../util.js';
 
 const EFFORTS = [
   { id: 'low', label: 'Rapida', text: 'Lettura veloce, adatta a moduli molto chiari.' },
@@ -21,9 +21,15 @@ const SOURCE_TEXT = {
 };
 // token indicativi per foglio (pagina intera + 2 ritagli + risposta strutturata, verifica incrociata inclusa)
 const TOKENS_PER_SHEET = { input: 14000, output: 4000 };
+const REG_FIELDS = [
+  { id: 'operatore', label: 'Operatori', one: 'operatore', ph: 'COGNOME NOME dell\'operatore' },
+  { id: 'alunno', label: 'Alunni', one: 'alunno', ph: 'COGNOME NOME dell\'alunno' },
+  { id: 'istituto', label: 'Istituti', one: 'istituto', ph: 'es. IC 9 CUOCO-SCHIPA' },
+  { id: 'ente', label: 'Enti', one: 'ente', ph: 'es. COOPERATIVA SOCIALE SIRIO' },
+];
 
 export function mount(root) {
-  const view = { root, keyVisible: false, testing: false, testResult: null, saving: false };
+  const view = { root, keyVisible: false, testing: false, testResult: null, saving: false, regTab: 'operatore' };
   root.addEventListener('click', (e) => onClick(view, e));
   root.addEventListener('change', (e) => onChange(view, e));
   root.addEventListener('keydown', (e) => {
@@ -31,7 +37,8 @@ export function mount(root) {
   });
   render(view);
   loadSettings().then(() => render(view)).catch((err) => toastError(err, 'Impostazioni non disponibili'));
-  return { onState: (kind) => { if (kind === 'settings') render(view); } };
+  loadRegistry(true);
+  return { onState: (kind) => { if (kind === 'settings') render(view); else if (kind === 'registry') renderRegistry(view); } };
 }
 
 function render(view) {
@@ -169,6 +176,8 @@ function render(view) {
         </div>
       </div>
 
+      <div class="set-section" id="set-registry"></div>
+
       <div class="set-section">
         <div class="set-intro"><h3>${icon('folder')}Cartelle</h3><p>Dove Sirio OCR conserva i documenti letti e dove salva i file Excel.</p></div>
         <div class="set-controls">
@@ -196,6 +205,56 @@ function render(view) {
   </div>`);
   const keyInput = $('#set-key', root);
   if (keyInput && typed) keyInput.value = typed;
+  renderRegistry(view);
+}
+
+function renderRegistry(view) {
+  const el = $('#set-registry', view.root);
+  if (!el) return;
+  const reg = store.registry;
+  if (!reg || !reg.campi) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const typed = $('#reg-new', el)?.value || '';
+  const field = REG_FIELDS.find((f) => f.id === view.regTab) || REG_FIELDS[0];
+  const items = reg.campi[field.id] || [];
+  setHTML(el, html`
+    <div class="set-intro"><h3>${icon('user')}Anagrafica dei nomi</h3>
+      <p>Nomi già confermati: i fogli successivi vengono confrontati con questo elenco e le letture imprecise dei nomi vengono corrette automaticamente. Si aggiorna confermando i documenti o correggendo i nomi a mano.</p></div>
+    <div class="set-controls">
+      <div class="segmented" role="group" aria-label="Categoria dell'anagrafica">
+        ${REG_FIELDS.map((f) => html`<button type="button" data-reg-tab="${f.id}" aria-pressed="${String(f.id === field.id)}">${f.label}<span class="count">${(reg.campi[f.id] || []).length}</span></button>`)}
+      </div>
+      <div class="reg-list" role="list" aria-label="${field.label}">
+        ${items.length ? items.map((e) => html`<div class="reg-item" role="listitem">
+            <div style="min-width:0"><div class="reg-name">${e.valore}</div>
+              <div class="reg-meta">${e.conteggio ? `usato in ${plural(e.conteggio, 'documento', 'documenti')}` : 'non ancora usato'}${e.manuale ? ' · aggiunto a mano' : ''}${e.ultimo_uso ? ` · ${fmtDateTime(e.ultimo_uso)}` : ''}</div></div>
+            <button type="button" class="btn btn-sm btn-ghost btn-icon" data-reg-del="${e.valore}" aria-label="Rimuovi ${e.valore}" data-tip="Rimuovi dall'anagrafica">${icon('trash')}</button>
+          </div>`) : html`<div class="reg-empty">Nessun nome in elenco: verrà compilato automaticamente confermando i documenti.</div>`}
+      </div>
+      <div class="row" style="gap:8px">
+        <input class="input" id="reg-new" placeholder="${field.ph}" autocomplete="off" spellcheck="false" maxlength="200" aria-label="Nuovo nome: ${field.one}">
+        <button type="button" class="btn" data-act="reg-add">${icon('plus')}Aggiungi</button>
+      </div>
+    </div>`);
+  const inp = $('#reg-new', el);
+  if (typed) inp.value = typed;
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addRegistry(view); } });
+}
+
+async function addRegistry(view) {
+  const inp = $('#reg-new', view.root);
+  const valore = (inp?.value || '').trim();
+  if (!valore) { inp?.focus(); return; }
+  try {
+    store.registry = await post('/api/anagrafica', { campo: view.regTab, valore });
+    if (inp) inp.value = '';
+    renderRegistry(view);
+    $('#reg-new', view.root)?.focus();
+    toast({ type: 'success', title: 'Nome aggiunto all\'anagrafica', message: valore, duration: 2200 });
+  } catch (err) { toastError(err, 'Nome non aggiunto'); }
 }
 
 function privacyNote(claude) {
@@ -261,6 +320,25 @@ async function onClick(view, e) {
     }
     return;
   }
+  const regTab = e.target.closest('[data-reg-tab]');
+  if (regTab) { view.regTab = regTab.dataset.regTab; renderRegistry(view); return; }
+  const regDel = e.target.closest('[data-reg-del]');
+  if (regDel) {
+    const valore = regDel.dataset.regDel;
+    const ok = await confirmDialog({
+      title: 'Rimuovere il nome dall\'anagrafica?',
+      message: raw(`<p><b>${esc(valore)}</b> non verrà più usato per correggere le letture dei prossimi fogli. I documenti già letti non cambiano.</p>`),
+      confirmLabel: 'Rimuovi',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      store.registry = await del(`/api/anagrafica/${encodeURIComponent(view.regTab)}/${encodeURIComponent(valore)}`);
+      renderRegistry(view);
+      toast({ type: 'success', title: 'Nome rimosso', duration: 2000 });
+    } catch (err) { toastError(err, 'Rimozione non riuscita'); }
+    return;
+  }
   const theme = e.target.closest('[data-theme-opt]');
   if (theme) { await save({ tema: theme.dataset.themeOpt }, 'Tema aggiornato'); return; }
   const b = e.target.closest('[data-act]');
@@ -272,7 +350,8 @@ async function onClick(view, e) {
     if (input) input.type = view.keyVisible ? 'text' : 'password';
     b.innerHTML = String(icon(view.keyVisible ? 'eye-off' : 'eye'));
     b.setAttribute('aria-label', view.keyVisible ? 'Nascondi la chiave' : 'Mostra la chiave');
-  } else if (act === 'save-key') saveKey(view);
+  } else if (act === 'reg-add') addRegistry(view);
+  else if (act === 'save-key') saveKey(view);
   else if (act === 'test-key') testKey(view);
   else if (act === 'remove-key') {
     const ok = await confirmDialog({ title: 'Rimuovere la chiave API?', message: 'Claude Vision non potrà leggere nuovi documenti finché non verrà inserita una nuova chiave.', confirmLabel: 'Rimuovi', danger: true });
