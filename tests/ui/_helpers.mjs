@@ -12,10 +12,24 @@
 
 import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+
+// Playwright installato globalmente: gli import ESM ignorano NODE_PATH, quindi si ricorre a require.
+async function loadPlaywright() {
+  try {
+    return await import('playwright');
+  } catch {
+    const require = createRequire(import.meta.url);
+    for (const candidate of ['playwright', ...(process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean).map((p) => path.join(p, 'playwright')), '/opt/node22/lib/node_modules/playwright']) {
+      try { return require(candidate); } catch { /* prossimo */ }
+    }
+    throw new Error('Playwright non trovato: installarlo (npm i -g playwright) e impostare NODE_PATH.');
+  }
+}
+const { chromium } = await loadPlaywright();
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
