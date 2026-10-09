@@ -40,10 +40,11 @@ import re
 import threading
 import time
 import unicodedata
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Protocol
 
 import cv2
 import numpy as np
@@ -79,7 +80,7 @@ _WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin")
 _MISSING_MSG = (
     "Componenti offline non installati: il motore locale richiede i pacchetti "
     "«torch» e «transformers». Si installano con il programma di avvio (opzione "
-    "offline) oppure si puo' usare il motore Claude."
+    "offline) oppure si può usare il motore Claude."
 )
 
 
@@ -146,6 +147,8 @@ NOTE_FREQUENTI: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("RIUNIONE", ("RIUNIONE",)),
 )
 
+_NOTE_CANONICHE = frozenset(canon for canon, _forms in NOTE_FREQUENTI)
+
 NAME_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     "ÀÈÉÌÒÙàèéìòù0123456789 '.-/,"
@@ -179,9 +182,10 @@ class Lexicon:
     prefixes: frozenset[str]
     alphabet: frozenset[str]
     max_chars: int
+    numeric: bool = False
 
     @classmethod
-    def build(cls, name: str, pairs: Iterable[tuple[str, Any]]) -> Lexicon:
+    def build(cls, name: str, pairs: Iterable[tuple[str, Any]], numeric: bool = False) -> Lexicon:
         forms: dict[str, Any] = {}
         for text, value in pairs:
             k = _key(text)
@@ -191,7 +195,14 @@ class Lexicon:
             raise ValueError(f"Lessico vuoto: {name}")
         prefixes = frozenset(k[:i] for k in forms for i in range(len(k) + 1))
         alphabet = frozenset("".join(forms)) | frozenset(_JUNK_LEAD) | frozenset(_JUNK_TRAIL)
-        return cls(name, forms, prefixes, alphabet, max(len(k) for k in forms) + 2 * _MAX_JUNK)
+        return cls(name, forms, prefixes, alphabet, max(len(k) for k in forms) + 2 * _MAX_JUNK, numeric)
+
+    def signature(self, key: str) -> str:
+        """Contenuto essenziale di una scrittura (senza separatori e segni spuri;
+        nei lessici numerici le lettere confuse con cifre valgono come cifre)."""
+        if self.numeric:
+            return "".join(c for c in key.translate(_ALIAS_TABLE) if c.isdigit())
+        return "".join(c for c in key if c.isalnum())
 
     def is_prefix(self, key: str) -> bool:
         """True se ``key`` puo' ancora diventare una scrittura ammessa."""
@@ -224,6 +235,7 @@ class Lexicon:
 
 # Confusioni tipiche della lettura delle cifre scritte a mano.
 _DIGIT_ALIASES = {"1": ("1", "I", "L"), "0": ("0", "O")}
+_ALIAS_TABLE = str.maketrans({"I": "1", "L": "1", "O": "0", "U": "11"})
 
 
 def _digit_variants(s: str) -> list[str]:
@@ -268,31 +280,31 @@ def time_lexicon() -> Lexicon:
                             pairs.append((f"{hh}{sep}{mm}", value))
                 if m == 0:
                     pairs.append((hh, value))
-    return Lexicon.build("orari", pairs)
+    return Lexicon.build("orari", pairs, numeric=True)
 
 
 @functools.cache
 def hours_lexicon() -> Lexicon:
     """Ore giornaliere 0-8 a passi di mezz'ora ("3", "1,5", "1.5", "3h")."""
     pairs: list[tuple[str, float]] = []
-    for half in range(0, int(HOURS_MAX_DAY * 2) + 1):
+    for half in range(int(HOURS_MAX_DAY * 2) + 1):
         v = half / 2
         for f in _num_forms(v):
             for variant in _digit_variants(f):
                 pairs.append((variant, v))
                 pairs.append((variant + "h", v))
-    return Lexicon.build("ore", pairs)
+    return Lexicon.build("ore", pairs, numeric=True)
 
 
 @functools.cache
 def total_lexicon() -> Lexicon:
     """Totale mensile 0-300 ore a passi di mezz'ora."""
     pairs: list[tuple[str, float]] = []
-    for half in range(0, 601):
+    for half in range(601):
         v = half / 2
         for f in _num_forms(v):
             pairs.append((f, v))
-    return Lexicon.build("totale", pairs)
+    return Lexicon.build("totale", pairs, numeric=True)
 
 
 @functools.cache
@@ -304,7 +316,7 @@ def pei_lexicon() -> Lexicon:
         for f in _num_forms(v):
             pairs.append((f, v))
             pairs.append((f + "h", v))
-    return Lexicon.build("ore_pei", pairs)
+    return Lexicon.build("ore_pei", pairs, numeric=True)
 
 
 @functools.cache
@@ -315,12 +327,15 @@ def small_int_lexicon(maximum: int, roman: bool = False) -> Lexicon:
         pairs += [(str(n), str(n)), (f"{n:02d}", str(n))]
         if roman and n <= len(_ROMANI):
             pairs.append((_ROMANI[n - 1], str(n)))
-    return Lexicon.build(f"interi_{maximum}_{int(roman)}", pairs)
+    return Lexicon.build(f"interi_{maximum}_{int(roman)}", pairs, numeric=not roman)
 
 
 def _years_around(year: int | None) -> tuple[int, ...]:
     y = year or date.today().year
     return tuple(range(y - 2, y + 2))
+
+
+_MONTH_SEPARATORS = ("/", "-", ".", ",", "|", "1") + tuple(a + b for a in "/.,-" for b in "/.,-" if a != b)
 
 
 @functools.cache
@@ -332,7 +347,7 @@ def month_year_lexicon(years: tuple[int, ...]) -> Lexicon:
             v = (m, y)
             for mm in dict.fromkeys((str(m), f"{m:02d}")):
                 for yy in (str(y), f"{y % 100:02d}"):
-                    for sep in ("/", "-", "."):
+                    for sep in _MONTH_SEPARATORS:
                         pairs.append((f"{mm}{sep}{yy}", v))
             pairs.append((f"{MESI_NOMI[m - 1]} {y}", v))
     return Lexicon.build(f"mese_anno_{years[0]}_{years[-1]}", pairs)
@@ -351,7 +366,7 @@ def date_lexicon(years: tuple[int, ...]) -> Lexicon:
                         for yy in (str(y), f"{y % 100:02d}"):
                             for sep in ("/", "."):
                                 pairs.append((f"{dd}{sep}{mm}{sep}{yy}", v))
-    return Lexicon.build(f"date_{years[0]}_{years[-1]}", pairs)
+    return Lexicon.build(f"date_{years[0]}_{years[-1]}", pairs, numeric=True)
 
 
 @functools.cache
@@ -497,7 +512,7 @@ class TrOCRRecognizer:
         ids = self._charset_ids.get(charset)
         if ids is None:
             if charset is None:
-                sel = [i for i, t in enumerate(self.tok_text) if t and t.strip() != "" or (t == " ")]
+                sel = [i for i, t in enumerate(self.tok_text) if t]
             else:
                 sel = [i for i, t in enumerate(self.tok_text) if t and set(t) <= charset]
             sel = [i for i in sel if i != self.eos_id]
@@ -522,7 +537,10 @@ class TrOCRRecognizer:
 
     # ------------------------------------------------------------ decoder
     def _caches(self) -> tuple[Any, Any, Any]:
-        from transformers.cache_utils import DynamicCache, EncoderDecoderCache  # noqa: PLC0415
+        from transformers.cache_utils import (  # noqa: PLC0415
+            DynamicCache,
+            EncoderDecoderCache,
+        )
 
         return DynamicCache, EncoderDecoderCache, self.decoder.config
 
@@ -541,11 +559,11 @@ class TrOCRRecognizer:
         return self_kv, cross_kv, lp
 
     def _make_cache(self, self_kv: list[tuple[Any, Any]], cross_kv: list[tuple[Any, Any]], width: int) -> Any:
+        """Cache per ``width`` ipotesi: le chiavi/valori della cross-attention (uguali
+        per tutte) vengono copiati una volta sola, non ricalcolati a ogni passo."""
         dyn, encdec, _ = self._caches()
-        cross = [(k.expand(width, -1, -1, -1).contiguous(), v.expand(width, -1, -1, -1).contiguous())
-                 for k, v in cross_kv]
-        selfc = [(k.expand(width, -1, -1, -1).contiguous(), v.expand(width, -1, -1, -1).contiguous())
-                 for k, v in self_kv]
+        cross = [(k.expand(width, -1, -1, -1), v.expand(width, -1, -1, -1)) for k, v in cross_kv]
+        selfc = [(k.expand(width, -1, -1, -1), v.expand(width, -1, -1, -1)) for k, v in self_kv]
         cache = encdec(dyn(selfc), dyn(cross))
         for i in range(len(cross)):
             cache.is_updated[i] = True
@@ -590,26 +608,45 @@ class TrOCRRecognizer:
             scores = torch.cat(cand_scores)
             parents = torch.cat(cand_parent)
             toks = torch.cat(cand_tok)
-            k = min(width, int(scores.numel()))
+            k = min(width * 4 if lexicon is not None else width, int(scores.numel()))
             top_s, top_i = torch.topk(scores, k)
             best_live = float(top_s[0])
             if len(finished) >= width:
-                ranked = sorted((self._rank(f, length_norm) for f in finished), reverse=True)
+                if lexicon is not None:
+                    # conta i valori distinti gia' conclusi (le varianti di scrittura non contano)
+                    best_by_value: dict[Any, float] = {}
+                    for fk, _fi, fs in finished:
+                        fv = lexicon.complete(fk)
+                        best_by_value[fv] = max(fs, best_by_value.get(fv, -math.inf))
+                    ranked = sorted(best_by_value.values(), reverse=True)
+                else:
+                    ranked = sorted((self._rank(f, length_norm) for f in finished), reverse=True)
                 bound = best_live if not length_norm else best_live / (step + 2)
-                if ranked[width - 1] >= bound:
+                if len(ranked) >= width and ranked[width - 1] >= bound:
                     break
             new_live: list[_Hyp] = []
             sel_parents: list[int] = []
             sel_tokens: list[int] = []
+            seen: set[str] = set()
             for s, j in zip(top_s.tolist(), top_i.tolist()):
                 if not math.isfinite(s):
                     continue
                 p = int(parents[j])
                 t = int(toks[j])
                 h = live[p]
-                new_live.append(_Hyp(h.ids + (t,), h.key + self.tok_key[t], s))
+                key = h.key + self.tok_key[t]
+                if lexicon is not None:
+                    # una sola ipotesi per "contenuto": le varianti (8:00 / 8.00 / 8,00)
+                    # non devono occupare tutto il beam a scapito di valori diversi
+                    sig = lexicon.signature(key)
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                new_live.append(_Hyp(h.ids + (t,), key, s))
                 sel_parents.append(p)
                 sel_tokens.append(t)
+                if len(new_live) >= width:
+                    break
             if not new_live:
                 break
             # larghezza fissa: le posizioni libere ripetono l'ultima ipotesi (punteggio -inf)
@@ -697,6 +734,15 @@ class TrOCRRecognizer:
             cands = [(v, _logsumexp(s)) for v, s in by_value.items()]
             cands.sort(key=lambda c: c[1], reverse=True)
             reading.candidates = cands
+            best = max(fin, key=lambda f: f[2], default=None)
+            if (best is not None and best[2] > math.log(0.5) and req.charset is None
+                    and req.free_beams <= 1):
+                # una sequenza con probabilita' > 1/2 e' per forza quella della lettura
+                # libera "golosa": inutile ricalcolarla
+                reading.free_text = self._decode_ids(best[1])
+                reading.free_logprob = best[2]
+                reading.free_tokens = len(best[1])
+                return reading
         if req.free or lex is None:
             width = max(1, req.free_beams)
             if start is not None:
@@ -833,7 +879,7 @@ def _download_error(exc: BaseException, model_name: str, size_mb: float | None) 
     names = {c.__name__ for c in type(exc).__mro__}
     if names & {"RepositoryNotFoundError", "RevisionNotFoundError", "GatedRepoError"}:
         return EngineError(
-            f"Il modello «{model_name}» non e' disponibile su huggingface.co: verificare il nome del "
+            f"Il modello «{model_name}» non è disponibile su huggingface.co: verificare il nome del "
             "modello locale nelle impostazioni."
         )
     if _is_network_error(exc):
@@ -866,6 +912,19 @@ def _weight_patterns(files: Sequence[str]) -> list[str]:
     return base + ["*.bin"]
 
 
+def _silent_tqdm() -> Any:
+    """Barre di avanzamento disattivate: l'avanzamento passa da ``progress`` e
+    l'applicazione puo' girare senza console (stderr assente)."""
+    from tqdm.auto import tqdm  # noqa: PLC0415
+
+    class _Silent(tqdm):  # type: ignore[misc]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+
+    return _Silent
+
+
 def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_progress) -> Path:
     """Scarica il modello da huggingface.co in ``cache_dir`` (solo i file necessari),
     riportando l'avanzamento. Restituisce la cartella del modello."""
@@ -890,7 +949,8 @@ def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_p
     def worker() -> None:
         try:
             outcome["path"] = snapshot_download(model_name, cache_dir=str(cache_dir), allow_patterns=patterns,
-                                                revision=getattr(info, "sha", None))
+                                                revision=getattr(info, "sha", None),
+                                                tqdm_class=_silent_tqdm())
         except BaseException as exc:  # noqa: BLE001 - riportata nel thread chiamante
             outcome["error"] = exc
 
@@ -919,14 +979,20 @@ def _load_recognizer(path: Path, model_name: str, device: str, quantize: bool = 
     torch = importlib.import_module("torch")
     transformers = importlib.import_module("transformers")
     try:
+        # niente barre di avanzamento su stderr (l'applicazione puo' non avere una console)
+        transformers.utils.logging.disable_progress_bar()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         processor = transformers.TrOCRProcessor.from_pretrained(str(path), local_files_only=True)
-    except (ImportError, ValueError) as exc:
-        if "sentencepiece" in str(exc).lower() or "tiktoken" in str(exc).lower():
+    except Exception as exc:  # noqa: BLE001
+        text = str(exc).lower()
+        if "sentencepiece" in text or "tiktoken" in text or "protobuf" in text:
             raise EngineError(
-                f"Il modello {_model_label(model_name)} richiede il pacchetto «sentencepiece», non "
-                "installato: scegliere un altro modello locale nelle impostazioni."
+                f"Il modello {_model_label(model_name)} richiede i pacchetti «sentencepiece» e «protobuf», "
+                "non installati: scegliere un altro modello locale nelle impostazioni."
             ) from exc
-        raise EngineError(f"Modello di riconoscimento offline non valido: {exc}") from exc
+        raise EngineError(f"Modello di riconoscimento offline non valido o incompleto: {exc}") from exc
     try:
         model = transformers.VisionEncoderDecoderModel.from_pretrained(str(path), local_files_only=True)
     except Exception as exc:  # noqa: BLE001
@@ -1070,7 +1136,7 @@ def clean_crop(gray: np.ndarray, box: Box, unit: float, rows: Sequence[float] = 
         n2, lab2, stats2, _ = cv2.connectedComponentsWithStats(sel.astype(np.uint8), connectivity=8)
         thin = max(2.0, 0.07 * unit)
         for k in range(1, n2):
-            x, y, w, h, area = (int(v) for v in stats2[k])
+            _x, _y, w, h, area = (int(v) for v in stats2[k])
             comp = lab2 == k
             if area < min_area or (min(w, h) <= thin and max(w, h) >= 3 * min(w, h)
                                    and float((comp & line_near).sum()) > 0.5 * area):
@@ -1268,33 +1334,48 @@ def _text_request(key: str, crop: np.ndarray, lexicon: Lexicon | None, **kw: Any
 
 
 def _sostituzione(gray: np.ndarray, grid: TableGrid) -> tuple[str | None, bool]:
-    """Crocetta nei riquadri SI/NO dell'intestazione: (valore, incerto)."""
+    """Crocetta nei riquadri "Sostituzione: [SI] [NO]": (valore, incerto).
+
+    Le lettere stampate occupano la fascia centrale dei riquadri e "NO" ha
+    circa 1,4-1,7 volte l'inchiostro di "SI": un segno si riconosce dall'inchiostro
+    che esce dalla fascia delle lettere o dall'eccesso d'inchiostro in un riquadro
+    rispetto all'altro. Nei casi dubbi il campo resta vuoto."""
     rh = grid.row_height
     tx0 = grid.col_x[0]
     tw = grid.col_x[-1] - grid.col_x[0]
     a, mid, b, top, bot = SOSTITUZIONE_LAYOUT
     ya, yb = grid.header_top + top * rh, grid.header_top + bot * rh
     H, W = gray.shape[:2]
-    marks: dict[str, float] = {}
+    amount: dict[str, int] = {}
+    outside: dict[str, float] = {}
     for label, (fx0, fx1) in (("SI", (a, mid)), ("NO", (mid, b))):
         bx0, bx1 = tx0 + fx0 * tw, tx0 + fx1 * tw
-        inset_x = 0.08 * (bx1 - bx0)
-        inset_y = 0.08 * (yb - ya)
-        box = _clip_box((bx0 + inset_x, ya + inset_y, bx1 - inset_x, yb - inset_y), W, H)
-        _ratio, comps = _components(gray, box, rh, rows=(ya, yb), cols=(bx0, bx1))
-        bw, bh = box[2] - box[0], box[3] - box[1]
-        # le lettere stampate "SI"/"NO" sono basse; una crocetta occupa gran parte del riquadro
-        best = 0.0
-        for _x, _y, w, h, _area in comps:
-            best = max(best, min(1.0, h / max(1.0, 0.62 * bh)) * min(1.0, w / max(1.0, 0.3 * bw)),
-                       min(1.0, w / max(1.0, 0.7 * bw)) * min(1.0, h / max(1.0, 0.45 * bh)))
-        marks[label] = best
-    si, no = marks["SI"], marks["NO"]
-    if max(si, no) < 0.85:
-        return None, max(si, no) >= 0.6
-    if si >= 0.85 and no >= 0.85:
-        return ("SI" if si > no else "NO"), True
-    return ("SI" if si > no else "NO"), False
+        box = _clip_box((bx0 + 0.06 * (bx1 - bx0), ya + 0.06 * (yb - ya),
+                         bx1 - 0.06 * (bx1 - bx0), yb - 0.06 * (yb - ya)), W, H)
+        x0, y0, x1, y1 = box
+        region = gray[y0:y1, x0:x1]
+        if region.size == 0:
+            amount[label], outside[label] = 0, 0.0
+            continue
+        m = region < _ink_threshold(_paper_level(region))
+        m &= ~_line_mask(m, rh, [ya - y0, yb - y0], [bx0 - x0, bx1 - x0])
+        h, w = m.shape
+        central = np.zeros_like(m)
+        central[int(0.22 * h):int(0.78 * h), int(0.15 * w):int(0.85 * w)] = True
+        amount[label] = int(m.sum())
+        outside[label] = float((m & ~central).sum()) / max(1, amount[label])
+    if not amount.get("SI") or not amount.get("NO"):
+        return None, False
+    # segno che esce dalla fascia delle lettere
+    if max(outside.values()) >= 0.15 and min(outside.values()) < 0.05:
+        value = max(outside, key=lambda k: outside[k])
+        return value, max(outside.values()) < 0.25
+    ratio = amount["NO"] / float(amount["SI"])
+    if ratio < 1.25:
+        return "SI", ratio > 1.1
+    if ratio > 2.0:
+        return "NO", ratio < 2.3
+    return None, False
 
 
 def stamp_boxes(gray: np.ndarray, grid: TableGrid) -> list[Box]:
@@ -1427,7 +1508,7 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
             continue
         key = f"header.{name}"
         if name in ("operatore", "alunno", "ente", "istituto"):
-            plan.requests.append(_text_request(key, crop, None, free_beams=3, charset=NAME_CHARS,
+            plan.requests.append(_text_request(key, crop, None, free_beams=4, charset=NAME_CHARS,
                                                max_tokens=24, min_aspect=2.0))
         elif name == "lotto":
             plan.requests.append(_text_request(key, crop, small_int_lexicon(30), beams=4, max_tokens=4))
@@ -1481,13 +1562,20 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
 
 
 # ==========================================================================
-# Post-elaborazione: distribuzioni, riconciliazione, incertezze
+# Post-elaborazione: evidenze, riconciliazione, incertezze
 # ==========================================================================
 
-P_INCERTO = 0.6          # probabilita' minima del valore scelto per non segnalarlo
-P_ILLEGGIBILE = 0.05     # sotto questa soglia (e lettura libera non interpretabile) -> illeggibile
+P_INCERTO = 0.6          # probabilita' minima del valore scelto per non segnalarlo come incerto
+P_LEGGIBILE = 0.05       # copertura minima: sotto, la scrittura non somiglia a nessun valore ammesso
+SUPPORTO_CONTESTO = 1.0  # coerenza minima perche' un valore poco leggibile sia dedotto dalla riga
+COPERTURA_DEBOLE = 0.3   # sotto questa copertura la lettura conta poco e si considerano i valori del contesto
+P_CONTESTO = 0.02        # probabilita' iniziale di un valore suggerito dal contesto
+TAU_MIN = 0.25           # attenuazione massima delle preferenze di una lettura debole
 TOP_K = 4                # alternative per cella considerate nella riconciliazione
-FREE_GAP_ILLEGGIBILE = 6.0   # lettura libera molto piu' probabile del miglior valore ammesso
+W_COLONNA = 1.0          # preferenza per i valori ricorrenti nella stessa colonna (orario scolastico)
+QUOTA_COLONNA = 0.6      # quota oltre la quale un valore "domina" la colonna
+SIMILE_NOTA = 0.8        # somiglianza per agganciare una nota a una formula ricorrente
+SIMILE_NOTA_VICINA = 0.45   # ... o alla nota (sicura) del giorno precedente/successivo
 
 
 def _time_minutes(v: str | None) -> int | None:
@@ -1496,47 +1584,86 @@ def _time_minutes(v: str | None) -> int | None:
 
 
 def _time_prior(value: str) -> float:
+    """Preferenza per gli orari "tondi" (8:00 molto piu' frequente di 8:30, 8:15)."""
     m = _time_minutes(value)
     if m is None:
         return 0.0
-    minute = m % 60
-    return {0: 0.0, 30: -0.4}.get(minute, -1.0)
+    return {0: 0.0, 30: -1.0}.get(m % 60, -2.0)
 
 
 def _hours_prior(value: float) -> float:
-    return 0.0 if abs(value - round(value)) < 1e-9 else -0.3
+    return 0.0 if abs(value - round(value)) < 1e-9 else -0.5
 
 
-def _free_value(kind: str, text: str) -> Any:
-    """Valore della lettura libera (None se non interpretabile)."""
+def free_value(text: str, lexicon: Lexicon | None, kind: str = "") -> Any:
+    """Valore della lettura libera (``None`` se non interpretabile).
+
+    Usa il lessico (con le sue tolleranze) e, se non basta, le funzioni di
+    interpretazione di ``validation``; "3 3" (cifra ripetuta) vale "3"."""
     if not text:
         return None
+    if lexicon is not None:
+        v = lexicon.value(text)
+        if v is not None:
+            return v
+        parts = text.split()
+        if len(parts) > 1:
+            vals = {lexicon.value(p) for p in parts}
+            if len(vals) == 1 and None not in vals:
+                return vals.pop()
     if kind == "time":
         return normalize_time(text)
     if kind == "hours":
-        v = parse_hours(text)
-        return None if v is None else round(v * 4) / 4
+        return parse_hours(text)
     return None
 
 
-def distribution(reading: Reading, kind: str, prior: Callable[[Any], float] | None = None
-                 ) -> list[tuple[Any, float]]:
-    """Probabilita' (normalizzate, log) dei valori ammessi di un campo.
+@dataclass
+class Evidence:
+    """Cosa dice la lettura di un campo con lessico."""
 
-    La massa della lettura libera conta come "altro" quando la lettura libera
-    non corrisponde a nessuno dei candidati: abbassa la fiducia di tutti."""
-    scored = [(v, lp + (prior(v) if prior else 0.0)) for v, lp in reading.candidates if math.isfinite(lp)]
-    if not scored:
-        return []
-    free_v = _free_value(kind, reading.free_text)
+    options: list[tuple[Any, float]]   # (valore, log-prob relativa ai soli valori ammessi), decrescente
+    coverage: float                    # 0..1: quanto la scrittura somiglia a un valore ammesso
+    free_value: Any = None             # valore della lettura libera (None = non interpretabile)
+
+    @property
+    def top(self) -> Any:
+        return self.options[0][0] if self.options else None
+
+    def p(self, value: Any) -> float:
+        """Probabilita' relativa di ``value`` fra i valori ammessi."""
+        return next((math.exp(lp) for v, lp in self.options if v == value), 0.0)
+
+
+def evidence(reading: Reading | None, lexicon: Lexicon | None, kind: str = "",
+             prior: Callable[[Any], float] | None = None) -> Evidence:
+    """Distribuzione dei valori ammessi e copertura della lettura.
+
+    La copertura confronta la probabilita' dei valori ammessi con quella della
+    lettura libera quando quest'ultima non corrisponde a nessuno di essi
+    ("Atlas" letto in una cella degli orari -> copertura quasi nulla)."""
+    if reading is None:
+        return Evidence([], 0.0)
+    fv = free_value(reading.free_text, lexicon, kind)
+    cands = [(v, lp) for v, lp in reading.candidates if math.isfinite(lp)]
+    if not cands:
+        return Evidence([], 0.0, fv)
+    z = _logsumexp(lp for _v, lp in cands)
     other = -math.inf
-    if reading.free_text and math.isfinite(reading.free_logprob):
-        if free_v is None or all(free_v != v for v, _ in scored):
-            other = reading.free_logprob
-    z = _logsumexp([s for _, s in scored] + [other])
-    out = [(v, s - z) for v, s in scored]
-    out.sort(key=lambda t: t[1], reverse=True)
-    return out
+    if (reading.free_text and math.isfinite(reading.free_logprob)
+            and (fv is None or all(fv != v for v, _ in cands))):
+        other = reading.free_logprob
+    coverage = math.exp(z - _logsumexp([z, other]))
+    scored = [(v, lp + (prior(v) if prior else 0.0)) for v, lp in cands]
+    zp = _logsumexp(lp for _v, lp in scored)
+    options = sorted(((v, lp - zp) for v, lp in scored), key=lambda t: t[1], reverse=True)
+    return Evidence(options, coverage, fv)
+
+
+def _with_bonus(options: list[tuple[Any, float]], bonus: Callable[[Any], float]) -> list[tuple[Any, float]]:
+    scored = [(v, lp + bonus(v)) for v, lp in options]
+    z = _logsumexp(lp for _v, lp in scored)
+    return sorted(((v, lp - z) for v, lp in scored), key=lambda t: t[1], reverse=True)
 
 
 # pesi (log) della riconciliazione di riga
@@ -1545,6 +1672,7 @@ W_DURATION = -3.0        # durata < 30 min o > 8 h
 W_SAME_PROG_EFF = 1.0    # effettivo uguale al programmato (caso piu' frequente)
 W_HOURS_OK = 2.5         # ore dichiarate = uscita - entrata effettive
 W_HOURS_BAD = -2.0
+W_HOURS_PROG_MATCH = 0.5  # ore dichiarate = durata dell'orario programmato
 W_HOURS_PROG_OK = 0.3    # senza orario effettivo: ore entro l'orario programmato
 W_HOURS_PROG_BAD = -1.0
 
@@ -1577,8 +1705,12 @@ def row_consistency(values: dict[str, Any], assenza_alunno: bool = False) -> flo
                 s += W_HOURS_OK
             elif not (assenza_alunno and ore < d):
                 s += W_HOURS_BAD
-        elif pe is not None and pu is not None and pu > pe:
-            s += W_HOURS_PROG_OK if ore <= (pu - pe) / 60.0 + 0.01 else W_HOURS_PROG_BAD
+        if pe is not None and pu is not None and pu > pe:
+            d = (pu - pe) / 60.0
+            if abs(d - ore) < 0.01:
+                s += W_HOURS_PROG_MATCH
+            elif ee is None or eu is None:
+                s += W_HOURS_PROG_OK if ore <= d + 0.01 else W_HOURS_PROG_BAD
     return s
 
 
@@ -1586,8 +1718,8 @@ def reconcile_row(options: dict[str, list[tuple[Any, float]]], assenza_alunno: b
                   ) -> dict[str, tuple[Any, float]]:
     """Sceglie la combinazione piu' probabile e coerente.
 
-    ``options``: per campo, alternative (valore, log-prob normalizzata) in ordine
-    decrescente. Restituisce per campo (valore scelto, log-prob del valore)."""
+    ``options``: per campo, alternative (valore, log-prob) in ordine decrescente.
+    Restituisce per campo (valore scelto, log-prob del valore)."""
     fields = [f for f, opts in options.items() if opts]
     if not fields:
         return {}
@@ -1605,7 +1737,7 @@ def reconcile_row(options: dict[str, list[tuple[Any, float]]], assenza_alunno: b
 def _clean_name(text: str) -> str:
     t = unicodedata.normalize("NFKC", text).upper()
     t = re.sub(r"[^A-ZÀÈÉÌÒÙ0-9' .\-/]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip(" .-/'")
+    t = re.sub(r"\s+", " ", t).strip(" .-/',")
     return t
 
 
@@ -1617,55 +1749,177 @@ class _Field:
     illeggibile: bool = False
 
 
-def _lexicon_field(reading: Reading | None, kind: str, prior: Callable[[Any], float] | None = None,
-                   ) -> tuple[list[tuple[Any, float]], bool]:
-    """(distribuzione, illeggibile) di un campo con lessico."""
-    if reading is None:
-        return [], True
-    dist = distribution(reading, kind, prior)
-    if not dist:
-        return [], True
-    top_p = math.exp(dist[0][1])
-    free_v = _free_value(kind, reading.free_text)
-    gap = reading.free_logprob - max(lp for _v, lp in reading.candidates) if reading.candidates else math.inf
-    if top_p < P_ILLEGGIBILE and free_v is None and gap > FREE_GAP_ILLEGGIBILE:
-        return dist, True
-    return dist, False
-
-
-def _choose(dist: list[tuple[Any, float]], free_v: Any = None) -> _Field:
-    if not dist:
-        return _Field(illeggibile=True)
-    v, lp = dist[0]
-    p = math.exp(lp)
-    incerto = p < P_INCERTO or (free_v is not None and free_v != v)
+def _choose(ev: Evidence) -> _Field:
+    """Valore piu' probabile di un campo senza contesto."""
+    if not ev.options or ev.coverage < P_LEGGIBILE:
+        return _Field(illeggibile=True, confidence=0.0)
+    v = ev.top
+    p = ev.p(v) * ev.coverage
+    incerto = p < P_INCERTO or (ev.free_value is not None and ev.free_value != v)
     return _Field(value=v, confidence=p, incerto=incerto)
 
 
-def _text_field(reading: Reading | None, lexicon: Lexicon | None = None, min_conf: float = 0.55,
-                floor: float = 0.12) -> _Field:
-    """Campo di testo libero (nomi, note) con eventuale aggancio al lessico."""
+def _similarity(a: str, b: str) -> float:
+    import difflib  # noqa: PLC0415
+
+    ka, kb = _key(a), _key(b)
+    if not ka or not kb:
+        return 0.0
+    return difflib.SequenceMatcher(None, ka, kb).ratio()
+
+
+def _text_field(reading: Reading | None, min_conf: float = 0.55, floor: float = 0.12) -> _Field:
+    """Campo di testo libero (nomi): lettura libera ripulita."""
     if reading is None:
         return _Field(illeggibile=True)
     text = _clean_name(reading.free_text)
     conf = reading.free_confidence
-    if lexicon is not None and reading.candidates:
-        lex_v, lex_lp = reading.candidates[0]
-        if not text or lex_lp >= reading.free_logprob - 1.0:
-            # la nota corrisponde a una formula ricorrente
-            n_tok = max(1, reading.free_tokens)
-            lconf = float(math.exp(min(0.0, lex_lp) / (n_tok + 1)))
-            return _Field(value=str(lex_v), confidence=lconf, incerto=lconf < min_conf)
-    if not text or len(re.sub(r"[^A-Z0-9ÀÈÉÌÒÙ]", "", text)) == 0 or conf < floor:
+    if not text or not re.search(r"[A-Z0-9ÀÈÉÌÒÙ]", text) or conf < floor:
         return _Field(illeggibile=True, confidence=conf)
     return _Field(value=text, confidence=conf, incerto=conf < min_conf)
 
 
+def _note_field(reading: Reading | None) -> _Field:
+    """Nota: formula ricorrente (lessico o somiglianza) oppure testo letto."""
+    if reading is None:
+        return _Field(illeggibile=True)
+    text = _clean_name(reading.free_text)
+    conf = reading.free_confidence
+    n_tok = max(1, reading.free_tokens)
+    if reading.candidates:
+        lex_v, lex_lp = reading.candidates[0]
+        if not text or lex_lp >= reading.free_logprob - 1.0:
+            lconf = float(math.exp(min(0.0, lex_lp) / (n_tok + 1)))
+            return _Field(value=str(lex_v), confidence=lconf, incerto=lconf < 0.55)
+    if text:
+        best, sim = None, 0.0
+        for canon, forms in NOTE_FREQUENTI:
+            for form in forms:
+                r = _similarity(text, form)
+                if r > sim:
+                    best, sim = canon, r
+        if best is not None and sim >= SIMILE_NOTA:
+            return _Field(value=best, confidence=min(conf, sim), incerto=sim < 0.9 or conf < 0.55)
+    return _text_field(reading)
+
+
+_ETICHETTE = {
+    "prog_entrata": "entrata programmata", "prog_uscita": "uscita programmata",
+    "eff_entrata": "entrata effettiva", "eff_uscita": "uscita effettiva", "ore_dichiarate": "ore",
+}
+
+
+def etichetta(campo: str) -> str:
+    return _ETICHETTE.get(campo, campo)
+
+
+def _shift(t: Any, hours: Any, sign: int) -> str | None:
+    m = _time_minutes(t) if isinstance(t, str) else None
+    if m is None or not isinstance(hours, (int, float)):
+        return None
+    r = m + sign * int(round(float(hours) * 60))
+    if not TIME_MIN <= r <= TIME_MAX or r % TIME_STEP:
+        return None
+    return f"{r // 60:02d}:{r % 60:02d}"
+
+
+def _context_values(f: str, cells: dict[str, Evidence], column_values: list[Any]) -> list[Any]:
+    """Valori suggeriti dal resto della riga e dalla colonna per una cella poco leggibile."""
+    top = {k: ev.top for k, ev in cells.items() if k != f and ev.options}
+    out: list[Any] = []
+    twin = {"prog_entrata": "eff_entrata", "eff_entrata": "prog_entrata",
+            "prog_uscita": "eff_uscita", "eff_uscita": "prog_uscita"}
+    if f in twin and top.get(twin[f]) is not None:
+        out.append(top[twin[f]])
+    ore = top.get("ore_dichiarate")
+    if f == "eff_uscita":
+        out += [_shift(top.get("eff_entrata"), ore, 1), _shift(top.get("prog_entrata"), ore, 1)]
+    elif f == "eff_entrata":
+        out += [_shift(top.get("eff_uscita"), ore, -1), _shift(top.get("prog_uscita"), ore, -1)]
+    elif f == "prog_uscita":
+        out += [_shift(top.get("prog_entrata"), ore, 1), _shift(top.get("eff_entrata"), ore, 1)]
+    elif f == "prog_entrata":
+        out += [_shift(top.get("prog_uscita"), ore, -1), _shift(top.get("eff_uscita"), ore, -1)]
+    elif f == "ore_dichiarate":
+        for a, b in (("eff_entrata", "eff_uscita"), ("prog_entrata", "prog_uscita")):
+            d = hours_between(top.get(a), top.get(b))
+            if d is not None and abs(d * 2 - round(d * 2)) < 1e-9 and 0 < d <= HOURS_MAX_DAY:
+                out.append(d)
+    if column_values:
+        out.append(max(set(column_values), key=column_values.count))
+    return [v for v in dict.fromkeys(out) if v is not None]
+
+
+def _weak_options(options: list[tuple[Any, float]], extra: list[Any], coverage: float
+                  ) -> list[tuple[Any, float]]:
+    """Lettura debole: differenze fra le alternative attenuate in proporzione alla
+    copertura e valori suggeriti dal contesto aggiunti fra le alternative."""
+    tau = min(1.0, max(TAU_MIN, coverage / COPERTURA_DEBOLE))
+    scored = [(v, lp * tau) for v, lp in options]
+    present = {v for v, _ in scored}
+    floor = math.log(P_CONTESTO) * tau
+    scored += [(v, floor) for v in extra if v not in present]
+    if not scored:
+        return []
+    z = _logsumexp(lp for _v, lp in scored)
+    return sorted(((v, lp - z) for v, lp in scored), key=lambda t: t[1], reverse=True)
+
+
+def _column_bonus(values: list[Any], own: Any) -> Callable[[Any], float]:
+    """Preferenza per i valori gia' letti con sicurezza negli altri giorni della colonna."""
+    others = list(values)
+    if own is not None and own in others:
+        others.remove(own)
+    n = len(others)
+    if n < 3:
+        return lambda _v: 0.0
+    counts: dict[Any, int] = {}
+    for v in others:
+        counts[v] = counts.get(v, 0) + 1
+    return lambda v: W_COLONNA * counts.get(v, 0) / n
+
+
+def _context_confidence(support: float) -> float:
+    """Fiducia data dalla coerenza della riga (es. ore = uscita - entrata)."""
+    return min(0.95, max(0.0, 1.0 - math.exp(-max(0.0, support) / 1.5)))
+
+
+def _dominant(values: list[Any], own: Any) -> Any:
+    others = list(values)
+    if own is not None and own in others:
+        others.remove(own)
+    if len(others) < 3:
+        return None
+    best = max(set(others), key=others.count)
+    return best if others.count(best) >= QUOTA_COLONNA * len(others) else None
+
+
 def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> ExtractionResult:
     """Costruisce il risultato finale dai riconoscimenti e dall'analisi d'inchiostro."""
+    t_lex, h_lex = time_lexicon(), hours_lexicon()
+    # 1) evidenze di tutte le celle con scrittura
+    evs: dict[int, dict[str, Evidence]] = {}
+    for g in range(1, 32):
+        st = plan.cells.get(g, {})
+        evs[g] = {}
+        for f in TEXT_FIELDS:
+            if st.get(f) != TESTO:
+                continue
+            reading = readings.get(f"rows.{g}.{f}")
+            if f == "ore_dichiarate":
+                evs[g][f] = evidence(reading, h_lex, "hours", _hours_prior)
+            else:
+                evs[g][f] = evidence(reading, t_lex, "time", _time_prior)
+    # valori letti con sicurezza in ogni colonna (per la preferenza di colonna)
+    column: dict[str, list[Any]] = {f: [] for f in TEXT_FIELDS}
+    for g, cells in evs.items():
+        for f, ev in cells.items():
+            if ev.options and ev.coverage >= 0.3 and math.exp(ev.options[0][1]) >= 0.5:
+                column[f].append(ev.top)
+
     rows: list[DayRow] = []
     confs: list[float] = []
-    n_incerti = n_illeggibili = 0
+    dedotti: list[str] = []
     for g in range(1, 32):
         st = plan.cells.get(g, {})
         row = DayRow(giorno=g)
@@ -1677,49 +1931,108 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
                 row.incerti.append(f)
                 row.confidenza[f] = 0.5
         row.trattino_effettivo = TRATTINO in (st.get("eff_entrata"), st.get("eff_uscita"))
-        options: dict[str, list[tuple[Any, float]]] = {}
-        frees: dict[str, Any] = {}
-        illeg: set[str] = set()
-        for f in TEXT_FIELDS:
-            if st.get(f) != TESTO:
-                continue
-            kind = "hours" if f == "ore_dichiarate" else "time"
-            prior = _hours_prior if kind == "hours" else _time_prior
-            reading = readings.get(f"rows.{g}.{f}")
-            dist, illegible = _lexicon_field(reading, kind, prior)
-            if illegible:
-                illeg.add(f)
-                continue
-            options[f] = dist
-            frees[f] = _free_value(kind, reading.free_text) if reading else None
+        cells = evs[g]
+        options = {f: _with_bonus(ev.options, _column_bonus(column[f], ev.top))
+                   for f, ev in cells.items() if ev.options}
+        for f, ev in cells.items():
+            if ev.coverage < COPERTURA_DEBOLE:
+                options[f] = _weak_options(options.get(f, []), _context_values(f, cells, column[f]),
+                                           ev.coverage)
         chosen = reconcile_row(options, assenza_alunno=row.assenza_alunno)
-        for f, (v, lp) in chosen.items():
-            p = math.exp(lp)
+        values = {f: v for f, (v, _lp) in chosen.items()}
+        for f in TEXT_FIELDS:
+            if f not in cells:
+                continue
+            ev = cells[f]
+            if f not in chosen:
+                row.illeggibili.append(f)
+                confs.append(0.0)
+                continue
+            v = values[f]
+            p = ev.p(v) * ev.coverage
+            rest = {k: x for k, x in values.items() if k != f}
+            support = (row_consistency(values, row.assenza_alunno)
+                       - row_consistency(rest, row.assenza_alunno))
+            deduced = ev.coverage < P_LEGGIBILE
+            if deduced:
+                if support < SUPPORTO_CONTESTO:
+                    # scrittura presente ma non riconducibile a un valore ammesso
+                    row.illeggibili.append(f)
+                    values.pop(f)
+                    confs.append(0.0)
+                    continue
+                dedotti.append(f"giorno {g} ({etichetta(f)})")
+                p = min(p, 0.2)
+            else:
+                # la coerenza con il resto della riga rafforza una lettura gia' preferita
+                p = 1.0 - (1.0 - p) * (1.0 - _context_confidence(support))
             setattr(row, f, v)
             row.confidenza[f] = round(p, 3)
             confs.append(p)
-            top = options[f][0][0]
-            fv = frees.get(f)
-            if v != top or p < P_INCERTO or (fv is not None and fv != v):
+            dom = _dominant(column[f], ev.top)
+            unusual = dom is not None and dom != v and ev.p(dom) >= 0.02
+            if (deduced or v != ev.top or p < P_INCERTO or unusual
+                    or (ev.free_value is not None and ev.free_value != v)):
                 row.incerti.append(f)
-        for f in TEXT_FIELDS:
-            if f in illeg:
-                row.illeggibili.append(f)
-                confs.append(0.0)
-        if st.get("note") == TESTO:
-            fld = _text_field(readings.get(f"rows.{g}.note"), notes_lexicon())
-            if fld.illeggibile:
-                row.illeggibili.append("note")
-            else:
-                row.note = fld.value
-                if fld.incerto:
-                    row.incerti.append("note")
-            if fld.confidence is not None:
-                row.confidenza["note"] = round(fld.confidence, 3)
-        n_incerti += len(row.incerti)
-        n_illeggibili += len(row.illeggibili)
         rows.append(row)
 
+    # note: formule ricorrenti, testo letto, nota uguale a quella del giorno vicino
+    notes: dict[int, _Field] = {}
+    for g in range(1, 32):
+        if plan.cells.get(g, {}).get("note") == TESTO:
+            notes[g] = _note_field(readings.get(f"rows.{g}.note"))
+    for g, fld in list(notes.items()):
+        if fld.illeggibile or fld.incerto:
+            reading = readings.get(f"rows.{g}.note")
+            text = _clean_name(reading.free_text) if reading else ""
+            for ng in (g - 1, g + 1):
+                other = notes.get(ng)
+                reliable = other is not None and bool(other.value) and not other.illeggibile and (
+                    not other.incerto or other.value in _NOTE_CANONICHE)
+                if reliable and text and _similarity(text, str(other.value)) >= SIMILE_NOTA_VICINA:
+                    notes[g] = _Field(value=other.value, confidence=fld.confidence, incerto=True)
+                    break
+    for g, fld in notes.items():
+        row = rows[g - 1]
+        if fld.illeggibile:
+            row.illeggibili.append("note")
+        else:
+            row.note = fld.value
+            if fld.incerto:
+                row.incerti.append("note")
+        if fld.confidence is not None:
+            row.confidenza["note"] = round(fld.confidence, 3)
+
+    header = _assemble_header(plan, readings, rows, confs)
+
+    n_incerti = sum(len(r.incerti) for r in rows) + len(header.incerti)
+    n_illeggibili = sum(len(r.illeggibili) for r in rows) + len(header.illeggibili)
+    detected = bool(grid.detected) or grid.score >= 0.5
+    text_conf = float(np.mean(confs)) if confs else 1.0
+    confidence = round(max(0.0, min(1.0, 0.85 * text_conf + 0.15 * float(grid.score))), 3)
+    remarks = list(plan.notes)
+    if not grid.detected:
+        remarks.append("Tabella individuata solo con il modello proporzionale: verificare l'allineamento "
+                       "delle righe.")
+    if n_illeggibili:
+        remarks.append(f"Campi illeggibili: {n_illeggibili}.")
+    if dedotti:
+        remarks.append("Valori poco leggibili dedotti dalla coerenza della riga (da verificare): "
+                       + ", ".join(dedotti) + ".")
+    if n_incerti:
+        remarks.append(f"Campi da verificare (lettura incerta): {n_incerti}.")
+    return ExtractionResult(
+        is_foglio_firma=detected,
+        header=header,
+        rows=rows,
+        ocr_notes=" ".join(remarks) or None,
+        confidence=confidence,
+        engine="locale",
+    )
+
+
+def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[DayRow],
+                     confs: list[float]) -> Header:
     header = Header()
     for name in ("operatore", "alunno", "ente", "istituto"):
         if not plan.header_ink.get(name):
@@ -1728,24 +2041,22 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
         _apply_header(header, name, fld)
         if fld.confidence is not None:
             confs.append(fld.confidence)
-    for name, kind, lex_prior in (("lotto", "int", None), ("municipalita", "int", None),
-                                  ("ore_pei", "hours", None)):
+    for name, lex in (("lotto", small_int_lexicon(30)), ("municipalita", small_int_lexicon(10, roman=True)),
+                      ("ore_pei", pei_lexicon())):
         if not plan.header_ink.get(name):
             continue
-        reading = readings.get(f"header.{name}")
-        dist, illegible = _lexicon_field(reading, kind, lex_prior)
-        fld = _Field(illeggibile=True) if illegible else _choose(dist)
+        ev = evidence(readings.get(f"header.{name}"), lex, "hours" if name == "ore_pei" else "")
+        fld = _choose(ev)
         if name == "ore_pei" and fld.value is not None:
             fld.value = float(fld.value)
         _apply_header(header, name, fld)
         if fld.confidence is not None:
             confs.append(fld.confidence)
     if plan.header_ink.get("mese_anno"):
-        reading = readings.get("header.mese_anno")
-        dist, illegible = _lexicon_field(reading, "month")
+        ev = evidence(readings.get("header.mese_anno"), None, "month")
         worked = [g for g, st in plan.cells.items()
                   if any(st.get(f) == TESTO for f in TEXT_FIELDS) or st.get("firma") == FIRMA]
-        fld = _Field(illeggibile=True) if illegible else _choose_month(dist, worked)
+        fld = _choose_month(ev, worked)
         if fld.illeggibile:
             header.illeggibili += ["mese", "anno"]
         elif fld.value is not None:
@@ -1763,44 +2074,16 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
     header.firma_coordinatore = plan.firma_coordinatore
     header.timbro_referente = plan.timbro_referente
     if plan.totale_ink:
-        reading = readings.get("footer.totale")
-        dist, illegible = _lexicon_field(reading, "hours")
-        if illegible:
-            header.illeggibili.append("totale_mensile_dichiarato")
-        else:
-            somma = sum(r.ore_dichiarate or 0.0 for r in rows)
-            fld = _choose_total(dist, somma, _free_value("hours", reading.free_text) if reading else None)
-            header.totale_mensile_dichiarato = fld.value
-            if fld.incerto:
-                header.incerti.append("totale_mensile_dichiarato")
-            if fld.confidence is not None:
-                confs.append(fld.confidence)
+        ev = evidence(readings.get("footer.totale"), total_lexicon(), "hours", _hours_prior)
+        somma = sum(r.ore_dichiarate or 0.0 for r in rows)
+        fld = _choose_total(ev, somma)
+        _apply_header(header, "totale_mensile_dichiarato", fld)
+        if fld.confidence is not None:
+            confs.append(fld.confidence)
     if plan.data_ink:
-        reading = readings.get("footer.data")
-        dist, illegible = _lexicon_field(reading, "date")
-        fld = _Field(illeggibile=True) if illegible else _choose(dist)
-        _apply_header(header, "data_compilazione", fld)
-    n_incerti += len(header.incerti)
-    n_illeggibili += len(header.illeggibili)
-
-    detected = bool(grid.detected) or grid.score >= 0.5
-    text_conf = float(np.mean(confs)) if confs else 1.0
-    confidence = round(max(0.0, min(1.0, 0.85 * text_conf + 0.15 * float(grid.score))), 3)
-    notes = list(plan.notes)
-    if not grid.detected:
-        notes.append("Tabella individuata solo con il modello proporzionale: verificare l'allineamento delle righe.")
-    if n_illeggibili:
-        notes.append(f"Campi illeggibili: {n_illeggibili}.")
-    if n_incerti:
-        notes.append(f"Campi da verificare (lettura incerta): {n_incerti}.")
-    return ExtractionResult(
-        is_foglio_firma=detected,
-        header=header,
-        rows=rows,
-        ocr_notes=" ".join(notes) or None,
-        confidence=confidence,
-        engine="locale",
-    )
+        ev = evidence(readings.get("footer.data"), None, "date")
+        _apply_header(header, "data_compilazione", _choose(ev))
+    return header
 
 
 W_CAL_SABATO = -0.5      # giorno lavorato di sabato (possibile)
@@ -1812,8 +2095,8 @@ def _month_prior(value: tuple[int, int], today: date | None = None) -> float:
     today = today or date.today()
     m, y = value
     ago = (today.year * 12 + today.month) - (y * 12 + m)
-    if ago < -1:
-        return -3.0
+    if ago < 0:
+        return -3.0          # mese futuro: i giorni non possono essere gia' stati lavorati
     return -0.04 * max(0, ago - 1)
 
 
@@ -1836,32 +2119,53 @@ def calendar_penalty(value: tuple[int, int], worked_days: Sequence[int]) -> floa
     return pen
 
 
-def _choose_month(dist: list[tuple[Any, float]], worked_days: Sequence[int]) -> _Field:
-    """Mese/anno: lettura combinata con la coerenza del calendario dei giorni compilati."""
-    if not dist:
-        return _Field(illeggibile=True)
-    scored = [(v, lp + _month_prior(v) + calendar_penalty(v, worked_days)) for v, lp in dist]
-    z = _logsumexp(s for _v, s in scored)
-    scored = sorted(((v, s - z) for v, s in scored), key=lambda t: t[1], reverse=True)
-    v, lp = scored[0]
-    # la probabilita' riportata resta quella della lettura (non gonfiata dal calendario)
-    p_read = math.exp(next(l for vv, l in dist if vv == v))
-    p = min(p_read, math.exp(lp)) if v == dist[0][0] else math.exp(lp)
-    incerto = p < P_INCERTO or v != dist[0][0] and math.exp(lp) < 0.9
+def _choose_month(ev: Evidence, worked_days: Sequence[int], today: date | None = None) -> _Field:
+    """Mese/anno: lettura di mese e anno (separatamente) combinata con la coerenza
+    del calendario dei giorni compilati e con la preferenza per i mesi recenti.
+
+    Esempio: "02/2026" letto male come "02/2025" viene corretto se nel 2025 i
+    giorni compilati cadrebbero di domenica."""
+    if not ev.options:
+        return _Field(illeggibile=True, confidence=0.0)
+    today = today or date.today()
+    month_lp: dict[int, list[float]] = {}
+    year_lp: dict[int, list[float]] = {}
+    for (m, y), lp in ev.options:
+        month_lp.setdefault(m, []).append(lp)
+        year_lp.setdefault(y, []).append(lp)
+    ml = {m: _logsumexp(v) for m, v in month_lp.items()}
+    yl = {y: _logsumexp(v) for y, v in year_lp.items()}
+    tau = min(1.0, max(0.05, ev.coverage / COPERTURA_DEBOLE))
+    floor_m = min(ml.values()) - 3.0
+    floor_y = min(yl.values()) - 3.0
+    years = sorted(set(_years_around(today.year)) | set(yl))
+    scored = []
+    for y in years:
+        for m in range(1, 13):
+            lp = tau * (ml.get(m, floor_m) + yl.get(y, floor_y))
+            scored.append(((m, y), lp + _month_prior((m, y), today) + calendar_penalty((m, y), worked_days)))
+    z = _logsumexp(s_ for _v, s_ in scored)
+    scored.sort(key=lambda t: t[1], reverse=True)
+    v, best = scored[0]
+    p_post = math.exp(best - z)
+    if ev.coverage < P_LEGGIBILE and (calendar_penalty(v, worked_days) < 0 or len(worked_days) < 5):
+        return _Field(illeggibile=True, confidence=0.0)
+    p = min(ev.p(v) * ev.coverage, p_post) if v == ev.top else min(p_post, 0.5) * max(ev.coverage, 0.2)
+    incerto = v != ev.top or p < P_INCERTO
     return _Field(value=v, confidence=p, incerto=incerto)
 
 
-def _choose_total(dist: list[tuple[Any, float]], somma: float, free_v: Any) -> _Field:
+def _choose_total(ev: Evidence, somma: float) -> _Field:
     """Totale mensile: se fra le alternative plausibili c'e' la somma delle ore
     giornaliere la preferisce (segnalandola se non era la lettura migliore)."""
-    if not dist:
-        return _Field(illeggibile=True)
-    for v, lp in dist[:3]:
+    if not ev.options:
+        return _Field(illeggibile=True, confidence=0.0)
+    for v, lp in ev.options[:3]:
         if abs(float(v) - somma) < 0.01 and math.exp(lp) >= 0.1:
-            p = math.exp(lp)
-            incerto = v != dist[0][0] or p < P_INCERTO
+            p = math.exp(lp) * ev.coverage
+            incerto = v != ev.top or p < P_INCERTO
             return _Field(value=float(v), confidence=p, incerto=incerto)
-    fld = _choose(dist, free_v)
+    fld = _choose(ev)
     if fld.value is not None:
         fld.value = float(fld.value)
     return fld
@@ -1907,10 +2211,10 @@ class LocalEngine:
             return False, missing
         label = _model_label(self.model_name)
         if local_model_path(self.model_name, self.cache_dir) is not None:
-            return True, f"Motore locale pronto: modello {label} gia' scaricato (funziona senza Internet)."
+            return True, f"Motore locale pronto: modello {label} già scaricato (funziona senza Internet)."
         mb = KNOWN_MODELS.get(self.model_name, {}).get("mb")
         size = f" (circa {_fmt_size(mb)}, una sola volta)" if mb else " (una sola volta)"
-        return True, (f"Motore locale disponibile: al primo utilizzo verra' scaricato il modello {label}"
+        return True, (f"Motore locale disponibile: al primo utilizzo verrà scaricato il modello {label}"
                       f"{size}; poi funziona senza Internet.")
 
     # ---------------------------------------------------------------- modello
@@ -1967,7 +2271,11 @@ class LocalEngine:
             )
         recognizer = self._ensure_recognizer(progress)
         progress(0.3, "Analisi della tabella e delle firme…")
-        plan = plan_page(img, grid)
+        try:
+            plan = plan_page(img, grid)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Analisi della pagina non riuscita")
+            raise EngineError(f"Analisi della pagina non riuscita: {exc}") from exc
         total = len(plan.requests)
 
         def on_read(done: int, n: int) -> None:
@@ -2005,8 +2313,9 @@ __all__ = [
     "TrOCRRecognizer",
     "assemble",
     "clean_crop",
-    "distribution",
     "download_model",
+    "evidence",
+    "free_value",
     "hours_lexicon",
     "local_model_path",
     "plan_page",
