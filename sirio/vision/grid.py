@@ -44,16 +44,16 @@ N_COLS = len(COLUMNS)
 # --- Modello proporzionale (misurato sul modulo reale, A4 verticale) --------
 # Bordi delle colonne in frazione della larghezza della tabella.
 TEMPLATE_COL_FRACTIONS: tuple[float, ...] = (
-    0.0, 0.0556, 0.1311, 0.2063, 0.2809, 0.3561, 0.4282, 0.4915, 0.5551, 0.7550, 1.0,
+    0.0, 0.0548, 0.1306, 0.2059, 0.2807, 0.3561, 0.4280, 0.4914, 0.5553, 0.7555, 1.0,
 )
 # Posizioni in frazione della pagina.
-TEMPLATE_TABLE_X = (0.0390, 0.8867)        # bordo sinistro / destro della tabella
+TEMPLATE_TABLE_X = (0.0395, 0.8855)        # bordo sinistro / destro della tabella
 TEMPLATE_HEADER_TOP = 0.1584               # bordo superiore dell'intestazione della tabella
 TEMPLATE_FIRST_ROW = 0.1818                # bordo superiore del giorno 1
-TEMPLATE_LAST_ROW = 0.9307                 # bordo inferiore del giorno 31
-TEMPLATE_TOTAL_BOTTOM = 0.9522             # bordo inferiore della riga dei totali
+TEMPLATE_LAST_ROW = 0.9305                 # bordo inferiore del giorno 31
+TEMPLATE_TOTAL_BOTTOM = 0.9518             # bordo inferiore della riga dei totali
 # Altezza dell'intestazione e della riga dei totali in righe-giorno.
-HEADER_ROWS = 0.96
+HEADER_ROWS = 0.97
 TOTAL_ROWS = 0.88
 
 _WORK_WIDTH = 1700
@@ -75,6 +75,19 @@ class TableGrid:
     detected: bool             # True = da linee reali; False = modello proporzionale
     score: float               # qualita' 0..1
     details: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # tipi normalizzati: interi per le coordinate, punteggio a 4 decimali
+        # (la griglia passa per JSON senza perdere l'uguaglianza)
+        self.width = int(self.width)
+        self.height = int(self.height)
+        self.col_x = [int(round(v)) for v in self.col_x]
+        self.row_y = [int(round(v)) for v in self.row_y]
+        self.header_top = int(round(self.header_top))
+        if self.total_row is not None:
+            self.total_row = (int(round(self.total_row[0])), int(round(self.total_row[1])))
+        self.detected = bool(self.detected)
+        self.score = round(float(self.score), 4)
 
     # ---------------------------------------------------------------- utilita'
     @staticmethod
@@ -354,8 +367,8 @@ def _fit_columns(vlines: list[_Line], x_left: float, x_right: float, w: int) -> 
 
     best: tuple[float, list[float], int] | None = None
     # Candidati per i bordi: linee verticali vicine agli estremi delle righe lunghe.
-    lefts = [ln.pos for ln in vlines if abs(ln.pos - x_left) <= 0.06 * w] or [x_left]
-    rights = [ln.pos for ln in vlines if abs(ln.pos - x_right) <= 0.06 * w] or [x_right]
+    lefts = [ln.pos for ln in vlines if abs(ln.pos - x_left) <= 0.06 * w] + [x_left]
+    rights = [ln.pos for ln in vlines if abs(ln.pos - x_right) <= 0.06 * w] + [x_right]
     for a in lefts:
         for b in rights:
             if b - a < 0.4 * w:

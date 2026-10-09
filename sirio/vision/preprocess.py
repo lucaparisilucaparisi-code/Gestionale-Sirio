@@ -54,6 +54,8 @@ def to_gray(img: np.ndarray) -> np.ndarray:
 
 def to_bgr(img: np.ndarray) -> np.ndarray:
     """Converte un'immagine grigia/BGRA in BGR ``uint8`` (copia se necessario)."""
+    if img is None or not isinstance(img, np.ndarray) or img.size == 0 or img.ndim not in (2, 3):
+        raise ValueError("Immagine vuota o non valida.")
     if img.dtype != np.uint8:
         img = np.clip(img, 0, 255).astype(np.uint8)
     if img.ndim == 2:
@@ -371,10 +373,12 @@ def detect_orientation(img: np.ndarray) -> int:
     ang_h, _ = _coarse_skew(bw)
     bw_h = rotate_small_angle(bw, -ang_h) if abs(ang_h) >= MIN_SKEW_DEG else bw
     n_h = len(_long_lines(_fix_binary(bw_h), 0, 0.35))
-    bw_t = np.ascontiguousarray(bw.T)
-    ang_v, _ = _coarse_skew(bw_t)
-    bw_v = rotate_small_angle(bw_t, -ang_v) if abs(ang_v) >= MIN_SKEW_DEG else bw_t
-    n_v = len(_long_lines(_fix_binary(bw_v), 0, 0.35))
+    n_v = 0
+    if n_h < 20:   # con le righe gia' orizzontali l'analisi verticale e' superflua
+        bw_t = np.ascontiguousarray(bw.T)
+        ang_v, _ = _coarse_skew(bw_t)
+        bw_v = rotate_small_angle(bw_t, -ang_v) if abs(ang_v) >= MIN_SKEW_DEG else bw_t
+        n_v = len(_long_lines(_fix_binary(bw_v), 0, 0.35))
 
     if n_v >= 15 and n_v >= 1.6 * max(n_h, 1):
         # Righe verticali: ruota di 90 gradi e decide il verso.
@@ -399,8 +403,9 @@ def _fix_binary(bw: np.ndarray) -> np.ndarray:
 def normalize_page(img: np.ndarray) -> np.ndarray:
     """Porta la pagina in verticale e nel verso giusto, poi la raddrizza.
 
-    Non ritaglia: il formato resta quello della pagina (scambiato se ruotata di
-    90 gradi). In caso di dubbio l'immagine non viene ruotata.
+    Restituisce sempre un'immagine BGR ``uint8``. Non ritaglia: il formato resta
+    quello della pagina (scambiato se ruotata di 90 gradi). In caso di dubbio
+    l'immagine non viene ruotata. Solleva ``ValueError`` solo per immagini non valide.
     """
     img = to_bgr(img)
     try:
