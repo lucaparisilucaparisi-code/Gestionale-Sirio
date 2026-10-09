@@ -1,0 +1,9 @@
+# Fine riga corrette per ogni sistema operativo
+*.sh        text eol=lf
+*.command   text eol=lf
+*.py        text eol=lf
+*.bat       -text
+*.ps1       -text
+*.ico       binary
+*.png       binary
+*.xlsx      binary
