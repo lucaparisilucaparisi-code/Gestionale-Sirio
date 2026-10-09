@@ -527,7 +527,7 @@ class Review {
     let tone = 'tone-ok'; let label = 'OK';
     if (text.startsWith('Errore')) { tone = 'tone-err'; label = 'Errore'; }
     else if (text.startsWith('Da verificare')) { tone = 'tone-warn'; label = 'Da verificare'; }
-    else if (text === 'Assenza operatore') { tone = 'tone-neutral'; label = 'Ass. operatore'; }
+    else if (text === 'Assenza operatore') { tone = 'tone-neutral'; label = 'Ass. operat.'; }
     else if (text === 'Assenza alunno') { tone = 'tone-info'; label = 'Ass. alunno'; }
     else if (text === 'Non svolto') { tone = 'tone-neutral'; label = 'Non svolto'; }
     const anoms = (this.anomByDay?.get(row.giorno) || []).map((a) => `• ${a.messaggio}`).join('\n');
