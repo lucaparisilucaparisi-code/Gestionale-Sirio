@@ -35,6 +35,7 @@ CROSS_SPAN = 0.16           # estensione minima (larghezza e altezza) di una cro
 DASH_MAX_HEIGHT = 0.22      # altezza massima di un trattino (frazione della cella)
 DASH_MIN_ASPECT = 1.8       # rapporto larghezza/altezza minimo di un trattino
 SHARED_STROKE_RATIO = 0.045  # inchiostro minimo nella cella per un tratto condiviso con altre righe
+SHARED_STROKE_EXTENT = 0.4   # ... e altezza minima occupata nella cella (frazione)
 
 
 @dataclass
@@ -244,7 +245,8 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
     inner = lab[cy0:cy1, cx0:cx1]
     inside = np.bincount(inner.ravel(), minlength=n)
     # pixel nella cella vera (senza margine): per l'attribuzione
-    in_cell = np.bincount(lab[fy0:fy1, fx0:fx1].ravel(), minlength=n)
+    cell_lab = lab[fy0:fy1, fx0:fx1]
+    in_cell = np.bincount(cell_lab.ravel(), minlength=n)
 
     min_area = max(6.0, (0.07 * bh) ** 2)
     owned = np.zeros(n, dtype=bool)
@@ -252,12 +254,16 @@ def analyze_cell(img: np.ndarray, box: Box, margin: float = 0.04) -> CellInk:
         if total[k] < min_area or inside[k] == 0:
             continue
         share = in_cell[k] / float(total[k])
-        # parte maggiore nella cella, oppure molto inchiostro dentro la cella:
-        # firme (o scritte) di righe consecutive che si toccano formano un solo
-        # tratto, ma ognuna riempie la propria cella; le code che debordano
-        # dalle righe vicine restano invece ben sotto questa soglia.
-        if share >= 0.5 or (share >= 0.15 and in_cell[k] >= SHARED_STROKE_RATIO * bw * bh):
+        if share >= 0.5:
             owned[k] = True
+        elif share >= 0.15 and in_cell[k] >= SHARED_STROKE_RATIO * bw * bh:
+            # Firme (o scritte) di righe consecutive che si toccano formano un
+            # solo tratto, ma ognuna occupa buona parte dell'altezza della
+            # propria cella; le code che debordano dalle righe vicine restano
+            # invece addossate al bordo superiore o inferiore.
+            ys_k = np.nonzero((cell_lab == k).any(axis=1))[0]
+            if ys_k.size and (ys_k[-1] - ys_k[0] + 1) >= SHARED_STROKE_EXTENT * bh:
+                owned[k] = True
     area = float((cx1 - cx0) * (cy1 - cy0))
     foreign = float(inside[1:][~owned[1:]].sum()) / area if area > 0 else 0.0
     empty.foreign = foreign
