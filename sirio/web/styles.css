@@ -1277,6 +1277,17 @@ button.kpi:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); bo
 .danger-zone { border-color: var(--danger-border); }
 .settings-skel { display: grid; gap: 16px; padding: 24px; }
 
+/* trascinamento di file su qualunque vista */
+body.is-dragging-files .main::after {
+  content: "Rilascia per importare i fogli firma";
+  position: fixed; inset: 12px 12px 12px calc(var(--sidebar-w) + 12px); z-index: 700;
+  display: grid; place-items: center; border-radius: 18px; pointer-events: none;
+  border: 2px dashed var(--azure-500); background: rgba(59, 130, 246, .08); backdrop-filter: blur(2px);
+  color: var(--accent-text); font-size: 18px; font-weight: 680; letter-spacing: -.01em;
+}
+body.is-dragging-files .app.is-rail .main::after { left: calc(var(--sidebar-rail) + 12px); }
+body.is-dragging-files:has(.dropzone) .main::after { display: none; }
+
 /* ==========================================================================
    Connessione persa
    ========================================================================== */

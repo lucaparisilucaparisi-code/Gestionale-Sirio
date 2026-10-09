@@ -995,8 +995,8 @@ def _load_recognizer(path: Path, model_name: str, device: str, quantize: bool = 
     try:
         # niente barre di avanzamento su stderr (l'applicazione puo' non avere una console)
         transformers.utils.logging.disable_progress_bar()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:  # noqa: BLE001 - facoltativo
+        log.debug("Impossibile disattivare le barre di avanzamento di transformers", exc_info=True)
     try:
         processor = transformers.TrOCRProcessor.from_pretrained(str(path), local_files_only=True)
     except Exception as exc:  # noqa: BLE001
@@ -2321,6 +2321,7 @@ class LocalEngine:
 __all__ = [
     "DEFAULT_MODEL",
     "KNOWN_MODELS",
+    "Evidence",
     "Lexicon",
     "LocalEngine",
     "PagePlan",
@@ -2329,14 +2330,25 @@ __all__ = [
     "Recognizer",
     "TrOCRRecognizer",
     "assemble",
+    "calendar_penalty",
     "clean_crop",
+    "date_lexicon",
+    "default_cache_dir",
     "download_model",
     "evidence",
     "free_value",
+    "header_spots",
     "hours_lexicon",
     "local_model_path",
+    "model_image",
+    "month_year_lexicon",
+    "notes_lexicon",
+    "pei_lexicon",
     "plan_page",
     "reconcile_row",
     "row_consistency",
+    "small_int_lexicon",
+    "stamp_boxes",
     "time_lexicon",
+    "total_lexicon",
 ]
