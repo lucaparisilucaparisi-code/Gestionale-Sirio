@@ -310,11 +310,33 @@ async function testKey(view) {
   }
 }
 
+/** Prima di passare a Claude Vision: avviso su invio dei dati (anche di minori), costi e documenti in coda. */
+function confirmClaude() {
+  const data = store.settings || {};
+  const model = (data.models || []).find((m) => m.id === data.settings?.claude_model) || data.models?.[0];
+  const perSheet = model ? (TOKENS_PER_SHEET.input * model.input + TOKENS_PER_SHEET.output * model.output) / 1e6 : 0;
+  const queued = store.queue?.in_coda ?? store.documents.filter((d) => d.status === 'in_coda').length;
+  const parts = [
+    '<p>Le scansioni dei fogli firma, che contengono <b>dati personali di minori</b>, verranno inviate all\'API di Anthropic per la lettura. Verificare che l\'uso sia coerente con le informative e le nomine privacy della cooperativa.</p>',
+    `<p>Il servizio è <b>a consumo</b>: ogni foglio letto ha un costo${perSheet ? ` (circa ${esc(fmtUSD(perSheet))} con il modello selezionato)` : ''}, addebitato sul credito della chiave API.</p>`,
+  ];
+  if (queued) {
+    parts.push(`<p><b>${esc(plural(queued, 'documento in coda verrà inviato', 'documenti in coda verranno inviati'))} ad Anthropic</b>${data.api_key_set ? '' : ' non appena sarà configurata la chiave API'}.</p>`);
+  }
+  return confirmDialog({
+    title: 'Usare Claude Vision?',
+    message: raw(parts.join('')),
+    confirmLabel: 'Usa Claude Vision',
+    tone: 'warning',
+  });
+}
+
 async function onClick(view, e) {
   const engine = e.target.closest('[data-engine]');
   if (engine) {
     const id = engine.dataset.engine;
     if (store.settings?.settings?.engine === id) return;
+    if (id === 'claude' && !(await confirmClaude())) return;
     if (await save({ engine: id }, id === 'claude' ? 'Claude Vision selezionato' : 'Motore locale selezionato')) {
       if (id === 'claude' && !store.settings?.api_key_set) setTimeout(() => $('#set-key', view.root)?.focus(), 50);
     }

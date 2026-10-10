@@ -12,33 +12,48 @@ genera un file Excel preciso e pronto per la rendicontazione.
 
 ## Avvio in un clic
 
-1. Scarica il programma (pulsante **Code → Download ZIP** su GitHub) ed estrai la
-   cartella dove preferisci, ad esempio in *Documenti*.
+1. Scarica il programma (pulsante **Code → Download ZIP** su GitHub) ed estrai
+   tutti i file (*clic destro sul file ZIP → Estrai tutto*) in una cartella **non
+   sincronizzata** con OneDrive o iCloud, ad esempio `C:\Users\<nome>\SirioOCR`
+   su Windows.
 2. Fai doppio clic su:
    - **Windows:** `Avvia Sirio OCR.bat`
    - **macOS:** `Avvia Sirio OCR.command`
    - **Linux:** `avvia-sirio-ocr.sh`
 
-Al **primo avvio** il programma scarica da solo tutto ciò che serve (Python 3.12 e
-le librerie, circa 1 GB compreso il motore offline): servono una connessione a
-Internet e qualche minuto. Non servono privilegi di amministratore e non viene
-modificato nulla fuori dalla cartella del programma. Su Windows viene creato
-anche il collegamento **Sirio OCR** sul desktop.
+Al **primo avvio** il programma scarica da solo tutto ciò che serve: Python 3.12,
+le librerie e il modello di riconoscimento della scrittura a mano del motore
+offline, **circa 1,7 GB da scaricare**; servono **circa 4 GB di spazio libero**, una
+connessione a Internet e qualche minuto. Non servono privilegi di amministratore.
+I componenti vengono installati in `%LOCALAPPDATA%\SirioOCR\runtime` su Windows
+(cartella locale, non sincronizzata con OneDrive) e nella cartella `.runtime` del
+programma su macOS e Linux. Su Windows viene creato anche il collegamento
+**Sirio OCR** sul desktop (aggiornato automaticamente se in seguito si avvia una
+copia del programma estratta in un'altra cartella).
 
 Dagli avvii successivi l'applicazione si apre in pochi secondi, in una finestra
 dedicata (Microsoft Edge o Google Chrome in modalità applicazione).
 
 > **Windows:** se compare l'avviso "Windows ha protetto il PC", scegli
 > *Ulteriori informazioni → Esegui comunque* (succede con i file scaricati da Internet).
-> **macOS:** la prima volta apri il file con *clic destro → Apri*.
+> **macOS:** se macOS blocca il file perché scaricato da Internet, apri
+> *Impostazioni di Sistema → Privacy e sicurezza* e scegli *Apri comunque*
+> (fino a macOS 14 basta anche *clic destro sul file → Apri*).
 
 ## Motore di lettura
 
 Sirio OCR funziona **subito, senza configurazione**: il motore predefinito è il
 **motore locale offline** (OpenCV + TrOCR), gratuito, senza chiave API e senza
-abbonamenti. I fogli firma **non lasciano mai il computer**. Al primo utilizzo
-viene scaricato una sola volta il modello di riconoscimento della scrittura a mano;
-da quel momento il programma funziona anche senza Internet.
+abbonamenti. I fogli firma **non lasciano mai il computer**. Il modello di
+riconoscimento della scrittura a mano (circa 1,3 GB) viene scaricato una sola volta
+durante il primo avvio; da quel momento la lettura funziona anche senza Internet.
+
+Il motore offline richiede Windows a 64 bit, Linux a 64 bit oppure un Mac con
+processore Apple (M1 o successivi) e macOS 14 o successivo. Sugli altri computer
+(ad esempio i Mac con processore Intel) il programma si installa comunque e si può
+usare il motore Claude. Su Windows serve anche il componente *Microsoft Visual C++
+Redistributable*, già presente sulla maggior parte dei PC: se manca, il programma di
+avvio lo segnala e indica dove scaricarlo.
 
 La scrittura a mano è difficile da leggere per qualunque sistema automatico: per
 questo ogni valore viene controllato (coerenza tra orari e ore, totali, firme…) e
@@ -121,22 +136,42 @@ particolari di dati, art. 9 GDPR).
   Anthropic per la lettura. Per impostazione predefinita Anthropic non usa i dati inviati tramite API per
   addestrare i modelli; valutate comunque con il vostro DPO la nomina a
   responsabile del trattamento e le condizioni contrattuali applicabili.
-- Con il **motore locale** tutto resta sul computer.
-- Documenti, immagini ed export sono salvati solo in locale (cartella dati
-  dell'utente e *Documenti/Sirio OCR*). Dalla schermata Documenti si possono
-  eliminare in qualsiasi momento.
+- Con il **motore locale** la lettura avviene interamente sul computer.
+- Documenti e immagini importati sono salvati nella cartella dati dell'utente
+  (Windows: `%LOCALAPPDATA%\SirioOCR`, non sincronizzata con OneDrive). Dalla
+  schermata Documenti si possono eliminare in qualsiasi momento.
+- Gli Excel generati sono salvati in *Documenti\Sirio OCR\Export*. **Attenzione:**
+  se la cartella *Documenti* è sincronizzata con OneDrive (backup delle cartelle di
+  Windows, proposto durante la configurazione di Windows 11; il percorso indicato in
+  *Impostazioni* contiene «OneDrive») o con iCloud, gli Excel, che contengono dati
+  personali dei minori, vengono caricati anche nel cloud. In questo caso escludete
+  *Documenti* dal backup, oppure fate impostare dal referente informatico la
+  variabile d'ambiente `SIRIO_EXPORT_DIR` con una cartella locale non sincronizzata
+  (ad esempio `C:\SirioOCR\Export`).
 
 ## Risoluzione dei problemi
 
 - **Il primo avvio si interrompe:** controlla la connessione e riprova; i dettagli
-  sono in `.runtime/avvio.log` nella cartella del programma.
-- **Reinstallare da zero:** chiudi il programma, elimina la cartella `.runtime`
-  e riavvia.
+  (compresi i messaggi dell'installazione) sono in `avvio.log`, nella cartella dei
+  componenti: `%LOCALAPPDATA%\SirioOCR\runtime\avvio.log` su Windows,
+  `.runtime/avvio.log` nella cartella del programma su macOS e Linux.
+- **Antivirus o proxy aziendale:** il programma di avvio usa i certificati di
+  sistema, quindi funziona anche con gli antivirus che analizzano le connessioni
+  HTTPS e con i proxy aziendali già configurati sul computer.
+- **Reinstallare da zero:** chiudi il programma, elimina la cartella dei componenti
+  (`%LOCALAPPDATA%\SirioOCR\runtime` su Windows, `.runtime` nella cartella del
+  programma su macOS e Linux) e riavvia.
 - **Installazione senza motore offline** (solo per chi usa esclusivamente Claude,
-  risparmia ~1 GB): imposta la variabile d'ambiente `SIRIO_SENZA_OFFLINE=1` prima
-  del primo avvio.
+  risparmia circa 1,5 GB di download e più spazio su disco): imposta la variabile
+  d'ambiente `SIRIO_SENZA_OFFLINE=1` prima del primo avvio.
 - **Registro dell'applicazione:** `sirio.log` nella cartella dati
   (Windows: `%LOCALAPPDATA%\SirioOCR\log`).
+- **Disinstallare:** chiudi il programma ed elimina la cartella del programma, la
+  cartella dei dati (documenti importati, modello del motore offline e, su Windows,
+  componenti): `%LOCALAPPDATA%\SirioOCR` su Windows,
+  `~/Library/Application Support/SirioOCR` su macOS, `~/.local/share/SirioOCR` su
+  Linux. Su Windows elimina anche il collegamento **Sirio OCR** sul desktop. Gli
+  Excel generati restano in *Documenti/Sirio OCR/Export*.
 
 ## Per sviluppatori
 

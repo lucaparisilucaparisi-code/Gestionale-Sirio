@@ -44,6 +44,7 @@ thread contemporaneamente. La chiave API non viene mai registrata nei log.
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import logging
 import math
@@ -151,6 +152,11 @@ _MSG_BAD_JSON = (
     "Claude ha restituito una risposta non interpretabile per questa pagina. "
     "Riprova a elaborare il documento."
 )
+_MSG_TIMEOUT = "Il servizio Claude non ha risposto in tempo. Controlla la connessione a Internet e riprova."
+_MSG_CONNECTION = (
+    "Connessione a Internet assente o servizio Claude non raggiungibile: controlla la connessione "
+    "(ed eventuali proxy o firewall) e riprova."
+)
 
 
 # ==========================================================================
@@ -223,15 +229,42 @@ def map_api_error(exc: BaseException, model: str | None = None) -> EngineError:
             )
         return EngineError(f"Errore del servizio Claude (codice {status}): {detail or 'nessun dettaglio'}.")
     if isinstance(exc, anthropic.APITimeoutError):
-        return EngineError(
-            "Il servizio Claude non ha risposto in tempo. Controlla la connessione a Internet e riprova."
-        )
+        return EngineError(_MSG_TIMEOUT)
     if isinstance(exc, anthropic.APIConnectionError):
-        return EngineError(
-            "Connessione a Internet assente o servizio Claude non raggiungibile: controlla la connessione "
-            "(ed eventuali proxy o firewall) e riprova."
-        )
+        return EngineError(_MSG_CONNECTION)
     return EngineError(f"Errore del servizio Claude: {detail or type(exc).__name__}.")
+
+
+def _transport_error_classes() -> tuple[type[BaseException], ...]:
+    """Errori di rete delle librerie HTTP usate dall'SDK (``httpx2`` e ``httpx``)."""
+    out: list[type[BaseException]] = []
+    for name in ("httpx2", "httpx"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        cls = getattr(module, "TransportError", None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            out.append(cls)
+    return tuple(out)
+
+
+# L'SDK converte gli errori di rete solo prima che arrivi la risposta: se la
+# connessione cade (o resta muta) mentre la risposta arriva in streaming, l'errore
+# della libreria HTTP esce cosi' com'e'.
+_TRANSPORT_ERRORS = _transport_error_classes()
+
+
+class StreamInterrupted(EngineError):
+    """Connessione interrotta o rimasta muta durante la risposta in streaming."""
+
+
+def map_transport_error(exc: BaseException) -> EngineError:
+    """Errore di rete durante lo streaming -> messaggio in italiano."""
+    log.warning("Connessione con il servizio Claude interrotta durante la risposta: %s: %s",
+                type(exc).__name__, exc)
+    timeout = any("Timeout" in c.__name__ for c in type(exc).__mro__)
+    return StreamInterrupted(_MSG_TIMEOUT if timeout else _MSG_CONNECTION)
 
 
 # ==========================================================================
@@ -1231,13 +1264,26 @@ class ClaudeEngine:
                 return stream.get_final_message()
         except anthropic.AnthropicError as exc:
             raise map_api_error(exc, self.model) from exc
+        except _TRANSPORT_ERRORS as exc:
+            raise map_transport_error(exc) from exc
+
+    def _stream_retrying(self, content: list[dict], schema: dict, max_tokens: int, progress: ProgressFn,
+                         span: tuple[float, float], message: str, expected_chars: int) -> Any:
+        """``_stream`` con un nuovo tentativo se la connessione cade a risposta
+        iniziata (l'SDK ripete da solo solo gli errori prima della risposta)."""
+        try:
+            return self._stream(content, schema, max_tokens, progress, span, message, expected_chars)
+        except StreamInterrupted:
+            log.warning("Nuovo tentativo dopo l'interruzione della connessione con il servizio Claude")
+            _safe_progress(progress, span[0], "Connessione interrotta: nuovo tentativo…")
+            return self._stream(content, schema, max_tokens, progress, span, message, expected_chars)
 
     def _call(self, content: list[dict], schema: dict, meter: _UsageMeter, progress: ProgressFn,
               span: tuple[float, float], message: str, expected_chars: int) -> dict:
         """Una richiesta completa: refusal -> errore; max_tokens -> un nuovo tentativo
         con limite doppio; poi il JSON della risposta."""
         for attempt, max_tokens in enumerate((MAX_TOKENS, MAX_TOKENS_RETRY)):
-            msg = self._stream(content, schema, max_tokens, progress, span, message, expected_chars)
+            msg = self._stream_retrying(content, schema, max_tokens, progress, span, message, expected_chars)
             meter.add(msg)
             stop = getattr(msg, "stop_reason", None)
             if stop == "refusal":
@@ -1370,10 +1416,12 @@ __all__ = [
     "MAX_LONG_EDGE",
     "MAX_PIXELS",
     "Reread",
+    "StreamInterrupted",
     "VerificationPlan",
     "first_pass_crops",
     "fit_to_limits",
     "map_api_error",
+    "map_transport_error",
     "merge_row",
     "merge_verification",
     "message_json",

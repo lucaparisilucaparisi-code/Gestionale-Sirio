@@ -21,9 +21,11 @@ from sirio.vision.preprocess import (
     detect_orientation,
     estimate_skew,
     normalize_page,
+    perspective_matrix,
     rotate_right_angle,
+    table_quad,
 )
-from tests.synthetic import make_synthetic_sheet
+from tests.synthetic import make_synthetic_sheet, photograph
 
 TIME_FIELDS = ("prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita")
 
@@ -164,6 +166,61 @@ def test_grid_detected_on_skewed_sheets(skew, dpi):
     assert np.all(np.abs(diffs - expected) <= max(2.0, 0.04 * expected))
     widths = np.diff(grid.col_x)
     assert np.allclose(widths, np.diff(truth["griglia"]["col_x"]), atol=3)
+
+
+# --------------------------------------------------------------------------
+# Foto scattate di sbieco (prospettiva)
+# --------------------------------------------------------------------------
+
+def test_table_quad_on_scans_and_no_warp_when_rectangular():
+    img, truth = _sheet(0, 0.0)
+    g = truth["griglia"]
+    quad = table_quad(img)
+    assert quad is not None
+    expected = [(g["col_x"][0], g["header_top"]), (g["col_x"][-1], g["header_top"]),
+                (g["col_x"][-1], g["total_row"][1]), (g["col_x"][0], g["total_row"][1])]
+    assert np.abs(quad - np.array(expected, dtype=float)).max() <= 3
+    assert perspective_matrix(img) is None                  # scansione: nessuna deformazione
+    assert table_quad(np.full((1400, 1000, 3), 255, np.uint8)) is None
+
+
+@functools.cache
+def _photo(**kw) -> tuple[np.ndarray, np.ndarray, TableGrid]:
+    img, _ = _sheet(3, 0.0)
+    photo = photograph(img, **kw)
+    page = normalize_page(photo)
+    return photo, page, detect_grid(page)
+
+
+@pytest.mark.parametrize("kw", [
+    {"keystone": 0.03},
+    {"keystone": 0.06},
+    {"keystone": 0.08, "shadow": True},
+    {"jitter": 0.03, "seed": 2},
+    {"jitter": 0.04, "seed": 4, "background": (30, 30, 30)},
+], ids=["keystone3", "keystone6", "keystone8-ombra", "casuale3", "casuale4-scuro"])
+def test_photo_perspective_is_corrected(kw):
+    """Foto del foglio scattata di sbieco: la tabella torna rettangolare e ogni
+    cella e' letta nel giorno giusto (prima: griglia sfalsata di alcune righe
+    accettata come rilevata, oppure foglio scartato)."""
+    _, truth = _sheet(3, 0.0)
+    photo, page, grid = _photo(**kw)
+    assert page.shape == photo.shape
+    assert grid.detected and grid.score > 0.9
+    assert grid.details["intestazione_trovata"] and grid.details["totale_trovato"]
+    assert perspective_matrix(page) is None                 # gia' rettangolare
+    assert classification_errors(page, grid, truth) == []
+
+
+@pytest.mark.parametrize("kw", [{"keystone": 0.06}, {"keystone": 0.06, "shadow": True}],
+                         ids=["senza-ancoraggio", "righe-inclinate"])
+def test_grid_rejects_rows_misaligned_by_perspective(kw):
+    """Senza correzione della prospettiva le righe-giorno non seguono quelle del
+    modulo: la griglia non deve essere data per rilevata (dati nei giorni sbagliati)."""
+    img, _ = _sheet(3, 0.0)
+    straight, _angle = deskew(photograph(img, **kw))        # solo rotazione, niente prospettiva
+    grid = detect_grid(straight)
+    assert not grid.detected and grid.score <= 0.3
 
 
 def test_grid_never_raises_and_falls_back_to_template():

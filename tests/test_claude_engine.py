@@ -855,6 +855,72 @@ def test_real_sdk_wire_format(model: str) -> None:
     assert req.headers.get("x-api-key") == API_KEY
 
 
+def _dropping_body(data: bytes, error: Exception):
+    """Corpo in streaming che si interrompe a meta' (connessione caduta o muta)."""
+    yield data[: len(data) // 3]
+    raise error
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (httpx2.RemoteProtocolError("peer closed connection without sending complete message body"),
+         "Connessione a Internet assente"),
+        (httpx2.ReadTimeout("timed out"), "non ha risposto in tempo"),
+    ],
+    ids=["connessione-caduta", "connessione-muta"],
+)
+def test_connection_lost_during_streaming(error: Exception, expected: str) -> None:
+    """Errore di rete a risposta iniziata: l'SDK non lo converte. Un nuovo
+    tentativo, poi il messaggio in italiano (prima: eccezione grezza di httpx2 e
+    "Errore imprevisto" generico)."""
+    calls: list[int] = []
+    payload = _sse(json.dumps(first_json()), "claude-haiku-5-5")
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(1)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"},
+                               content=_dropping_body(payload, error))
+
+    client = anthropic.Anthropic(api_key=API_KEY, max_retries=0,
+                                 http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(handler)))
+    eng = ce.ClaudeEngine(api_key=API_KEY, model="claude-haiku-5-5", verify=False, client=client)
+    with pytest.raises(EngineError) as info:
+        eng.extract(make_page(), lambda *_: None)
+    assert expected in str(info.value)
+    assert isinstance(info.value.__cause__, httpx2.TransportError)
+    assert len(calls) == 2                                  # un solo nuovo tentativo
+
+
+def test_connection_lost_during_streaming_then_retry_succeeds() -> None:
+    payload = _sse(json.dumps(first_json()), "claude-haiku-5-5")
+    calls: list[int] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(1)
+        body = (_dropping_body(payload, httpx2.ReadError("connection reset")) if len(calls) == 1
+                else iter([payload]))
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    client = anthropic.Anthropic(api_key=API_KEY, max_retries=0,
+                                 http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(handler)))
+    eng = ce.ClaudeEngine(api_key=API_KEY, model="claude-haiku-5-5", verify=False, client=client)
+    steps: list[str] = []
+    res = eng.extract(make_page(), lambda _f, m: steps.append(m))
+    assert len(calls) == 2 and res.header.operatore == "ROSSI MARIO" and len(res.rows) == 31
+    assert any("nuovo tentativo" in m for m in steps)
+
+
+def test_verification_survives_connection_drop() -> None:
+    """Nella verifica incrociata l'interruzione e' spiegata, non "errore interno"."""
+    rows = {4: worked(4, ee="9:00", inc=("eff_entrata",))}
+    drop = httpx2.RemoteProtocolError("peer closed connection")
+    eng, _client = engine([message(first_json(rows)), drop, drop])
+    res = eng.extract(make_page(), lambda *_: None)
+    assert "Verifica incrociata non eseguita: Connessione a Internet assente" in (res.ocr_notes or "")
+    assert "errore interno" not in (res.ocr_notes or "")
+
+
 # ==========================================================================
 # Scansione reale (facoltativa: SIRIO_SAMPLE_PDF)
 # ==========================================================================

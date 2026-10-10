@@ -457,7 +457,7 @@ def _month(value: Any) -> int | None:
         value = word
     try:
         month = int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: "inf", "1e309"
         raise ApiError(422, f"Mese: valore non valido («{_short(value)}»), indicare un numero da 1 a 12.") from None
     if not 1 <= month <= 12:
         raise ApiError(422, f"Mese: valore non valido ({month}), indicare un numero da 1 a 12.")
@@ -471,7 +471,7 @@ def _year(value: Any) -> int | None:
         raise ApiError(422, "Anno: valore non valido.")
     try:
         year = int(float(str(value).strip()))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ApiError(422, f"Anno: valore non valido («{_short(value)}»).") from None
     if 0 <= year <= 99:
         year += 2000
@@ -683,11 +683,26 @@ def resolve_export_file(filename: str) -> Path:
         or ":" in filename
     ):
         raise ApiError(400, "Nome del file non valido.")
-    base = config.export_dir().resolve()
+    base = config.export_dir(create=False).resolve()
     path = (base / filename).resolve()
     if path.parent != base or not path.is_file():
         raise ApiError(404, "File non trovato nella cartella delle esportazioni.")
     return path
+
+
+def export_folder() -> Path:
+    """Cartella delle esportazioni, creata se manca; ``ApiError`` con la causa se non può
+    essere creata (permessi, accesso controllato alle cartelle, cartella di rete non raggiungibile)."""
+    try:
+        return config.export_dir()
+    except OSError as exc:
+        path = config.export_dir(create=False)
+        log.warning("Cartella delle esportazioni %s non disponibile: %s", path, exc)
+        raise ApiError(
+            500,
+            f"Impossibile creare la cartella delle esportazioni «{path}»: {exc.strerror or exc}. "
+            "Verificare i permessi o l'accesso controllato alle cartelle di Windows.",
+        ) from None
 
 
 def _export_entry(path: Path) -> dict:
@@ -975,7 +990,11 @@ def create_app(
     @app.get("/api/state")
     def state(since: str | None = None) -> JSONResponse:
         revision = store.revision
-        if since is not None and since.strip().lstrip("-").isdigit() and int(since) == revision:
+        try:
+            known = int(since) if since is not None else None
+        except ValueError:   # valore non numerico (anche cifre come «²», per cui isdigit() è vero)
+            known = None
+        if known == revision:
             return _json({"revision": revision, "unchanged": True})
         docs = store.list(copy=False)
         return _json({
@@ -1215,7 +1234,7 @@ def create_app(
             "engines": _engines(),
             "models": config.CLAUDE_MODELS,
             "data_dir": str(config.data_dir()),
-            "export_dir": str(config.export_dir()),
+            "export_dir": str(config.export_dir(create=False)),   # creata solo quando serve
             "version": __version__,
         }
 
@@ -1319,7 +1338,7 @@ def create_app(
             options = excel_export.ExportOptions.model_validate(options_data)
         except ValidationError:
             raise ApiError(422, "Opzioni di esportazione non valide.") from None
-        folder = config.export_dir()
+        folder = export_folder()
         filename = safe_export_name(body.filename) or safe_export_name(excel_export.default_filename(docs))
         path = _unique_path(folder, filename or "Rendicontazione.xlsx")
         try:
@@ -1340,12 +1359,17 @@ def create_app(
 
     @app.get("/api/exports")
     def list_exports() -> JSONResponse:
-        folder = config.export_dir()
+        folder = config.export_dir(create=False)   # cartella mancante o non leggibile: elenco vuoto
         entries = []
-        for path in folder.glob("*.xlsx"):
-            if path.name.startswith((".", "~$")) or not path.is_file():
-                continue
+        try:
+            paths = list(folder.glob("*.xlsx"))
+        except OSError as exc:
+            log.warning("Elenco delle esportazioni in %s non disponibile: %s", folder, exc)
+            paths = []
+        for path in paths:
             try:
+                if path.name.startswith((".", "~$")) or not path.is_file():
+                    continue
                 entries.append(_export_entry(path))
             except OSError:
                 continue
@@ -1361,7 +1385,7 @@ def create_app(
     @app.post("/api/open")
     def open_target(body: OpenRequest) -> JSONResponse:
         if body.target == "export_dir":
-            path = config.export_dir()
+            path = export_folder()
         else:
             if not body.filename:
                 raise ApiError(422, "Indicare il file da aprire.")

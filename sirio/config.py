@@ -68,11 +68,12 @@ def logs_dir() -> Path:
     return _ensure(data_dir() / "log")
 
 
-def export_dir() -> Path:
+def export_dir(create: bool = True) -> Path:
+    """Cartella delle esportazioni; con ``create=False`` solo il percorso (nessuna creazione,
+    nessun ``OSError`` se la cartella non può essere creata)."""
     override = os.environ.get("SIRIO_EXPORT_DIR")
-    if override:
-        return _ensure(Path(override).expanduser())
-    return _ensure(Path(platformdirs.user_documents_dir()) / APP_NAME / "Export")
+    path = Path(override).expanduser() if override else Path(platformdirs.user_documents_dir()) / APP_NAME / "Export"
+    return _ensure(path) if create else path
 
 
 class Settings(BaseModel):

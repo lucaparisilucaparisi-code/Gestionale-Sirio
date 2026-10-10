@@ -14,8 +14,12 @@ di avvio subito dopo l'installazione delle dipendenze. Codice d'uscita 0 se il m
 3. finestra: Microsoft Edge / Google Chrome / Chromium in modalita' applicazione
    (profilo dedicato in ``data_dir()/finestra``), altrimenti il browser predefinito;
 4. chiusura automatica: processo della finestra terminato e nessun heartbeat da
-   10 s, oppure ``/api/bye`` senza heartbeat successivi per 8 s, oppure nessun
-   heartbeat per 15 minuti (``--senza-finestra`` disattiva la chiusura automatica);
+   75 s, oppure ``/api/bye`` senza heartbeat successivi per 75 s, oppure nessun
+   heartbeat per 15 minuti (``--senza-finestra`` disattiva la chiusura automatica).
+   Le attese superano l'intervallo tra due heartbeat anche nelle finestre ridotte a
+   icona (il browser ne rallenta i timer fino a circa uno al minuto): un'altra finestra
+   ancora aperta, o il passaggio della finestra a un processo del browser gia' attivo,
+   non deve mai provocare l'arresto;
 5. registro in ``logs_dir()/sirio.log`` (con rotazione), eccezioni non gestite incluse.
 """
 
@@ -48,8 +52,10 @@ log = logging.getLogger("sirio.app")
 
 HOST = "127.0.0.1"
 WINDOW_SIZE = (1480, 940)
-WINDOW_GRACE = 10.0          # finestra chiusa: attesa di eventuali heartbeat (s)
-BYE_GRACE = 8.0              # dopo /api/bye (s)
+HEARTBEAT_MAX_GAP = 60.0     # intervallo massimo tra due heartbeat di una finestra aperta (s):
+                             # 20 s, fino a ~60 s se ridotta a icona (timer rallentati dal browser)
+WINDOW_GRACE = 75.0          # finestra chiusa: attesa di eventuali heartbeat (s)
+BYE_GRACE = 75.0             # dopo /api/bye (s): un'altra finestra aperta deve poter dare segno di vita
 IDLE_TIMEOUT = 15 * 60.0     # nessun heartbeat (s)
 SUSPEND_GAP = 30.0           # pausa del ciclo oltre la quale si presume una sospensione del sistema
 INSTANCE_WAIT = 30.0         # attesa dell'istanza in avvio (s)
@@ -762,8 +768,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError(f"La porta {args.porta} non è disponibile ({exc.strerror or exc}).") from exc
             raise RuntimeError(f"Impossibile aprire il server locale ({exc.strerror or exc}).") from exc
         server = ServerThread(app, sock)
-        server.start()
         url = instance_url(server.port)
+        # istanza.json va scritto prima che il server risponda: chi vede /api/health
+        # attivo deve poter già leggere porta e token.
         write_instance({
             "port": server.port,
             "pid": os.getpid(),
@@ -772,6 +779,7 @@ def main(argv: list[str] | None = None) -> int:
             "url": url,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         })
+        server.start()
         processor.start()
         log.info("Server in ascolto su %s", url)
         _say(f"Sirio OCR {__version__} in esecuzione su {url}")

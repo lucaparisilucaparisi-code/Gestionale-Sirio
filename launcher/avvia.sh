@@ -6,9 +6,13 @@
 # programma. Nessun privilegio di amministratore richiesto.
 #
 # Variabili d'ambiente facoltative:
-#   SIRIO_SENZA_OFFLINE=1   non installa il motore OCR offline (PyTorch e modello TrOCR, ~2 GB)
+#   SIRIO_SENZA_OFFLINE=1   non installa il motore OCR offline (PyTorch e modello TrOCR, ~1,5 GB)
 #   SIRIO_REINSTALLA=1      forza la reinstallazione delle dipendenze
 # Opzioni: --solo-installa  installa/aggiorna senza aprire l'applicazione
+#
+# Il motore offline richiede Linux (x86_64/aarch64) o un Mac con processore Apple e
+# macOS 14 o successivo: altrove (es. Mac con processore Intel) si installano solo i
+# componenti di base, sufficienti per il motore Claude.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,6 +27,9 @@ export UV_PYTHON_INSTALL_DIR="$RUNTIME/python"
 export UV_PROJECT_ENVIRONMENT="$VENV"
 export UV_CACHE_DIR="$RUNTIME/cache"
 export UV_PYTHON_PREFERENCE="only-managed"
+# Certificati del sistema operativo invece di quelli inclusi in uv: necessari con gli
+# antivirus che analizzano le connessioni HTTPS e con i proxy aziendali.
+export UV_SYSTEM_CERTS=1
 export PYTHONUTF8=1
 
 SOLO_INSTALLA=0
@@ -31,16 +38,31 @@ for arg in "$@"; do
 done
 
 if [ -t 1 ]; then
-    C_TIT=$'\033[1;36m'; C_DIM=$'\033[2m'; C_ERR=$'\033[1;31m'; C_OFF=$'\033[0m'
+    C_TIT=$'\033[1;36m'; C_DIM=$'\033[2m'; C_AVV=$'\033[1;33m'; C_ERR=$'\033[1;31m'; C_OFF=$'\033[0m'
 else
-    C_TIT=""; C_DIM=""; C_ERR=""; C_OFF=""
+    C_TIT=""; C_DIM=""; C_AVV=""; C_ERR=""; C_OFF=""
 fi
-passo() { printf '   » %s\n' "$1"; }
-nota()  { printf '     %s%s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+
+# Registro dell'avvio (riscritto a ogni avvio): vi si copia l'output di uv e pip.
+if ! { printf '=== Sirio OCR - avvio del %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" >"$LOG"; } 2>/dev/null; then
+    LOG=/dev/null
+fi
+
+passo()  { printf '   » %s\n' "$1"; }
+nota()   { printf '     %s%s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+avviso() { printf '     %s%s%s\n' "$C_AVV" "$1" "$C_OFF"; }
 errore() {
+    printf 'ERRORE: %s\n' "$1" >>"$LOG" 2>/dev/null || true
     printf '\n   %sX  %s%s\n' "$C_ERR" "$1" "$C_OFF" >&2
-    printf '      Dettagli nel file: %s\n' "$LOG" >&2
+    [ "$LOG" = /dev/null ] || printf '      Dettagli nel file: %s\n' "$LOG" >&2
     exit 1
+}
+
+esegui() {  # esegue un comando mostrandone l'output e copiandolo nel registro
+    local rc=0
+    printf '\n$ %s\n' "$*" >>"$LOG" 2>/dev/null || true
+    "$@" 2>&1 | tee -a "$LOG" || rc=$?
+    return "$rc"
 }
 
 printf '\n   %s*  S I R I O   O C R%s\n' "$C_TIT" "$C_OFF"
@@ -56,7 +78,7 @@ scarica() {  # scarica <url> <destinazione>
     fi
 }
 
-impronta() {
+impronta() {  # impronta dei file che definiscono le dipendenze: se cambiano si reinstalla
     local testo=""
     for f in pyproject.toml uv.lock; do
         if [ -f "$ROOT/$f" ]; then
@@ -67,7 +89,6 @@ impronta() {
             fi
         fi
     done
-    [ "${SIRIO_SENZA_OFFLINE:-0}" = "1" ] && testo+="-senza-offline"
     printf '%s' "$testo"
 }
 
@@ -106,6 +127,22 @@ installa_uv() {
     [ -x "$UV_DIR/uv" ]
 }
 
+certificati_di_sistema() {  # certificati_di_sistema <uv>
+    # Le versioni di uv che non conoscono UV_SYSTEM_CERTS usano UV_NATIVE_TLS (nelle
+    # versioni recenti e' deprecata e produce un avviso: si imposta solo se serve).
+    local aiuto
+    aiuto="$("$1" sync --help 2>/dev/null || true)"
+    case "$aiuto" in
+        *--system-certs*) ;;
+        *) export UV_NATIVE_TLS=1 ;;
+    esac
+}
+
+# Esito del motore offline dopo l'installazione: installato, non-richiesto
+# (SIRIO_SENZA_OFFLINE=1), non-supportato (nessun pacchetto per questo computer) o
+# non-riuscito (errore temporaneo: si riprova al prossimo avvio).
+OFFLINE_ESITO="installato"
+
 installa_con_python() {
     # Ripiego senza uv: Python di sistema (>= 3.10, < 3.14) + venv + pip.
     local py=""
@@ -119,11 +156,22 @@ installa_con_python() {
     passo "Creo l'ambiente Python..."
     "$py" -m venv "$VENV" || errore "Creazione dell'ambiente Python non riuscita."
     local req="requisiti.txt"
-    [ "${SIRIO_SENZA_OFFLINE:-0}" = "1" ] && req="requisiti-base.txt"
+    if [ "${SIRIO_SENZA_OFFLINE:-0}" = "1" ]; then req="requisiti-base.txt"; OFFLINE_ESITO="non-richiesto"; fi
     passo "Installo le dipendenze (alcuni minuti al primo avvio)..."
     "$VENV/bin/python" -m pip install --disable-pip-version-check --upgrade pip >>"$LOG" 2>&1 || true
-    "$VENV/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/launcher/$req" \
+    esegui "$VENV/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/launcher/$req" && return 0
+    [ "$req" = "requisiti.txt" ] || errore "Installazione delle dipendenze non riuscita (vedi messaggi sopra)."
+    nota "Installo i soli componenti di base, senza il motore offline..."
+    esegui "$VENV/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/launcher/requisiti-base.txt" \
         || errore "Installazione delle dipendenze non riuscita (vedi messaggi sopra)."
+    OFFLINE_ESITO="non-riuscito"
+}
+
+sincronizza() {  # sincronizza <uv> [opzioni]: uv sync, con un nuovo tentativo senza --frozen
+    local uv="$1"; shift
+    esegui "$uv" sync --project "$ROOT" --python 3.12 --frozen "$@" && return 0
+    nota "Nuovo tentativo con risoluzione aggiornata delle dipendenze..."
+    esegui "$uv" sync --project "$ROOT" --python 3.12 "$@"
 }
 
 installa_dipendenze() {
@@ -131,17 +179,29 @@ installa_dipendenze() {
     if ! uv="$(trova_uv)"; then
         if installa_uv; then uv="$UV_DIR/uv"; else uv=""; nota "Download di uv non riuscito."; fi
     fi
-    if [ -n "$uv" ]; then
-        passo "Installo Python 3.12 e le dipendenze (alcuni minuti solo al primo avvio)..."
-        local extra=(--extra offline)
-        [ "${SIRIO_SENZA_OFFLINE:-0}" = "1" ] && extra=()
-        if ! "$uv" sync --project "$ROOT" --python 3.12 --frozen ${extra[@]+"${extra[@]}"}; then
-            nota "Nuovo tentativo con risoluzione aggiornata delle dipendenze..."
-            "$uv" sync --project "$ROOT" --python 3.12 ${extra[@]+"${extra[@]}"} \
-                || errore "Installazione delle dipendenze non riuscita (vedi messaggi sopra)."
-        fi
-    else
+    if [ -z "$uv" ]; then
         installa_con_python
+        return 0
+    fi
+    certificati_di_sistema "$uv"
+    passo "Installo Python 3.12 e le dipendenze (alcuni minuti solo al primo avvio)..."
+    if [ "${SIRIO_SENZA_OFFLINE:-0}" = "1" ]; then
+        OFFLINE_ESITO="non-richiesto"
+        sincronizza "$uv" || errore "Installazione delle dipendenze non riuscita (vedi messaggi sopra)."
+        return 0
+    fi
+    sincronizza "$uv" --extra offline && return 0
+    # Motore offline non installabile: si installano i componenti di base (motore Claude),
+    # senza rimuovere quelli del motore offline eventualmente gia' presenti.
+    nota "Installo i soli componenti di base, senza il motore offline..."
+    esegui "$uv" sync --project "$ROOT" --python 3.12 --frozen --inexact \
+        || errore "Installazione delle dipendenze non riuscita (vedi messaggi sopra)."
+    # Nessun pacchetto del motore offline per questo computer (es. PyTorch per i Mac con
+    # processore Intel) oppure errore temporaneo (rete, disco)? Verifica senza scaricare nulla.
+    if "$uv" sync --project "$ROOT" --python 3.12 --frozen --extra offline --dry-run --offline >>"$LOG" 2>&1; then
+        OFFLINE_ESITO="non-riuscito"
+    else
+        OFFLINE_ESITO="non-supportato"
     fi
 }
 
@@ -158,18 +218,42 @@ scarica_modello() {
 }
 
 PY="$VENV/bin/python"
-IMPRONTA="$(impronta)"
-if [ "${SIRIO_REINSTALLA:-0}" = "1" ] || [ ! -x "$PY" ] || [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$IMPRONTA" ]; then
+IMPRONTA_FILE="$(impronta)"
+IMPRONTA="$IMPRONTA_FILE"
+[ "${SIRIO_SENZA_OFFLINE:-0}" = "1" ] && IMPRONTA+="-senza-offline"
+# Installazione riuscita senza motore offline perche' non disponibile su questo computer:
+# non si ritenta a ogni avvio, solo quando cambiano le dipendenze.
+IMPRONTA_BASE="$IMPRONTA_FILE-offline-non-supportato"
+REGISTRATA="$(cat "$STAMP" 2>/dev/null || true)"
+if [ "${SIRIO_REINSTALLA:-0}" = "1" ] || [ ! -x "$PY" ] || \
+   { [ "$REGISTRATA" != "$IMPRONTA" ] && [ "$REGISTRATA" != "$IMPRONTA_BASE" ]; }; then
     if [ ! -x "$PY" ]; then
         passo "Primo avvio: preparo il programma. Serve la connessione a Internet."
-        nota "Lo scaricamento avviene una sola volta (circa 2 GB con il motore offline, modello incluso)."
+        nota "Lo scaricamento avviene una sola volta (circa 1,7 GB con il motore offline, modello incluso);"
+        nota "servono circa 4 GB di spazio libero."
         echo
     else
         passo "Aggiornamento dei componenti..."
     fi
     installa_dipendenze
-    printf '%s' "$IMPRONTA" > "$STAMP"
-    scarica_modello
+    case "$OFFLINE_ESITO" in
+        non-supportato)
+            printf '%s' "$IMPRONTA_BASE" > "$STAMP"
+            echo
+            avviso "Il motore offline non è disponibile su questo computer (richiede un Mac con processore Apple"
+            avviso "e macOS 14 o successivo, oppure Linux a 64 bit): si può usare il motore Claude (Impostazioni)."
+            ;;
+        non-riuscito)
+            rm -f "$STAMP"
+            echo
+            avviso "Il motore offline non è stato installato (vedi messaggi sopra): l'installazione verrà"
+            avviso "ritentata al prossimo avvio. Nel frattempo si può usare il motore Claude (Impostazioni)."
+            ;;
+        *)
+            printf '%s' "$IMPRONTA" > "$STAMP"
+            scarica_modello
+            ;;
+    esac
     echo
     passo "Installazione completata."
 fi

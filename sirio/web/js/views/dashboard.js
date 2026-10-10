@@ -5,7 +5,7 @@ import { ART, icon } from '../icons.js';
 import { pokePolling, saveSettings, store } from '../state.js';
 import { statusBadge, statusKey, toast, toastError } from '../ui.js';
 import { filesFromDataTransfer, onUpload, pickFiles, pickFolder, upload, uploadItems, uploadSummaryText } from '../upload.js';
-import { $, esc, fmtInt, fmtOre, fmtUSD, html, plural, raw, setHTML } from '../util.js';
+import { $, esc, fmtInt, fmtOre, fmtUSD, html, keepFocus, patchHTML, patchList, plural, raw, setHTML } from '../util.js';
 
 export function mount(root, { navigate }) {
   root.innerHTML = `
@@ -102,11 +102,15 @@ export function mount(root, { navigate }) {
   };
 }
 
+// aggiornata a ogni lettura del server (ogni secondo durante la lettura): si ricreano solo gli
+// elementi cambiati e il fuoco della tastiera resta sull'elemento equivalente
 function renderAll(root) {
-  renderBanner(root);
-  renderKpis(root);
-  renderQueue(root);
-  renderSteps(root);
+  keepFocus(root, () => {
+    renderBanner(root);
+    renderKpis(root);
+    renderQueue(root);
+    renderSteps(root);
+  });
 }
 
 /* ------------------------------------------------------------ banner */
@@ -115,11 +119,11 @@ function renderBanner(root) {
   const q = store.queue;
   const s = store.settings;
   const waiting = q && !q.motore_pronto && q.in_coda > 0;
-  if (!waiting) { el.innerHTML = ''; el.hidden = true; return; }
+  if (!waiting) { patchHTML(el, ''); el.hidden = true; return; }
   el.hidden = false;
   const claude = (q.motore || s?.settings?.engine) === 'claude';
   if (claude && s && !s.api_key_set) {
-    setHTML(el, html`<div class="banner" role="status">
+    patchHTML(el, html`<div class="banner" role="status">
       <div class="banner-icon">${icon('key')}</div>
       <div style="flex:1;min-width:0">
         <div class="banner-title">Configura la chiave API di Anthropic per avviare la lettura</div>
@@ -130,7 +134,7 @@ function renderBanner(root) {
     </div>`);
     return;
   }
-  setHTML(el, html`<div class="banner" role="status">
+  patchHTML(el, html`<div class="banner" role="status">
     <div class="banner-icon">${icon('hourglass')}</div>
     <div style="flex:1;min-width:0">
       <div class="banner-title">Lettura in attesa</div>
@@ -153,7 +157,8 @@ function kpiCard({ tone, ic, label, value, unit = '', foot, nav, tip }) {
 
 function renderKpis(root) {
   const k = store.kpi || {};
-  const engine = store.queue?.motore || store.settings?.settings?.engine || 'locale';
+  // motore scelto nelle impostazioni (aggiornato subito quando l'utente lo cambia)
+  const engine = store.settings?.settings?.engine || store.queue?.motore || 'locale';
   const inLettura = (k.in_coda || 0) + (k.in_lavorazione || 0);
   const cards = [
     kpiCard({
@@ -181,14 +186,19 @@ function renderKpis(root) {
         : `in ${plural(k.documenti_con_errori || 0, 'foglio', 'fogli')}`,
       nav: '#/documenti?stato=errori',
     }),
-    kpiCard({
-      tone: 'k-slate', ic: 'coin', label: 'Costo stimato',
-      value: (engine !== 'claude' && !(k.costo_usd > 0)) ? 'Gratuito' : fmtUSD(k.costo_usd || 0),
-      foot: engine === 'claude' ? 'Letture con Claude Vision' : 'Motore locale offline',
-      tip: 'Stima del costo delle letture con Claude Vision (prezzi pubblici di Anthropic). Il motore locale non ha costi.',
-    }),
+    // il costo compare solo se si usa (o si è usato) Claude Vision
+    engine === 'claude' || k.costo_usd > 0
+      ? kpiCard({
+        tone: 'k-slate', ic: 'coin', label: 'Costo stimato', value: fmtUSD(k.costo_usd || 0),
+        foot: engine === 'claude' ? 'Letture con Claude Vision' : 'Letture precedenti con Claude Vision',
+        tip: 'Stima del costo delle letture con Claude Vision (prezzi pubblici di Anthropic). Il motore locale non ha costi.',
+      })
+      : kpiCard({
+        tone: 'k-slate', ic: 'cpu', label: 'Motore di lettura', value: 'Locale',
+        foot: 'Offline: i dati restano sul computer', nav: '#/impostazioni',
+      }),
   ];
-  setHTML($('#kpis', root), cards);
+  patchList($('#kpis', root), cards);
 }
 
 /* ------------------------------------------------------------ coda */
@@ -210,16 +220,16 @@ function renderQueue(root) {
   const summary = [];
   if (q.completati) summary.push(html`<span class="badge badge-sm tone-ok">${plural(q.completati, 'letto', 'letti')}</span>`);
   if (q.errori) summary.push(html`<span class="badge badge-sm tone-err">${plural(q.errori, 'errore', 'errori')}</span>`);
-  setHTML($('#queue-summary', root), summary);
+  patchHTML($('#queue-summary', root), summary);
 
   const el = $('#queue-list', root);
   if (!list.length) {
-    setHTML(el, html`<div class="empty is-compact">${raw(ART.queue)}
+    patchList(el, [html`<div class="empty is-compact">${raw(ART.queue)}
       <div class="empty-title">Nessun documento in coda</div>
-      <p class="empty-text">I fogli importati compaiono qui con l'avanzamento della lettura.</p></div>`);
+      <p class="empty-text">I fogli importati compaiono qui con l'avanzamento della lettura.</p></div>`]);
     return;
   }
-  setHTML(el, list.map((d) => queueItem(d)));
+  patchList(el, list.map((d) => queueItem(d)));
 }
 
 function queueItem(d) {
@@ -279,22 +289,22 @@ function renderSteps(root) {
   const s3 = completed && !toVerify && !reading ? 'is-current' : '';
   const firstToVerify = docs.find((d) => d.status === 'completato' && d.is_foglio_firma && d.totals?.stato !== 'ok' && !d.user_verified)
     || docs.find((d) => d.status === 'completato' && d.is_foglio_firma && !d.user_verified);
-  setHTML($('#steps', root), html`
-    <div class="step ${s1}">
+  patchList($('#steps', root), [
+    html`<div class="step ${s1}">
       <div class="step-num">${s1 === 'is-done' ? icon('check') : '1'}</div>
       <div class="step-title">Importa i fogli firma</div>
       <div class="step-text">${imported ? `${plural(k.documenti, 'documento importato', 'documenti importati')}${reading ? `, ${fmtInt(reading)} in lettura` : ''}.` : 'Trascina i PDF scansionati nell\'area qui sopra o usa «Importa PDF».'}</div>
-    </div>
-    <div class="step ${s2}">
+    </div>`,
+    html`<div class="step ${s2}">
       <div class="step-num">${s2 === 'is-done' ? icon('check') : '2'}</div>
       <div class="step-title">Verifica i campi segnalati</div>
       <div class="step-text">${completed ? (toVerify ? `${plural(toVerify, 'foglio da verificare', 'fogli da verificare')} · ${plural(k.illeggibili || 0, 'campo illeggibile', 'campi illeggibili')}.` : 'Tutti i fogli sono stati verificati o non hanno segnalazioni.') : 'Confronta la scansione con i dati letti e correggi le celle evidenziate.'}</div>
       ${firstToVerify ? html`<button type="button" class="btn btn-sm${s2 === 'is-current' ? ' btn-primary' : ''}" data-open="${firstToVerify.id}">${icon('arrow-right')}${toVerify ? 'Inizia la revisione' : 'Apri la revisione'}</button>` : ''}
-    </div>
-    <div class="step ${s3}">
+    </div>`,
+    html`<div class="step ${s3}">
       <div class="step-num">3</div>
       <div class="step-title">Genera l'Excel</div>
       <div class="step-text">${completed ? 'Controlla l\'anteprima e genera la rendicontazione con riepilogo, dettaglio, schede e anomalie.' : 'Disponibile quando almeno un foglio firma è stato letto.'}</div>
       ${completed ? html`<button type="button" class="btn btn-sm${s3 ? ' btn-primary' : ''}" data-nav="#/anteprima">${icon('excel')}Apri l'anteprima Excel</button>` : ''}
-    </div>`);
+    </div>`]);
 }

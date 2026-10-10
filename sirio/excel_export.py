@@ -12,7 +12,8 @@ Principi
   memorizzato accanto (``write_formula(..., value=...)``): il file resta "vivo"
   e i valori sono visibili anche nei programmi che non ricalcolano.
 * I documenti sono rivalidati su copie: totali e anomalie sono sempre coerenti
-  con i dati esportati, senza modificare gli oggetti ricevuti.
+  con i dati esportati, senza modificare gli oggetti ricevuti. Fogli con lo
+  stesso operatore, alunno e mese sono segnalati come possibili duplicati (W13).
 * Celle illeggibili (rosso), incerte (ambra) e corrette a mano (blu) sono
   evidenziate e spiegate da un commento della cella.
 """
@@ -194,6 +195,15 @@ def _link(sheet: str, row: int = 0, col: int = 0) -> str:
     return f"internal:{_q(sheet)}!{_cell(row, col)}"
 
 
+def _criterio_esatto(cella: str) -> str:
+    """Criterio di SOMMA.PIÙ.SE/CONTA.SE che corrisponde esattamente al testo di ``cella``.
+
+    "?", "*" e "~" sarebbero caratteri jolly e un "=", "<" o ">" iniziale un operatore: un nome
+    come "ROSS? MARIO" sommerebbe anche le ore di "ROSSI MARIO".
+    """
+    return f'"="&SUBSTITUTE(SUBSTITUTE(SUBSTITUTE({cella},"~","~~"),"*","~*"),"?","~?")'
+
+
 def _plurale(n: int, singolare: str, plurale: str) -> str:
     return f"{n} {singolare if n == 1 else plurale}"
 
@@ -228,6 +238,7 @@ def _ora_excel(s: str | None) -> float | None:
 
 
 def _data_compilazione(s: str | None) -> date | None:
+    """Data scritta -> data Excel; None (la cella riporta il testo) se non interpretabile o fuori dal 2000-2100."""
     if not s:
         return None
     m = _RE_DATA.search(str(s))
@@ -236,6 +247,8 @@ def _data_compilazione(s: str | None) -> date | None:
     g, mm, a = int(m.group(1)), int(m.group(2)), int(m.group(3))
     if a < 100:
         a += 2000
+    if not 2000 <= a <= 2100:  # es. "5/3/202": una data seriale negativa in Excel mostrerebbe solo "####"
+        return None
     try:
         return date(a, mm, g)
     except ValueError:
@@ -517,33 +530,56 @@ def _ordina_documenti(docs: Iterable[Document]) -> list[Document]:
     return sorted(docs, key=chiave)
 
 
-def _nome_scheda(d: _Doc, usati: set[str]) -> str:
-    """Nome di foglio univoco ≤ 31 caratteri, es. "ROSSI M. 02-2026"."""
+def _taglia_base(base: str, spazio: int) -> str:
+    base = base.strip(" '")
+    return base if len(base) <= spazio else base[:spazio].rstrip(" '-")
+
+
+def _nome_scheda(d: _Doc, usati: dict[str, str | None]) -> str:
+    """Nome di foglio univoco ≤ 31 caratteri, es. "ROSSI M. 02-2026".
+
+    ``usati``: nomi già assegnati (in minuscolo) -> operatore a cui appartengono (None per i fogli
+    fissi). Se il nome abbreviato è già di un altro operatore si usa il nome meno abbreviato
+    ("ROSSI MARCO 02-2026"); altrimenti si aggiunge " (2)", " (3)"… accorciando solo il nome e
+    lasciando intatto il periodo.
+    """
     periodo = f" {d.periodo[0]:02d}-{d.periodo[1]}" if d.periodo else ""
     spazio = 31 - len(periodo)
-    parti = [p for p in _RE_NOME_FOGLIO_VIETATI.sub("-", _pulisci(d.doc.header.operatore)).split(" ") if p]
-    if not parti:
-        base = f"Foglio {d.n}"
-    elif len(parti) == 1:
-        base = parti[0]
+    operatore = _pulisci(d.doc.header.operatore)
+    parti = [p for p in _RE_NOME_FOGLIO_VIETATI.sub("-", operatore).split(" ") if p]
+    if len(parti) < 2:
+        basi = parti
     else:
-        # "COGNOME NOME" -> "COGNOME N."; nomi lunghi: iniziali dalla fine ("DELLA VALLE S.M.G.A.")
-        base = ""
-        for k in range(len(parti) - 1, 0, -1):
-            base = " ".join(parti[:k]) + " " + "".join(p[0] + "." for p in parti[k:])
-            if len(base) <= spazio:
-                break
-    base = base.strip(" '")
-    if len(base) > spazio:
-        base = base[:spazio].rstrip(" '-")
-    nome = (base + periodo).strip(" '") or f"Foglio {d.n}"
-    candidato, k = nome, 2
-    while candidato.casefold() in usati or candidato.casefold() == "history":
+        # "COGNOME NOME" -> "COGNOME N."; nomi lunghi: iniziali dalla fine ("DELLA VALLE S.M.G.A.").
+        # Forme dalla più abbreviata al nome completo, che serve solo a distinguere operatori diversi.
+        forme = [" ".join(parti[:k]) + " " + "".join(p[0] + "." for p in parti[k:]) for k in range(1, len(parti))]
+        forme.append(" ".join(parti))
+        entro = [i for i, b in enumerate(forme[:-1]) if len(b) <= spazio]
+        i0 = entro[-1] if entro else 0
+        basi = [forme[i0]] + [b for b in forme[i0 + 1 :] if len(b) <= spazio]
+    basi = [b for b in (_taglia_base(b, spazio) for b in basi) if b] or [f"Foglio {d.n}"]
+    proprietario = operatore.casefold()
+
+    def libero(nome: str) -> bool:
+        return nome.casefold() not in usati and nome.casefold() != "history"
+
+    scelto = None
+    for base in basi:
+        nome = base + periodo
+        if libero(nome):
+            scelto = nome
+            break
+        if usati.get(nome.casefold()) == proprietario:
+            break  # stesso operatore (es. due alunni nello stesso mese): suffisso numerico
+    k = 2
+    while scelto is None:
         suffisso = f" ({k})"
-        candidato = nome[: 31 - len(suffisso)].rstrip(" '") + suffisso
+        candidato = _taglia_base(basi[0], spazio - len(suffisso)) + periodo + suffisso
+        if libero(candidato):
+            scelto = candidato
         k += 1
-    usati.add(candidato.casefold())
-    return candidato
+    usati[scelto.casefold()] = proprietario
+    return scelto
 
 
 # --- Valori dei campi con stato di lettura -----------------------------------------
@@ -885,7 +921,7 @@ class _Esportatore:
         self.ws_riep = wb.add_worksheet(S_RIEPILOGO)
         self.ws_det = wb.add_worksheet(S_DETTAGLIO)
         if self.opt.fogli_per_documento:
-            usati = {s.casefold() for s in _FOGLI_FISSI}
+            usati: dict[str, str | None] = {s.casefold(): None for s in _FOGLI_FISSI}
             for d in self.docs:
                 d.sheet = _nome_scheda(d, usati)
                 d.ws = wb.add_worksheet(d.sheet)
@@ -2626,9 +2662,12 @@ class _Esportatore:
     # ------------------------------------------------------------ Totali per operatore
 
     def _totali(self) -> None:
+        """Totali per operatore, alunno e istituto con SOMMA.PIÙ.SE sulla tabella del Riepilogo.
+
+        Le colonne del Riepilogo sono collegate alle schede dei fogli firma (o al Dettaglio senza
+        schede): una correzione fatta nella scheda aggiorna sia il Riepilogo sia questi totali.
+        """
         ws, f = self.ws_tot, self.f
-        det = self.det["rng"]
-        righe: list[tuple[_Doc, int]] = self.det["righe"]
         mesi = sorted({d.periodo for d in self.docs if d.periodo}, key=lambda p: (p[1], p[0]))
         colonne_mese: list[tuple[str, tuple[int, int] | None]] = [(_etichetta_mese(m, a), (m, a)) for m, a in mesi]
         if any(d.periodo is None for d in self.docs):
@@ -2644,20 +2683,25 @@ class _Esportatore:
             ws,
             last_c,
             "Totali per operatore, alunno e istituto",
-            f"{self.testo_periodo} · ore e giornate calcolate con formule (SOMMA.PIÙ.SE, CONTA.PIÙ.SE) "
-            f"sul foglio «{S_DETTAGLIO}»",
+            f"{self.testo_periodo} · ore e giornate calcolate con formule (SOMMA.PIÙ.SE, CONTA.SE) "
+            f"sul foglio «{S_RIEPILOGO}»",
         )
         cella = {**TXT, **GRID}
         tf = {**TXT, **TOTAL}
         riep_first = self.R_RIEP_HEAD + 1
         riep_last = riep_first + len(self.docs) - 1
+        RC = {nome: i for i, (nome, _) in enumerate(self._R_COLS)}
+
+        def riep(nome: str) -> str:
+            return f"{_q(S_RIEPILOGO)}!{_rng(riep_first, RC[nome], riep_last, RC[nome])}"
+
         sezioni = (
-            ("Ore per operatore", "operatore", "Operatore", "op", 1, "Alunni seguiti"),
-            ("Ore per alunno", "alunno", "Alunno", "al", 2, "Operatori"),
-            ("Ore per istituto", "istituto", "Istituto", "ist", 3, "Alunni"),
+            ("Ore per operatore", "operatore", "Operatore", "Alunni seguiti"),
+            ("Ore per alunno", "alunno", "Alunno", "Operatori"),
+            ("Ore per istituto", "istituto", "Istituto", "Alunni"),
         )
         r = 4
-        for titolo, attr, intestazione, chiave_rng, col_riep, etichetta_altri in sezioni:
+        for titolo, attr, intestazione, etichetta_altri in sezioni:
             gruppi: dict[str, tuple[str, list[_Doc]]] = {}
             for d in self.docs:
                 nome = getattr(d, attr)
@@ -2685,58 +2729,59 @@ class _Esportatore:
             r += 1
             r_a = r
             somme: dict[int, float] = {}
+            rng_crit = riep(intestazione)
+            rng_ric, rng_mese = riep("Ore riconosciute"), riep("Mese")
             for nome, ds in elenco:
                 ws.set_row(r, 20)
-                ids = {id(d) for d in ds}
-                proprie = [(d, g) for d, g in righe if id(d) in ids]
-                crit = f"$A{r + 1}"
+                crit = _criterio_esatto(_cell(r, 0, True))
                 valori: dict[int, float | None] = {
                     1: float(len(ds)),
-                    c_ric: math.fsum(d.calcs[g - 1].ric or 0.0 for d, g in proprie),
-                    c_prog: math.fsum(d.calcs[g - 1].prog or 0.0 for d, g in proprie),
-                    c_gg: float(sum(1 for d, g in proprie if (d.calcs[g - 1].ric or 0.0) > 0)),
-                    c_aa: float(sum(1 for d, g in proprie if d.doc.rows[g - 1].assenza_alunno)),
-                    c_ao: float(sum(1 for d, g in proprie if d.doc.rows[g - 1].assenza_operatore)),
+                    c_ric: math.fsum(d.tot["ric"] for d in ds),
+                    c_prog: math.fsum(d.tot["prog"] for d in ds),
+                    c_gg: math.fsum(d.tot["giorni"] for d in ds),
+                    c_aa: math.fsum(d.tot["ass_al"] for d in ds),
+                    c_ao: math.fsum(d.tot["ass_op"] for d in ds),
                 }
                 for k, (_, mese) in enumerate(colonne_mese):
-                    valori[2 + k] = math.fsum(d.calcs[g - 1].ric or 0.0 for d, g in proprie if d.periodo == mese)
+                    valori[2 + k] = math.fsum(d.tot["ric"] for d in ds if d.periodo == mese)
                 prog = valori[c_prog] or 0.0
                 valori[c_pct] = (valori[c_ric] or 0.0) / prog if prog > 0 else None
                 for c, v in valori.items():
                     if c != c_pct and v is not None:
                         somme[c] = somme.get(c, 0.0) + v
 
-                rng_crit = det[chiave_rng]
-                riep = f"{_q(S_RIEPILOGO)}!{_rng(riep_first, col_riep, riep_last, col_riep)}"
                 self._scrivi(ws, r, 0, nome, f(cella, bold=True, indent=1))
                 self._scrivi(
                     ws,
                     r,
                     1,
-                    _F(f"COUNTIF({riep},{crit})", valori[1]),
+                    _F(f"COUNTIF({rng_crit},{crit})", valori[1]),
                     f(cella, align="center", num_format=FMT_INT),
                 )
+                per_nome = f"{rng_crit},{crit}"
                 for k, (_, mese) in enumerate(colonne_mese):
-                    cond_mese = '""' if mese is None else f"DATE({mese[1]},{mese[0]},1)"
-                    self._scrivi(
-                        ws,
-                        r,
-                        2 + k,
-                        _F(f"SUMIFS({det['ric']},{rng_crit},{crit},{det['mese']},{cond_mese})", valori[2 + k]),
-                        f(cella, num_format=FMT_ORE),
-                    )
+                    if mese is None:
+                        # mese vuoto o non valido (testo, es. "ILLEGGIBILE"): tutte le ore meno quelle con
+                        # una data nella colonna Mese (il criterio numerico esclude celle vuote e testi)
+                        formula = (
+                            f"SUMIFS({rng_ric},{per_nome})"
+                            f'-SUMIFS({rng_ric},{per_nome},{rng_mese},">0")'
+                        )
+                    else:
+                        formula = f"SUMIFS({rng_ric},{per_nome},{rng_mese},DATE({mese[1]},{mese[0]},1))"
+                    self._scrivi(ws, r, 2 + k, _F(formula, valori[2 + k]), f(cella, num_format=FMT_ORE))
                 self._scrivi(
                     ws,
                     r,
                     c_ric,
-                    _F(f"SUMIFS({det['ric']},{rng_crit},{crit})", valori[c_ric]),
+                    _F(f"SUMIFS({rng_ric},{per_nome})", valori[c_ric]),
                     f(cella, num_format=FMT_ORE, bold=True, font_color=NAVY),
                 )
                 self._scrivi(
                     ws,
                     r,
                     c_prog,
-                    _F(f"SUMIFS({det['prog']},{rng_crit},{crit})", valori[c_prog]),
+                    _F(f"SUMIFS({riep('Ore programmate')},{per_nome})", valori[c_prog]),
                     f(cella, num_format=FMT_ORE),
                 )
                 self._scrivi(
@@ -2746,12 +2791,14 @@ class _Esportatore:
                     _F(f'IF({_cell(r, c_prog)}>0,{_cell(r, c_ric)}/{_cell(r, c_prog)},"")', valori[c_pct]),
                     f(cella, num_format=FMT_PCT, align="center"),
                 )
-                for c, formula in (
-                    (c_gg, f'COUNTIFS({rng_crit},{crit},{det["ric"]},">0")'),
-                    (c_aa, f'COUNTIFS({rng_crit},{crit},{det["aa"]},"Sì")'),
-                    (c_ao, f'COUNTIFS({rng_crit},{crit},{det["ao"]},"Sì")'),
-                ):
-                    self._scrivi(ws, r, c, _F(formula, valori[c]), f(cella, align="center", num_format=FMT_INT))
+                for c, colonna in ((c_gg, "Giorni lavorati"), (c_aa, "Assenze alunno"), (c_ao, "Assenze operatore")):
+                    self._scrivi(
+                        ws,
+                        r,
+                        c,
+                        _F(f"SUMIFS({riep(colonna)},{per_nome})", valori[c]),
+                        f(cella, align="center", num_format=FMT_INT),
+                    )
                 altri_attr = "operatore" if attr == "alunno" else "alunno"
                 altri = sorted({getattr(d, altri_attr) for d in ds}, key=str.casefold)
                 self._scrivi(ws, r, c_altri, ", ".join(altri), f(cella, font_size=9, font_color=MUTED, indent=1))
@@ -2794,8 +2841,13 @@ class _Esportatore:
             0,
             r,
             last_c,
-            f"Le ore e le giornate sono sommate dal foglio «{S_DETTAGLIO}»: correggendo un valore nel dettaglio "
-            "questi totali si aggiornano automaticamente. "
+            f"Le ore e le giornate sono sommate dalla tabella del foglio «{S_RIEPILOGO}», "
+            + (
+                "collegata alle schede dei fogli firma: correggendo un valore in una scheda "
+                if self.opt.fogli_per_documento
+                else f"calcolata dal foglio «{S_DETTAGLIO}»: correggendo un valore nel dettaglio "
+            )
+            + "questi totali si aggiornano automaticamente. "
             "% ore su programmate = ore riconosciute ÷ ore programmate.",
             f(TXT, font_size=9, italic=True, font_color=MUTED, indent=1, text_wrap=True),
         )
@@ -2926,13 +2978,14 @@ class _Esportatore:
         if self.opt.fogli_per_documento:
             regole.append(
                 "Le colonne calcolate e i totali sono formule: correggendo un valore nella scheda di un foglio "
-                "firma si aggiornano i totali della scheda e del Riepilogo; i «Totali per operatore» si basano "
-                "sul «Dettaglio giornaliero»."
+                "firma si aggiornano i totali della scheda, il «Riepilogo» e i «Totali per operatore». Il "
+                "«Dettaglio giornaliero» riporta invece i valori al momento della generazione del file: le "
+                "correzioni vanno fatte nelle schede."
             )
         else:
             regole.append(
                 "Le colonne calcolate e i totali sono formule basate sul «Dettaglio giornaliero»: correggendo un "
-                "valore nel dettaglio si aggiornano il Riepilogo e i Totali per operatore."
+                "valore nel dettaglio si aggiornano il «Riepilogo» e i «Totali per operatore»."
             )
         for testo in regole:
             riga_testo(testo, ("•", f(TXT, align="right", font_color=ACCENT, bold=True)))
@@ -3118,6 +3171,8 @@ def export_workbook(docs: list[Document], path: Path, options: ExportOptions | N
             "Nessun foglio firma completato da esportare: attendere la fine dell'elaborazione "
             "oppure selezionare documenti riconosciuti come fogli firma."
         )
+    # stesso operatore, alunno e mese in più fogli (es. pagina scansionata due volte): W13 su ciascuno
+    val.segnala_possibili_duplicati(inclusi)
 
     prepared = [_prepara(doc, i) for i, doc in enumerate(_ordina_documenti(inclusi), start=1)]
     adesso = _adesso()

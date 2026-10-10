@@ -63,6 +63,9 @@ import logging
 import math
 import os
 import re
+import shutil
+import stat
+import sys
 import threading
 import time
 import unicodedata
@@ -107,6 +110,14 @@ _MISSING_MSG = (
     "Componenti offline non installati: il motore locale richiede i pacchetti "
     "«torch» e «transformers». Si installano con il programma di avvio (opzione "
     "offline) oppure si può usare il motore Claude."
+)
+_DLL_MSG = (
+    "PyTorch è installato ma Windows non riesce a caricarlo: installare «Microsoft Visual C++ "
+    "Redistributable» (https://aka.ms/vs/17/release/vc_redist.x64.exe) e riavviare Sirio OCR."
+)
+OOM_MSG = (
+    "Memoria insufficiente per il riconoscimento offline (servono circa 3 GB liberi): chiudere altri "
+    "programmi e riprovare."
 )
 
 
@@ -696,17 +707,35 @@ class TrOCRRecognizer:
         logits = p.lm_head(x[:, -1, :])
         return torch.log_softmax(logits.float(), dim=-1), new_cache
 
+    VERIFY_STEPS = 4          # passi della decodifica confrontati con il modello originale
+
     def _verify_fast_path(self, enc: Any) -> bool:
-        """Confronta il primo passo della decodifica a lotti con quello del modello
-        originale: se differiscono (versione di transformers diversa) si usa il ripiego."""
+        """Confronta i primi passi della decodifica a lotti (con la cache della
+        self-attention) con il modello originale senza cache, seguendo la lettura
+        "golosa": se differiscono (versione di transformers diversa, posizioni o
+        cache gestite in altro modo) si usa il ripiego lento."""
         torch = self.torch
+        diff = 0.0
         try:
-            ids = torch.tensor([[self.start_id]], dtype=torch.long, device=self.device)
-            ref = self.decoder(input_ids=ids, encoder_hidden_states=enc[:1], use_cache=False)
-            ref_lp = torch.log_softmax(ref.logits[:, -1, :].float(), dim=-1)
+            enc1 = enc[:1]
+            cross = self._cross_kv(enc1)
             row_crop = torch.zeros(1, dtype=torch.long, device=self.device)
-            lp, _ = self._step(ids.view(1), 0, None, self._cross_kv(enc[:1]), row_crop)
-            diff = float((lp - ref_lp).abs().max())
+            ids = [self.start_id]
+            lp, cache = self._step(torch.tensor([self.start_id], dtype=torch.long, device=self.device), 0, None,
+                                   cross, row_crop)
+            for step in range(self.VERIFY_STEPS):
+                seq = torch.tensor([ids], dtype=torch.long, device=self.device)
+                ref = self.decoder(input_ids=seq, encoder_hidden_states=enc1, use_cache=False)
+                ref_lp = torch.log_softmax(ref.logits[:, -1, :].float(), dim=-1)
+                diff = max(diff, float((lp - ref_lp).abs().max()))
+                if not math.isfinite(diff) or diff > 1e-3:
+                    break
+                tok = int(ref_lp[0].argmax())
+                if tok == self.eos_id or step == self.VERIFY_STEPS - 1:
+                    break
+                ids.append(tok)
+                lp, cache = self._step(torch.tensor([tok], dtype=torch.long, device=self.device), step + 1, cache,
+                                       cross, row_crop)
         except Exception:  # noqa: BLE001 - API interna di transformers cambiata
             log.warning("Decodifica a lotti non disponibile, uso il ripiego lento", exc_info=True)
             return False
@@ -993,6 +1022,7 @@ def _to_rgb(img: np.ndarray) -> np.ndarray:
 
 _MODELS: dict[tuple[str, str, str], TrOCRRecognizer] = {}
 _MODELS_LOCK = threading.Lock()
+_REPLACED: set[tuple[str, str]] = set()     # modelli danneggiati gia' riscaricati in questa sessione
 _DOWNLOAD_LOCKS: dict[str, threading.Lock] = {}
 _IMPORT_STATE: dict[str, Any] = {}
 
@@ -1044,21 +1074,74 @@ def local_model_path(model_name: str, cache_dir: Path | None) -> Path | None:
     return None
 
 
+def _repo_of(snapshot: Path, cache_dir: Path) -> Path | None:
+    """Cartella ``models--...`` che contiene la revisione ``snapshot``, se e' nella cache."""
+    if snapshot.parent.name != "snapshots":
+        return None
+    repo = snapshot.parent.parent
+    try:
+        repo.resolve().relative_to(cache_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return repo if repo.name.startswith("models--") else None
+
+
+def _discard_cached_model(repo: Path) -> bool:
+    """Elimina (o, se non si puo', accantona) la copia locale danneggiata del modello."""
+
+    def writable_retry(func: Callable[..., Any], target: str, _exc: BaseException) -> None:
+        # su Windows i file della cache sono in sola lettura e rmtree non li elimina
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(repo, onexc=writable_retry)
+        else:
+            shutil.rmtree(repo, onerror=lambda f, p, info: writable_retry(f, p, info[1]))
+        return True
+    except OSError:
+        log.warning("Impossibile eliminare il modello danneggiato in %s", repo, exc_info=True)
+    try:
+        repo.rename(repo.with_name(f"{repo.name}.corrotto-{int(time.time())}"))
+        return True
+    except OSError:
+        log.warning("Impossibile accantonare il modello danneggiato in %s", repo, exc_info=True)
+        return False
+
+
+def _damaged_message(folder: Path) -> str:
+    return (f"Il modello di riconoscimento offline è danneggiato e non è stato possibile sostituirlo "
+            f"automaticamente: chiudere Sirio OCR, eliminare la cartella «{folder}» e riprovare "
+            "(il modello verrà scaricato di nuovo).")
+
+
+def _import_failure_message(exc: BaseException) -> str:
+    """Messaggio per torch/transformers presenti ma non importabili."""
+    text = str(exc)
+    if isinstance(exc, OSError) and (".dll" in text.lower() or "winerror" in text.lower()
+                                     or getattr(exc, "winerror", None) is not None):
+        # tipicamente manca il runtime Visual C++: reinstallare i pacchetti non serve
+        return _DLL_MSG
+    return _MISSING_MSG
+
+
 def _missing_components() -> str | None:
     """None se torch e transformers sono importabili, altrimenti il messaggio d'errore."""
     if "ok" in _IMPORT_STATE:
-        return None if _IMPORT_STATE["ok"] else _MISSING_MSG
+        return None if _IMPORT_STATE["ok"] else _IMPORT_STATE.get("msg", _MISSING_MSG)
     for mod in ("torch", "transformers"):
         if importlib.util.find_spec(mod) is None:
-            _IMPORT_STATE["ok"] = False
+            _IMPORT_STATE.update(ok=False, msg=_MISSING_MSG)
             return _MISSING_MSG
     try:
         importlib.import_module("torch")
         importlib.import_module("transformers")
-    except Exception:  # noqa: BLE001 - libreria presente ma non funzionante
+    except Exception as exc:  # noqa: BLE001 - libreria presente ma non funzionante
         log.warning("torch/transformers presenti ma non importabili", exc_info=True)
-        _IMPORT_STATE["ok"] = False
-        return _MISSING_MSG
+        msg = _import_failure_message(exc)
+        _IMPORT_STATE.update(ok=False, msg=msg)
+        return msg
     _IMPORT_STATE["ok"] = True
     return None
 
@@ -1076,13 +1159,80 @@ def _is_network_error(exc: BaseException) -> bool:
     return cause is not None and cause is not exc and _is_network_error(cause)
 
 
-def _download_error(exc: BaseException, model_name: str, size_mb: float | None) -> EngineError:
+def _exc_chain(exc: BaseException) -> Iterable[BaseException]:
+    """L'eccezione e le sue cause (``__cause__``/``__context__``), senza cicli."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = cur.__cause__ or cur.__context__
+
+
+_OOM_TEXTS = (
+    "out of memory", "not enough memory", "can't allocate memory", "cannot allocate memory",
+    "unable to mmap", "defaultcpuallocator", "bad_alloc", "paging file", "file di paging",
+    "memoria insufficiente", "(os error 12)", "(os error 1455)",
+)
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """True se l'errore (o una sua causa) e' una mancanza di memoria: ``MemoryError``,
+    ``ENOMEM`` o i messaggi di torch/safetensors/Windows (torch su CPU solleva
+    ``RuntimeError``, safetensors un errore con "Cannot allocate memory")."""
+    for e in _exc_chain(exc):
+        if isinstance(e, MemoryError):
+            return True
+        if isinstance(e, OSError) and (e.errno == errno.ENOMEM or getattr(e, "winerror", None) in (8, 1455)):
+            return True
+        text = str(e).lower()
+        if any(t in text for t in _OOM_TEXTS):
+            return True
+    return False
+
+
+_DISK_FULL_TEXTS = ("no space left", "(os error 28)", "(os error 112)", "disk full", "not enough space",
+                    "spazio insufficiente", "spazio su disco insufficiente")
+
+
+def _free_bytes(path: Path) -> float | None:
+    for p in (path, *path.parents):
+        try:
+            return float(shutil.disk_usage(p).free)
+        except OSError:
+            continue
+    return None
+
+
+def _disk_full_error(size_mb: float | None, needed: float | None = None) -> EngineError:
+    if needed:
+        size = f" (servono circa {_fmt_size(needed / 1e6)} liberi)"
+    else:
+        size = f" (circa {_fmt_size(size_mb)})" if size_mb else ""
+    return EngineError(
+        f"Spazio su disco insufficiente per scaricare il modello di riconoscimento offline{size}. "
+        "Liberare spazio e riprovare."
+    )
+
+
+def _is_disk_full(exc: BaseException, cache_dir: Path | None, remaining: float) -> bool:
+    for e in _exc_chain(exc):
+        if isinstance(e, OSError) and (e.errno == errno.ENOSPC or getattr(e, "winerror", None) in (39, 112)):
+            return True
+        if any(t in str(e).lower() for t in _DISK_FULL_TEXTS):
+            return True
+    # il download (hf_xet) puo' fallire con un errore generico: conta lo spazio rimasto
+    if cache_dir is not None and remaining > 0:
+        free = _free_bytes(cache_dir)
+        return free is not None and free < remaining
+    return False
+
+
+def _download_error(exc: BaseException, model_name: str, size_mb: float | None,
+                    cache_dir: Path | None = None, remaining: float = 0.0) -> EngineError:
     size = f" (circa {_fmt_size(size_mb)})" if size_mb else ""
-    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOSPC:
-        return EngineError(
-            f"Spazio su disco insufficiente per scaricare il modello di riconoscimento offline{size}. "
-            "Liberare spazio e riprovare."
-        )
+    if _is_disk_full(exc, cache_dir, remaining):
+        return _disk_full_error(size_mb)
     names = {c.__name__ for c in type(exc).__mro__}
     if names & {"RepositoryNotFoundError", "RevisionNotFoundError", "GatedRepoError"}:
         return EngineError(
@@ -1132,16 +1282,22 @@ def _silent_tqdm() -> Any:
     return _Silent
 
 
-def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_progress) -> Path:
+DISK_MARGIN = 200e6         # spazio libero da lasciare oltre al modello (byte)
+
+
+def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_progress,
+                   message: str | None = None) -> Path:
     """Scarica il modello da huggingface.co in ``cache_dir`` (solo i file necessari),
-    riportando l'avanzamento. Restituisce la cartella del modello."""
+    riportando l'avanzamento. Restituisce la cartella del modello. ``message``
+    sostituisce l'inizio dei messaggi di avanzamento del download."""
     label = _model_label(model_name)
     size_mb = KNOWN_MODELS.get(model_name, {}).get("mb")
     try:
         from huggingface_hub import HfApi, snapshot_download  # noqa: PLC0415
     except ImportError as exc:
         raise EngineError(_MISSING_MSG) from exc
-    progress(0.0, f"Connessione a huggingface.co per scaricare il modello {label}…")
+    head = message or f"Download del modello {label} (solo al primo utilizzo)"
+    progress(0.0, f"{message}…" if message else f"Connessione a huggingface.co per scaricare il modello {label}…")
     try:
         info = HfApi().model_info(model_name, files_metadata=True)
     except Exception as exc:  # noqa: BLE001
@@ -1151,6 +1307,14 @@ def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_p
     total = sum(sz for f, sz in siblings if any(fnmatch.fnmatch(f, p) for p in patterns)) or (
         (size_mb or 0) * 1e6)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    blobs = cache_dir / _repo_folder(model_name) / "blobs"
+    start_size = _dir_size(blobs)
+    # spazio libero controllato prima: un disco pieno durante il download produce
+    # solo errori generici (hf_xet) e un avviso che nessuno vede
+    remaining = max(0.0, total - start_size)
+    free = _free_bytes(cache_dir)
+    if free is not None and remaining and free < remaining * 1.1 + DISK_MARGIN:
+        raise _disk_full_error(size_mb, needed=remaining * 1.1 + DISK_MARGIN)
     outcome: dict[str, Any] = {}
 
     def worker() -> None:
@@ -1161,20 +1325,19 @@ def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_p
         except BaseException as exc:  # noqa: BLE001 - riportata nel thread chiamante
             outcome["error"] = exc
 
-    blobs = cache_dir / _repo_folder(model_name) / "blobs"
-    start_size = _dir_size(blobs)
     thread = threading.Thread(target=worker, name="sirio-download-modello", daemon=True)
     thread.start()
     while thread.is_alive():
         thread.join(0.5)
         done = max(0, _dir_size(blobs) - start_size)
         frac = min(0.99, done / total) if total else 0.0
-        msg = f"Download del modello {label} (solo al primo utilizzo): {_fmt_mb(done)}"
+        msg = f"{head}: {_fmt_mb(done)}"
         if total:
             msg += f" di {_fmt_mb(total)}"
         progress(frac, msg + "…")
     if "error" in outcome:
-        raise _download_error(outcome["error"], model_name, size_mb) from outcome["error"]
+        left = max(0.0, total - _dir_size(blobs))
+        raise _download_error(outcome["error"], model_name, size_mb, cache_dir, left) from outcome["error"]
     path = local_model_path(model_name, cache_dir)
     if path is None:
         raise EngineError(f"Download del modello {label} incompleto: riprovare.")
@@ -1182,7 +1345,13 @@ def download_model(model_name: str, cache_dir: Path, progress: ProgressFn = no_p
     return path
 
 
+class ModelDamagedError(EngineError):
+    """File del modello presenti ma illeggibili (download interrotto, disco danneggiato...)."""
+
+
 def _load_recognizer(path: Path, model_name: str, device: str) -> TrOCRRecognizer:
+    """Carica il modello. Solleva ``EngineError`` con ``OOM_MSG`` se manca memoria e
+    ``ModelDamagedError`` se i file del modello non sono leggibili."""
     torch = importlib.import_module("torch")
     transformers = importlib.import_module("transformers")
     try:
@@ -1199,20 +1368,28 @@ def _load_recognizer(path: Path, model_name: str, device: str) -> TrOCRRecognize
                 f"Il modello {_model_label(model_name)} richiede i pacchetti «sentencepiece» e «protobuf», "
                 "non installati: scegliere un altro modello locale nelle impostazioni."
             ) from exc
-        raise EngineError(f"Modello di riconoscimento offline non valido o incompleto: {exc}") from exc
+        if _is_oom(exc):
+            raise EngineError(OOM_MSG) from exc
+        log.warning("Componenti del modello in %s non leggibili", path, exc_info=True)
+        raise ModelDamagedError("Modello di riconoscimento offline non valido o incompleto.") from exc
     try:
         model = transformers.VisionEncoderDecoderModel.from_pretrained(str(path), local_files_only=True)
     except Exception as exc:  # noqa: BLE001
-        raise EngineError(
-            f"Impossibile caricare il modello di riconoscimento offline ({exc}). Se il download era stato "
-            "interrotto, eliminare la cartella dei modelli e riprovare."
-        ) from exc
-    model.eval()
-    model.to(torch.device(device))
-    # Pesi in float32: la quantizzazione dinamica int8 del decoder (scala unica per
-    # tutto il lotto) renderebbe le letture dipendenti dai ritagli letti insieme e
-    # con la decodifica a lotti non e' piu' necessaria per la velocita'.
-    return TrOCRRecognizer(model, processor, model_name, device)
+        if _is_oom(exc):
+            raise EngineError(OOM_MSG) from exc
+        log.warning("Pesi del modello in %s non leggibili", path, exc_info=True)
+        raise ModelDamagedError("Impossibile caricare il modello di riconoscimento offline.") from exc
+    try:
+        model.eval()
+        model.to(torch.device(device))
+        # Pesi in float32: la quantizzazione dinamica int8 del decoder (scala unica per
+        # tutto il lotto) renderebbe le letture dipendenti dai ritagli letti insieme e
+        # con la decodifica a lotti non e' piu' necessaria per la velocita'.
+        return TrOCRRecognizer(model, processor, model_name, device)
+    except Exception as exc:
+        if _is_oom(exc):
+            raise EngineError(OOM_MSG) from exc
+        raise
 
 
 # ==========================================================================
@@ -2546,6 +2723,18 @@ def _apply_header(header: Header, name: str, fld: _Field) -> None:
 # Motore
 # ==========================================================================
 
+MIN_ROW_HEIGHT = 22.0     # altezza minima di una riga-giorno (pixel, circa 80 dpi)
+LOW_RES_MSG = (
+    "Risoluzione dell'immagine troppo bassa per leggere la scrittura a mano in modo affidabile: "
+    "scansionare il foglio ad almeno 150 dpi oppure rifare la foto più da vicino."
+)
+TABLE_NOT_FOUND_MSG = (
+    "Tabella giornaliera non riconosciuta: la pagina non sembra un foglio firma, oppure la foto è storta "
+    "o tagliata. Se è un foglio firma, rifare la foto dall'alto inquadrando tutto il foglio, oppure usare "
+    "lo scanner."
+)
+
+
 class LocalEngine:
     """Motore OCR locale: TrOCR + analisi dell'inchiostro, nessun dato inviato in rete."""
 
@@ -2598,17 +2787,50 @@ class LocalEngine:
                 rec = _MODELS.get(key)
             if rec is not None:
                 return rec
-            path = local_model_path(self.model_name, self.cache_dir)
-            if path is None:
-                path = download_model(self.model_name, self.cache_dir,
-                                      lambda f, m: progress(0.25 * f, m))
-            progress(0.26, f"Caricamento del modello {_model_label(self.model_name)}…")
-            rec = _load_recognizer(path, self.model_name, self.device)
+            rec = self._load(progress)
             with _MODELS_LOCK:
                 # un solo modello in memoria alla volta
                 _MODELS.clear()
                 _MODELS[key] = rec
         return rec
+
+    def _load(self, progress: ProgressFn) -> TrOCRRecognizer:
+        """Scarica (se serve) e carica il modello; una copia locale danneggiata
+        viene eliminata e scaricata di nuovo, una sola volta per sessione."""
+        label = _model_label(self.model_name)
+        path = local_model_path(self.model_name, self.cache_dir)
+        if path is None:
+            path = download_model(self.model_name, self.cache_dir, lambda f, m: progress(0.25 * f, m))
+        progress(0.26, f"Caricamento del modello {label}…")
+        try:
+            return _load_recognizer(path, self.model_name, self.device)
+        except ModelDamagedError as exc:
+            path = self._replace_damaged(path, progress, exc)
+        progress(0.26, f"Caricamento del modello {label}…")
+        try:
+            return _load_recognizer(path, self.model_name, self.device)
+        except ModelDamagedError as exc:
+            repo = _repo_of(path, self.cache_dir)
+            raise EngineError(_damaged_message(repo or path)) from exc
+
+    def _replace_damaged(self, path: Path, progress: ProgressFn, cause: BaseException) -> Path:
+        repo = _repo_of(path, self.cache_dir)
+        if repo is None:
+            # cartella indicata dall'utente nelle impostazioni: non si tocca
+            raise EngineError(
+                f"Il modello nella cartella «{path}» è danneggiato o incompleto: sostituirlo oppure scegliere "
+                "un altro modello locale nelle impostazioni."
+            ) from cause
+        key = (self.model_name, str(self.cache_dir))
+        with _MODELS_LOCK:
+            again = key in _REPLACED
+            _REPLACED.add(key)
+        if again or not _discard_cached_model(repo):
+            # gia' riscaricato in questa sessione (il problema non e' il download) o non eliminabile
+            raise EngineError(_damaged_message(repo)) from cause
+        log.warning("Modello %s danneggiato in %s: eliminato, nuovo download", self.model_name, repo)
+        return download_model(self.model_name, self.cache_dir, lambda f, m: progress(0.25 * f, m),
+                              message="Modello danneggiato: nuovo download")
 
     # --------------------------------------------------------------- lettura
     def extract(self, page: PageInput, progress: ProgressFn) -> ExtractionResult:
@@ -2625,12 +2847,16 @@ class LocalEngine:
         if not grid.detected and grid.score < 0.5:
             return ExtractionResult(
                 is_foglio_firma=False,
-                ocr_notes="La pagina non sembra un foglio firma: tabella giornaliera non riconosciuta.",
+                ocr_notes=TABLE_NOT_FOUND_MSG,
                 confidence=round(float(grid.score), 3),
                 engine="locale",
                 model=self.model_name,
                 usage=Usage(seconds=round(time.monotonic() - t0, 2)),
             )
+        if grid.row_height < MIN_ROW_HEIGHT:
+            # sotto questa soglia TrOCR "legge" valori anche nelle celle vuote
+            log.info("Righe alte %.1f pixel: risoluzione insufficiente", grid.row_height)
+            raise EngineError(LOW_RES_MSG)
         recognizer = self._ensure_recognizer(progress)
         progress(0.3, "Analisi della tabella e delle firme…")
         try:
@@ -2648,10 +2874,11 @@ class LocalEngine:
             results = recognizer.read(plan.requests, on_read) if total else []
         except EngineError:
             raise
-        except MemoryError as exc:
-            raise EngineError("Memoria insufficiente per il riconoscimento offline: chiudere altri programmi "
-                              "e riprovare.") from exc
         except Exception as exc:  # noqa: BLE001
+            # torch su CPU segnala la mancanza di memoria con un RuntimeError
+            if _is_oom(exc):
+                log.warning("Memoria insufficiente durante la lettura", exc_info=True)
+                raise EngineError(OOM_MSG) from exc
             log.exception("Errore del riconoscimento offline")
             raise EngineError(f"Errore del riconoscimento offline: {exc}") from exc
         readings = {req.key: res for req, res in zip(plan.requests, results)}

@@ -99,6 +99,45 @@ def test_user_edit_learns_only_the_edited_field(reg: an.Anagrafica) -> None:
     assert counts(reg, "operatore") == {"ROSSI MARIO": 1}
 
 
+def test_confirmation_does_not_learn_fields_still_flagged(reg: an.Anagrafica) -> None:
+    confirm(reg, alunno="BIANCHI LUCA", ore_pei=15.0, lotto="2")
+    # conferma frettolosa: i campi ancora incerti/illeggibili non sono stati controllati
+    doc = make_doc(operatore="ROSSI MARIO", alunno="BLANCHJ LUKA", istituto="IC 1 VERDl", ore_pei=51.0, lotto="7",
+                   incerti=["alunno", "istituto", "ore_pei"], illeggibili=["lotto"])
+    reg.impara_documento(doc)
+    assert counts(reg, "operatore") == {"ROSSI MARIO": 2}
+    assert counts(reg, "alunno") == {"BIANCHI LUCA": 1} and counts(reg, "istituto") == {"IC 1 VERDI": 1}
+    assert counts(reg, "ente") == {"COOPERATIVA SOCIALE ESEMPIO": 2}
+    # associazione senza alunno; i valori non affidabili restano quelli gia' noti (qui nessuno)
+    assocs = {a["alunno"]: a for a in reg.esporta()["associazioni"]}
+    assert set(assocs) == {"BIANCHI LUCA", None}
+    assert (assocs["BIANCHI LUCA"]["ore_pei"], assocs["BIANCHI LUCA"]["lotto"]) == (15.0, "2")
+    assert assocs[None] == {**assocs[None], "operatore": "ROSSI MARIO", "istituto": None, "lotto": None,
+                            "ore_pei": None, "ente": "COOPERATIVA SOCIALE ESEMPIO", "municipalita": "3"}
+    # stessa coppia operatore/alunno con le ore PEI ancora incerte: restano quelle note
+    reg.impara_documento(make_doc(ore_pei=51.0, incerti=["ore_pei"]))
+    assocs = {a["alunno"]: a for a in reg.esporta()["associazioni"]}
+    assert assocs["BIANCHI LUCA"]["ore_pei"] == 15.0 and assocs["BIANCHI LUCA"]["conteggio"] == 2
+    # campo corretto a mano o confermato singolarmente (non piu' segnalato): appreso
+    doc.user_edited = ["header.alunno"]
+    doc.header.alunno = "BIANCHI LUCIA"
+    doc.header.incerti = ["istituto"]
+    reg.impara_documento(doc)
+    assert counts(reg, "alunno") == {"BIANCHI LUCA": 2, "BIANCHI LUCIA": 1}
+    assert "IC 1 VERDl" not in counts(reg, "istituto")
+    assocs = {a["alunno"]: a for a in reg.esporta()["associazioni"]}
+    assert None not in assocs and assocs["BIANCHI LUCIA"]["ore_pei"] == 51.0
+
+
+def test_confirmed_misreading_is_not_spread_to_later_sheets(reg: an.Anagrafica) -> None:
+    # documento confermato con l'operatore ancora incerto (letto male)
+    confirm(reg, operatore="ESPOSlTO GIUSEPPF", incerti=["operatore"])
+    assert counts(reg, "operatore") == {} and reg.esporta()["associazioni"] == []
+    # il foglio successivo, letto bene, non viene ricondotto alla lettura errata
+    h, dec, notes = correct(reg, operatore="ESPOSITO GIUSEPPE")
+    assert h.operatore == "ESPOSITO GIUSEPPE" and "operatore" not in h.incerti and notes == []
+
+
 def test_confirmed_document_learns_header_and_association(reg: an.Anagrafica) -> None:
     doc = confirm(reg)
     data = reg.esporta()

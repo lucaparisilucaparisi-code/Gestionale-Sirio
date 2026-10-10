@@ -7,6 +7,7 @@ API stabile, usata dai test di piu' moduli::
     img, truth = make_synthetic_sheet()                      # febbraio 2026, nomi fittizi
     img, truth = make_synthetic_sheet(skew_deg=1.5, seed=3)  # pagina inclinata
     pdf_bytes = sheet_to_pdf([img])                          # PDF "scansionato" (una pagina per immagine)
+    photo = photograph(img, keystone=0.06)                   # foto di sbieco su un tavolo
 
 ``make_synthetic_sheet(data=None, seed=0, skew_deg=0.0, dpi=200, noise=True)``
 restituisce ``(immagine BGR uint8, verita)``. ``verita`` ha la stessa forma del
@@ -591,4 +592,35 @@ def sheet_to_pdf(images: list[np.ndarray], dpi: int = 200, jpeg_quality: int = 8
         doc.close()
 
 
-__all__ = ["default_data", "make_synthetic_sheet", "sheet_to_pdf"]
+def photograph(img: np.ndarray, keystone: float = 0.0, jitter: float = 0.0, seed: int = 0,
+               background: tuple[int, int, int] = (70, 90, 110), shadow: bool = False) -> np.ndarray:
+    """Foto del foglio scattata con il telefono: il foglio appoggiato su un
+    piano (``background``, BGR) con margine attorno, deformato dalla prospettiva.
+
+    ``keystone`` (frazione del formato) sposta i vertici come in una foto
+    scattata di sbieco dall'alto a sinistra; ``jitter`` aggiunge a ogni vertice
+    uno spostamento casuale fino a quella frazione (``seed``). ``shadow`` scurisce
+    gradualmente il lato sinistro. Restituisce un'immagine BGR piu' grande del
+    foglio (125% x 120%)."""
+    rng = np.random.default_rng(seed)
+    h, w = img.shape[:2]
+    out_w, out_h = int(w * 1.25), int(h * 1.2)
+    ox, oy = (out_w - w) / 2.0, (out_h - h) / 2.0
+    d = float(keystone)
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst = np.float32([[ox + d * w, oy + d * 0.5 * h], [ox + w - d * 0.3 * w, oy],
+                      [ox + w, oy + h], [ox + d * 0.2 * w, oy + h - d * 0.4 * h]])
+    if jitter:
+        dst += (rng.uniform(-jitter, jitter, (4, 2)) * np.float32([w, h])).astype(np.float32)
+    m = cv2.getPerspectiveTransform(src, dst)
+    canvas = np.empty((out_h, out_w, 3), np.uint8)
+    canvas[:] = background
+    out = cv2.warpPerspective(img, m, (out_w, out_h), dst=canvas, borderMode=cv2.BORDER_TRANSPARENT)
+    if shadow:
+        light = 0.55 + 0.45 * np.linspace(0.0, 1.0, out_w, dtype=np.float32)
+        out = out.astype(np.float32) * light[None, :, None]
+    out = out.astype(np.float32) + rng.normal(0.0, 4.0, out.shape).astype(np.float32)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+__all__ = ["default_data", "make_synthetic_sheet", "photograph", "sheet_to_pdf"]

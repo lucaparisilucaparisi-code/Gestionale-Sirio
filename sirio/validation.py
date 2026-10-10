@@ -16,6 +16,8 @@ Regole principali
   valore settimanale pieno del PEI.
 * Senza mese/anno di riferimento validi si saltano i controlli di calendario
   (giorni inesistenti, festivi, settimane) ma si eseguono tutti gli altri.
+* ``segnala_possibili_duplicati`` confronta i documenti tra loro: stesso
+  operatore, alunno, mese e anno su più fogli = possibile doppia scansione (W13).
 """
 
 from __future__ import annotations
@@ -63,6 +65,7 @@ W09_TIMBRO_REFERENTE_MANCANTE = "W09_TIMBRO_REFERENTE_MANCANTE"
 W10_TOTALE_MENSILE_ASSENTE = "W10_TOTALE_MENSILE_ASSENTE"
 W11_DOPPIA_ASSENZA = "W11_DOPPIA_ASSENZA"
 W12_ORE_NON_INDICATE = "W12_ORE_NON_INDICATE"
+W13_POSSIBILE_DUPLICATO = "W13_POSSIBILE_DUPLICATO"
 I01_ASSENZA_ALUNNO = "I01_ASSENZA_ALUNNO"
 I02_ASSENZA_OPERATORE = "I02_ASSENZA_OPERATORE"
 I03_ORARIO_DIVERSO = "I03_ORARIO_DIVERSO"
@@ -163,6 +166,12 @@ CODICI: dict[str, dict[str, str]] = {
         "gravita": "attenzione",
         "titolo": "ore non indicate",
         "descrizione": "Orario effettivo presente ma ore effettive non scritte: le ore sono calcolate dall'orario.",
+    },
+    W13_POSSIBILE_DUPLICATO: {
+        "gravita": "attenzione",
+        "titolo": "possibile foglio duplicato",
+        "descrizione": "Un altro foglio firma ha lo stesso operatore, alunno, mese e anno: verificare che non sia "
+        "lo stesso foglio scansionato due volte (le ore sarebbero conteggiate due volte).",
     },
     I01_ASSENZA_ALUNNO: {
         "gravita": "info",
@@ -1226,6 +1235,57 @@ def validate_document(doc: Document) -> Document:
             [e06], Totals(campi_incerti=incerti, campi_illeggibili=illeggibili)
         )
     return doc
+
+
+# --- Controlli tra documenti ---------------------------------------------------
+
+
+def _chiave_nome(testo: str | None) -> str:
+    """Nome confrontabile: maiuscole, senza accenti né punteggiatura, parole in ordine alfabetico."""
+    lettere = (
+        ch.upper() if ch.isalnum() else " "
+        for ch in unicodedata.normalize("NFKD", str(testo or ""))
+        if not unicodedata.combining(ch)
+    )
+    return " ".join(sorted("".join(lettere).split()))
+
+
+def _origine(doc: Document) -> str:
+    return f"«{doc.source_file}»" + (f" (pagina {doc.source_page})" if doc.page_count > 1 else "")
+
+
+def segnala_possibili_duplicati(docs: Sequence[Document]) -> None:
+    """Controllo tra documenti (W13): fogli firma con lo stesso operatore, alunno, mese e anno.
+
+    Lo stesso foglio scansionato due volte (file diversi) conterebbe due volte le ore: a ogni
+    documento del gruppo si aggiunge un'attenzione che cita gli altri fogli, aggiornando contatori
+    e stato. I documenti devono essere già validati; quelli senza operatore, alunno o periodo
+    valido non sono confrontati. Una W13 di una chiamata precedente viene sostituita.
+    """
+    gruppi: dict[tuple[str, str, int, int], list[Document]] = {}
+    for doc in docs:
+        if any(a.codice == W13_POSSIBILE_DUPLICATO for a in doc.anomalies):
+            doc.anomalies, doc.totals = _finalizza(
+                [a for a in doc.anomalies if a.codice != W13_POSSIBILE_DUPLICATO], doc.totals
+            )
+        periodo = _periodo(doc.header)
+        operatore, alunno = _chiave_nome(doc.header.operatore), _chiave_nome(doc.header.alunno)
+        if periodo is not None and operatore and alunno:
+            gruppi.setdefault((operatore, alunno, periodo.mese, periodo.anno), []).append(doc)
+    for gruppo in gruppi.values():
+        if len(gruppo) < 2:
+            continue
+        for doc in gruppo:
+            altri = [_origine(o) for o in gruppo if o is not doc]
+            w13 = _anomalia(
+                W13_POSSIBILE_DUPLICATO,
+                "Stesso operatore, alunno e mese di riferimento "
+                + ("del foglio firma di " if len(altri) == 1 else "dei fogli firma di ")
+                + ", ".join(altri)
+                + ": verificare che non sia lo stesso foglio scansionato due volte, altrimenti le ore "
+                "sono conteggiate due volte.",
+            )
+            doc.anomalies, doc.totals = _finalizza([*doc.anomalies, w13], doc.totals)
 
 
 # --- Aiuti per interfaccia ed Excel -------------------------------------------

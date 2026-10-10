@@ -127,7 +127,7 @@ def test_nomi_schede_validi_e_univoci():
     ):
         docs.append(documento(id=f"d{i}", header=Header(operatore=op, mese=2, anno=2026), source_page=i + 1))
     prepared = [ex._prepara(d, i) for i, d in enumerate(docs, start=1)]
-    usati = {s.casefold() for s in ex._FOGLI_FISSI}
+    usati = {s.casefold(): None for s in ex._FOGLI_FISSI}
     nomi = [ex._nome_scheda(d, usati) for d in prepared]
     assert nomi[:4] == ["ROSSI M. 02-2026", "ROSSI M. 02-2026 (2)", "rossi m. 02-2026 (3)", "D'ANGELO M. 02-2026"]
     assert nomi[6] == "Foglio 7 02-2026"
@@ -138,6 +138,37 @@ def test_nomi_schede_validi_e_univoci():
         assert not RE_NOME_VIETATO.search(n)
         assert not n.startswith("'") and not n.endswith("'")
         assert n.casefold() != "history"
+
+
+def test_nomi_schede_omonimi_e_suffissi_senza_troncare_il_periodo():
+    lungo = "DELLA VALLE SANTA MARIA GIOVANNA ADDOLORATA DI NAPOLI"
+    operatori = ["ROSSI MARIO", "ROSSI MARCO", "ROSSI MARIO", lungo, lungo, lungo]
+    docs = [
+        documento(id=f"o{i}", header=Header(operatore=op, mese=3, anno=2026), source_page=i + 1)
+        for i, op in enumerate(operatori)
+    ]
+    usati = {s.casefold(): None for s in ex._FOGLI_FISSI}
+    nomi = [ex._nome_scheda(ex._prepara(d, i), usati) for i, d in enumerate(docs, start=1)]
+    assert nomi == [
+        "ROSSI M. 03-2026",
+        "ROSSI MARCO 03-2026",  # operatore diverso con la stessa abbreviazione: nome per esteso
+        "ROSSI M. 03-2026 (2)",  # stesso operatore (secondo alunno): suffisso numerico
+        "DELLA V.S.M.G.A.D.N. 03-2026",
+        "DELLA V.S.M.G.A.D.N 03-2026 (2)",  # si accorcia il nome, non l'anno
+        "DELLA V.S.M.G.A.D.N 03-2026 (3)",
+    ]
+    assert all(len(n) <= 31 for n in nomi)
+
+
+def test_data_di_compilazione_con_anno_non_plausibile_resta_testo(tmp_path):
+    assert ex._data_compilazione("Napoli, 5/3/26").isoformat() == "2026-03-05"
+    assert ex._data_compilazione("Napoli, 5/3/202") is None
+    assert ex._data_compilazione("1/1/1899") is None
+    assert ex._data_compilazione("1/1/2101") is None
+    doc = documento(header=Header(operatore="ROSSI MARIO", mese=2, anno=2026, data_compilazione="Napoli, 5/3/202"))
+    ws = openpyxl.load_workbook(export_workbook([doc], tmp_path / "data.xlsx"))["ROSSI M. 02-2026"]
+    assert ws["I8"].value == "Data di compilazione"
+    assert ws["L8"].value == "Napoli, 5/3/202" and ws["L8"].data_type == "s"
 
 
 def test_apostrofo_nel_nome_della_scheda(tmp_path):
@@ -305,7 +336,8 @@ def test_totali_per_operatore_con_somma_piu_se(esempio, wb_formule, wb_valori):
     r = trova_riga(ws, 1, "ROSSI MARIO")
     intest = {c.value: c.column for c in ws[trova_riga(ws, 1, "Operatore")]}
     formula = ws.cell(row=r, column=intest["Totale ore riconosciute"]).value
-    assert formula.startswith("=SUMIFS('Dettaglio giornaliero'!")
+    # dalla tabella del Riepilogo, collegata alle schede; criterio esatto (niente caratteri jolly)
+    assert formula.startswith("=SUMIFS('Riepilogo'!$J$12:$J$15,'Riepilogo'!$B$12:$B$15,\"=\"&SUBSTITUTE(")
     rossi = [d for d in attesi.values() if d.header.operatore == "ROSSI MARIO"]
     assert wv.cell(row=r, column=intest["Totale ore riconosciute"]).value == pytest.approx(
         sum(d.totals.ore_riconosciute for d in rossi)
@@ -480,6 +512,68 @@ def test_documento_senza_mese_e_con_giorno_inesistente(tmp_path):
     assert wb["VERDI P."].cell(row=E.S_R_D1 + 1, column=E.S_OC + 1).value == 3
 
 
+def _lavorato(*giorni: int) -> list[DayRow]:
+    rows = empty_rows()
+    for g in giorni:
+        rows[g - 1] = DayRow(
+            giorno=g,
+            prog_entrata="08:00",
+            prog_uscita="11:00",
+            eff_entrata="08:00",
+            eff_uscita="11:00",
+            ore_dichiarate=3,
+            firma=True,
+        )
+    return rows
+
+
+def _foglio_completo(id_: str, file: str, operatore: str = "ROSSI MARIO", mese: int = 3, **kw) -> Document:
+    """Foglio senza rilievi (stato OK): 3 ore il 2 del mese, intestazione completa."""
+    header = {
+        "operatore": operatore,
+        "alunno": "BIANCHI LUCA",
+        "mese": mese,
+        "anno": 2026,
+        "totale_mensile_dichiarato": 3,
+        "firma_coordinatore": True,
+        "timbro_referente": True,
+        **kw,
+    }
+    return documento(id=id_, source_file=file, header=Header(**header), rows=_lavorato(2))
+
+
+def test_stesso_foglio_scansionato_due_volte_segnalato(tmp_path):
+    docs = [
+        _foglio_completo("a", "scan1.pdf"),
+        _foglio_completo("b", "scan2.pdf", operatore="Rossi  Mario"),
+        _foglio_completo("c", "scan3.pdf", mese=4),  # mese diverso: non è un duplicato
+    ]
+    prima = [d.model_dump() for d in docs]
+    wb = openpyxl.load_workbook(export_workbook(docs, tmp_path / "doppio.xlsx"), data_only=True)
+    assert [d.model_dump() for d in docs] == prima  # la segnalazione riguarda solo le copie esportate
+    riep = wb["Riepilogo"]
+    intest = {c.value: c.column for c in riep[11]}
+    righe = {riep.cell(row=r, column=intest["File di origine"]).value: r for r in range(12, 15)}
+    stato = {f: riep.cell(row=r, column=intest["Stato"]).value for f, r in righe.items()}
+    attenzioni = {f: riep.cell(row=r, column=intest["Attenzioni"]).value for f, r in righe.items()}
+    assert stato == {"scan1.pdf": "Da verificare", "scan2.pdf": "Da verificare", "scan3.pdf": "OK"}
+    assert attenzioni == {"scan1.pdf": 1, "scan2.pdf": 1, "scan3.pdf": 0}
+    an = wb["Anomalie"]
+    intest_a = {c.value: c.column for c in an[5]}
+    w13 = [
+        an.cell(row=r, column=intest_a["Descrizione"]).value
+        for r in range(6, an.max_row + 1)
+        if an.cell(row=r, column=intest_a["Codice"]).value == "W13_POSSIBILE_DUPLICATO"
+    ]
+    assert len(w13) == 2
+    assert any("«scan2.pdf»" in m for m in w13) and any("«scan1.pdf»" in m for m in w13)
+    assert schede(wb) == ["ROSSI M. 03-2026", "Rossi M. 03-2026 (2)", "ROSSI M. 04-2026"]
+    for nome, atteso in zip(schede(wb), (True, True, False)):
+        testi = [c.value for row in wb[nome].iter_rows() for c in row if isinstance(c.value, str)]
+        assert ("W13 · Possibile foglio duplicato" in testi) is atteso, nome
+    assert "W13" in [c.value for row in wb["Legenda e note"].iter_rows() for c in row]  # tra i controlli eseguiti
+
+
 def test_testo_che_inizia_con_uguale_resta_testo(tmp_path):
     rows = empty_rows()
     rows[1] = DayRow(giorno=2, note='=HYPERLINK("http://example.com","x")')
@@ -621,6 +715,76 @@ def test_libreoffice_senza_schede(tmp_path):
         documenti_esempio(), tmp_path / "compatto.xlsx", ExportOptions(fogli_per_documento=False)
     )
     _confronta_con_libreoffice(path, tmp_path)
+
+
+@requires_soffice
+def test_libreoffice_nomi_con_caratteri_jolly_e_mese_non_valido(tmp_path):
+    """Nomi con ? * ~ o = iniziale sommano solo le proprie ore; mese scritto ma non valido."""
+    docs = [
+        _foglio_completo("a", "a.pdf", operatore="ROSSI MARIO"),
+        _foglio_completo("b", "b.pdf", operatore="ROSS? MARIO"),
+        _foglio_completo("c", "c.pdf", operatore="ROSSI*"),
+        _foglio_completo("d", "d.pdf", operatore='=HYPERLINK("http://x","y")', alunno="<5 ~ANNI"),
+        _foglio_completo("e", "e.pdf", operatore="VERDI PAOLO", mese=13),
+        _foglio_completo("f", "f.pdf", operatore="NERI ANNA", mese=None, anno=None),
+    ]
+    path = export_workbook(docs, tmp_path / "jolly.xlsx")
+    ricalcolato = _confronta_con_libreoffice(path, tmp_path)
+    tot = ricalcolato["Totali per operatore"]
+    intest = {c.value: c.column for c in tot[trova_riga(tot, 1, "Operatore")]}
+    for nome in ("ROSSI MARIO", "ROSS? MARIO", "ROSSI*", '=HYPERLINK("http://x","y")'):
+        r = trova_riga(tot, 1, nome)
+        assert tot.cell(row=r, column=intest["Fogli"]).value == 1, nome
+        assert tot.cell(row=r, column=intest["Totale ore riconosciute"]).value == 3, nome
+    for nome in ("VERDI PAOLO", "NERI ANNA"):
+        r = trova_riga(tot, 1, nome)
+        assert tot.cell(row=r, column=intest["Ore mese non indicato"]).value == 3, nome
+        assert tot.cell(row=r, column=intest["Ore marzo 2026"]).value == 0, nome
+    r = trova_riga(tot, 1, "<5 ~ANNI")
+    assert tot.cell(row=r, column=intest["Totale ore riconosciute"]).value == 3
+
+
+@requires_soffice
+def test_libreoffice_correzione_nella_scheda_aggiorna_tutti_i_totali(esempio, tmp_path):
+    """Correggendo le ore in una scheda, Riepilogo e Totali per operatore restano allineati."""
+    path, _ = esempio
+    wb = openpyxl.load_workbook(path)
+    E = ex._Esportatore
+    ws = wb["DE LUCA G. 03-2026"]
+    cella = next(
+        c
+        for g in range(1, 32)
+        if isinstance((c := cella_scheda(ws, g, E.S_OD)).value, (int, float))
+        and c.value < 10
+        and cella_scheda(ws, g, E.S_AO).value is None
+    )
+    vecchio = cella.value
+    cella.value = 10
+    modificato = tmp_path / "modificato.xlsx"
+    wb.save(modificato)
+    r = openpyxl.load_workbook(_ricalcola(modificato, tmp_path), data_only=True)
+    tot_scheda = r["DE LUCA G. 03-2026"].cell(row=E.S_R_TOT + 1, column=E.S_OR + 1).value
+    riep = r["Riepilogo"]
+    intest = {c.value: c.column for c in riep[11]}
+    r_riep = trova_riga(riep, intest["Operatore"], "DE LUCA GIOVANNA")
+    assert riep.cell(row=r_riep, column=intest["Ore riconosciute"]).value == pytest.approx(tot_scheda)
+    tot = r["Totali per operatore"]
+    intest_t = {c.value: c.column for c in tot[trova_riga(tot, 1, "Operatore")]}
+    riga = trova_riga(tot, 1, "DE LUCA GIOVANNA")
+    assert tot.cell(row=riga, column=intest_t["Totale ore riconosciute"]).value == pytest.approx(tot_scheda)
+    assert tot.cell(row=riga, column=intest_t["Ore marzo 2026"]).value == pytest.approx(tot_scheda)
+    totale_riepilogo = riep.cell(row=16, column=intest["Ore riconosciute"]).value
+    righe_totale = [rr for rr in range(1, tot.max_row + 1) if tot.cell(row=rr, column=1).value == "Totale"]
+    assert len(righe_totale) == 3
+    for rr in righe_totale:  # operatore, alunno, istituto
+        assert tot.cell(row=rr, column=intest_t["Totale ore riconosciute"]).value == pytest.approx(totale_riepilogo)
+    assert tot_scheda == pytest.approx(
+        openpyxl.load_workbook(path, data_only=True)["DE LUCA G. 03-2026"]
+        .cell(row=E.S_R_TOT + 1, column=E.S_OR + 1)
+        .value
+        + 10
+        - vecchio
+    )
 
 
 # --- Foglio firma reale (facoltativo) -------------------------------------------------------

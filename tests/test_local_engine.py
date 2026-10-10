@@ -26,7 +26,7 @@ from sirio.engines.base import EngineError, PageInput
 from sirio.models import DAY_FIELDS
 from sirio.vision.grid import TableGrid, detect_grid, template_grid
 from sirio.vision.preprocess import normalize_page
-from tests.synthetic import make_synthetic_sheet
+from tests.synthetic import make_synthetic_sheet, photograph
 
 TIME_FIELDS = ("prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita")
 
@@ -57,6 +57,8 @@ class FakeRecognizer:
             row = self.truth["rows"][int(parts[1]) - 1]
             f = parts[2]
             v = row[f]
+            if v is None:                      # cella vuota nella verita': nessuna scrittura leggibile
+                return le.Reading([], "", -math.inf, 0)
             if f in TIME_FIELDS:
                 h, m = v.split(":")
                 return le.Reading([(v, -0.05)], f"{int(h)}:{m}", -0.08, 4)
@@ -460,7 +462,26 @@ def test_extract_rejects_pages_without_table():
     fake = FakeRecognizer({"header": {}, "rows": []})
     res = le.LocalEngine(recognizer=fake).extract(PageInput(blank, grid, "vuoto.png", 1), lambda *_: None)
     assert not res.is_foglio_firma and fake.calls == 0
-    assert "non sembra un foglio firma" in (res.ocr_notes or "")
+    notes = res.ocr_notes or ""
+    # il messaggio vale anche per un foglio firma fotografato male: spiega come rimediare
+    assert "non sembra un foglio firma" in notes and "foto" in notes and "scanner" in notes
+
+
+def test_extract_on_photo_taken_at_an_angle():
+    """Foto di sbieco su un tavolo: la prospettiva e' corretta e ogni valore
+    finisce nel giorno giusto (prima: dati spostati di alcuni giorni, non segnalati)."""
+    img, truth = make_synthetic_sheet(seed=0)
+    page = normalize_page(photograph(img, keystone=0.06))
+    grid = detect_grid(page)
+    fake = FakeRecognizer(truth)
+    res = le.LocalEngine(recognizer=fake).extract(PageInput(page, grid, "foto.jpg", 1), lambda *_: None)
+    assert res.is_foglio_firma
+    for t, r in zip(truth["rows"], res.rows):
+        for f in ("prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita", "ore_dichiarate",
+                  "assenza_alunno", "assenza_operatore", "firma", "note", "trattino_effettivo"):
+            assert getattr(r, f) == t[f], (t["giorno"], f, getattr(r, f), t[f])
+    assert res.header.totale_mensile_dichiarato == truth["header"]["totale_mensile_dichiarato"]
+    assert (res.header.mese, res.header.anno) == (truth["header"]["mese"], truth["header"]["anno"])
 
 
 def test_extract_with_stamp_over_notes_column():
@@ -558,6 +579,223 @@ def test_extract_reports_download_failure(monkeypatch, tmp_path):
         le.LocalEngine(cache_dir=tmp_path).extract(_page(0)[0], lambda *_: None)
 
 
+def test_download_checks_free_disk_space_first(monkeypatch, tmp_path):
+    """Disco quasi pieno: messaggio chiaro prima di scaricare (durante il download
+    hf_xet produce solo errori generici in inglese)."""
+    hub = pytest.importorskip("huggingface_hub")
+    from types import SimpleNamespace
+
+    files = [SimpleNamespace(rfilename="model.safetensors", size=1_333_384_464),
+             SimpleNamespace(rfilename="config.json", size=4_000)]
+    monkeypatch.setattr(hub.HfApi, "model_info", lambda *_a, **_k: SimpleNamespace(siblings=files, sha="abc"))
+
+    def no_download(*_a, **_k):
+        raise AssertionError("download avviato senza spazio sufficiente")
+
+    monkeypatch.setattr(hub, "snapshot_download", no_download)
+    monkeypatch.setattr(le.shutil, "disk_usage", lambda _p: SimpleNamespace(total=10**11, used=10**11, free=30e6))
+    with pytest.raises(EngineError, match="Spazio su disco insufficiente") as info:
+        le.download_model(le.DEFAULT_MODEL, tmp_path)
+    assert "1,7 GB" in str(info.value)                     # 1,33 GB + 10% + margine
+
+
+def test_disk_full_during_download_is_recognized(monkeypatch, tmp_path):
+    xet = RuntimeError("Task error: File reconstruction error: Internal Writer Error: Background writer channel "
+                       "closed")
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(le.shutil, "disk_usage", lambda _p: SimpleNamespace(total=10**11, used=10**11, free=1e6))
+    err = le._download_error(xet, le.DEFAULT_MODEL, 1340, tmp_path, 1.2e9)
+    assert "Spazio su disco insufficiente" in str(err) and "Writer" not in str(err)
+    for exc in (OSError(errno.ENOSPC, "No space left on device"),
+                RuntimeError("IO error: No space left on device (os error 28)")):
+        assert "Spazio su disco insufficiente" in str(le._download_error(exc, le.DEFAULT_MODEL, 1340))
+    # con spazio sufficiente lo stesso errore non e' attribuito al disco
+    monkeypatch.setattr(le.shutil, "disk_usage", lambda _p: SimpleNamespace(total=10**12, used=0, free=5e11))
+    assert "Spazio su disco" not in str(le._download_error(xet, le.DEFAULT_MODEL, 1340, tmp_path, 1.2e9))
+
+
+@pytest.mark.parametrize("exc", [
+    MemoryError(),
+    OSError(errno.ENOMEM, "Cannot allocate memory"),
+    RuntimeError("[enforce fail at alloc_cpu.cpp:127] err == 0. DefaultCPUAllocator: can't allocate memory: "
+                 "you tried to allocate 10000000000000 bytes. Error code 12 (Cannot allocate memory)"),
+    OSError("unable to mmap 1333384464 bytes from file </modelli/model.safetensors>: Cannot allocate memory "
+            "(os error 12)"),
+    RuntimeError("Il file di paging è troppo piccolo per completare l'operazione. (os error 1455)"),
+], ids=["MemoryError", "ENOMEM", "torch", "mmap", "windows"])
+def test_out_of_memory_is_recognized(exc):
+    assert le._is_oom(exc)
+    wrapped = ValueError("caricamento non riuscito")
+    wrapped.__cause__ = exc
+    assert le._is_oom(wrapped)
+
+
+def test_damaged_files_are_not_out_of_memory():
+    for exc in (RuntimeError("Error while deserializing header: incomplete metadata, file not fully covered"),
+                ValueError("Error while initializing BPE: EOF while parsing a value at line 1 column 0"),
+                OSError(errno.ENOENT, "No such file or directory")):
+        assert not le._is_oom(exc)
+
+
+class _RaisingRecognizer:
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+
+    def read(self, requests, progress=None):
+        raise self.exc
+
+
+def test_out_of_memory_while_reading_has_clear_message():
+    page, _truth = _page(0)
+    oom = RuntimeError("[enforce fail at alloc_cpu.cpp:127] err == 0. DefaultCPUAllocator: can't allocate memory")
+    with pytest.raises(EngineError) as info:
+        le.LocalEngine(recognizer=_RaisingRecognizer(oom)).extract(page, lambda *_: None)
+    assert str(info.value) == le.OOM_MSG and "alloc_cpu" not in str(info.value)
+
+
+def test_out_of_memory_while_loading_keeps_the_model(monkeypatch, tmp_path):
+    """Memoria insufficiente al caricamento: nessun invito a eliminare (e riscaricare) il modello."""
+    transformers = pytest.importorskip("transformers")
+    snap = _fake_snapshot(tmp_path)
+
+    def oom(*_a, **_k):
+        raise OSError(errno.ENOMEM, "Cannot allocate memory (os error 12)")
+
+    monkeypatch.setattr(transformers.TrOCRProcessor, "from_pretrained", lambda *_a, **_k: object())
+    monkeypatch.setattr(transformers.VisionEncoderDecoderModel, "from_pretrained", oom)
+    with pytest.raises(EngineError) as info:
+        le._load_recognizer(snap, le.DEFAULT_MODEL, "cpu")
+    assert str(info.value) == le.OOM_MSG and not isinstance(info.value, le.ModelDamagedError)
+
+    def no_download(*_a, **_k):
+        raise AssertionError("nessun nuovo download per mancanza di memoria")
+
+    monkeypatch.setattr(le, "_IMPORT_STATE", {"ok": True})
+    monkeypatch.setattr(le, "download_model", no_download)
+    with pytest.raises(EngineError, match="Memoria insufficiente"):
+        le.LocalEngine(cache_dir=tmp_path).extract(_page(0)[0], lambda *_: None)
+    assert snap.is_dir()
+
+
+def test_unreadable_model_files_are_reported_as_damaged(tmp_path):
+    pytest.importorskip("transformers")
+    snap = _fake_snapshot(tmp_path)              # file presenti ma non validi
+    with pytest.raises(le.ModelDamagedError) as info:
+        le._load_recognizer(snap, le.DEFAULT_MODEL, "cpu")
+    assert "{}" not in str(info.value)
+
+
+@pytest.fixture
+def _session_replacements(monkeypatch):
+    monkeypatch.setattr(le, "_REPLACED", set())
+    monkeypatch.setattr(le, "_MODELS", {})
+    monkeypatch.setattr(le, "_IMPORT_STATE", {"ok": True})
+
+
+def test_damaged_model_is_downloaded_again(monkeypatch, tmp_path, _session_replacements):
+    """Copia locale danneggiata: eliminata e scaricata di nuovo automaticamente
+    (prima: ogni documento falliva con l'errore tecnico finche' l'utente non
+    trovava ed eliminava la cartella)."""
+    snap = _fake_snapshot(tmp_path)
+    repo = snap.parent.parent
+    (snap / "model.safetensors").chmod(0o444)               # come nella cache di huggingface_hub
+    page, truth = _page(0)
+    fake = FakeRecognizer(truth)
+    loads: list[Path] = []
+    downloads: list[str | None] = []
+
+    def load(path, *_a):
+        loads.append(path)
+        if len(loads) == 1:
+            raise le.ModelDamagedError("Impossibile caricare il modello di riconoscimento offline.")
+        return fake
+
+    def download(name, cache, progress, message=None):
+        assert not repo.exists()                            # la copia danneggiata e' stata eliminata
+        downloads.append(message)
+        progress(0.5, f"{message}: 600 MB di 1.334 MB…")
+        return _fake_snapshot(cache)
+
+    monkeypatch.setattr(le, "_load_recognizer", load)
+    monkeypatch.setattr(le, "download_model", download)
+    steps: list[str] = []
+    res = le.LocalEngine(cache_dir=tmp_path).extract(page, lambda _f, m: steps.append(m))
+    assert res.is_foglio_firma and fake.calls == 1
+    assert len(loads) == 2 and downloads and "danneggiato" in downloads[0]
+    assert any("Modello danneggiato: nuovo download" in m for m in steps)
+
+
+def test_damaged_model_is_downloaded_again_only_once(monkeypatch, tmp_path, _session_replacements):
+    _fake_snapshot(tmp_path)
+    downloads: list[int] = []
+
+    def load(*_a):
+        raise le.ModelDamagedError("Impossibile caricare il modello di riconoscimento offline.")
+
+    def download(name, cache, progress, message=None):
+        downloads.append(1)
+        return _fake_snapshot(cache)
+
+    monkeypatch.setattr(le, "_load_recognizer", load)
+    monkeypatch.setattr(le, "download_model", download)
+    engine = le.LocalEngine(cache_dir=tmp_path)
+    for _ in range(3):                                      # tre documenti in coda
+        with pytest.raises(EngineError) as info:
+            engine.extract(_page(0)[0], lambda *_: None)
+        msg = str(info.value)
+        assert "danneggiato" in msg and "models--microsoft--trocr-base-handwritten" in msg
+        assert "Error while" not in msg
+    assert len(downloads) == 1
+
+
+def test_damaged_model_in_user_folder_is_not_deleted(monkeypatch, tmp_path, _session_replacements):
+    folder = tmp_path / "mio-modello"
+    folder.mkdir()
+    for name in ("config.json", "preprocessor_config.json", "model.safetensors", "vocab.json"):
+        (folder / name).write_text("{}", encoding="utf-8")
+
+    def load(*_a):
+        raise le.ModelDamagedError("Impossibile caricare il modello di riconoscimento offline.")
+
+    monkeypatch.setattr(le, "_load_recognizer", load)
+    with pytest.raises(EngineError, match="mio-modello"):
+        le.LocalEngine(model_name=str(folder), cache_dir=tmp_path / "cache").extract(_page(0)[0], lambda *_: None)
+    assert (folder / "model.safetensors").exists()
+
+
+def test_windows_dll_failure_is_explained(monkeypatch):
+    real_import = le.importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            raise OSError('[WinError 126] Impossibile trovare il modulo specificato. Error loading '
+                          '"C:\\Sirio\\.venv\\Lib\\site-packages\\torch\\lib\\c10.dll" or one of its '
+                          'dependencies.')
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(le, "_IMPORT_STATE", {})
+    monkeypatch.setattr(le.importlib, "import_module", fake_import)
+    for _ in range(2):                                      # anche dal risultato memorizzato
+        ok, msg = le.LocalEngine().is_available()
+        assert not ok and "Visual C++ Redistributable" in msg and "programma di avvio" not in msg
+
+
+def test_low_resolution_page_is_refused():
+    """Righe di circa 19 pixel (scansione a ~70 dpi): TrOCR inventerebbe valori nelle celle vuote."""
+    import cv2
+
+    img, truth = make_synthetic_sheet(seed=0)
+    small = cv2.resize(img, (img.shape[1] // 3, img.shape[0] // 3), interpolation=cv2.INTER_AREA)
+    page = normalize_page(small)
+    grid = detect_grid(page)
+    assert grid.detected and grid.row_height < le.MIN_ROW_HEIGHT
+    fake = FakeRecognizer(truth)
+    with pytest.raises(EngineError, match="almeno 150 dpi"):
+        le.LocalEngine(recognizer=fake).extract(PageInput(page, grid, "piccola.jpg", 1), lambda *_: None)
+    assert fake.calls == 0
+
+
 def test_get_engine_builds_local_engine():
     from sirio.config import Settings
     from sirio.engines.base import get_engine
@@ -623,6 +861,45 @@ def test_batched_decoding_matches_reference_search():
             best = max(free_job.finished, key=lambda f: rec._rank(f, True))
             ref = max(slow_free, key=lambda f: rec._rank(f, True))
             assert best[1] == ref[1] and abs(best[2] - ref[2]) < 1e-3
+
+
+@needs_model
+def test_fast_path_self_check_covers_cached_steps(monkeypatch):
+    """Il controllo della decodifica a lotti confronta piu' passi (cache della
+    self-attention, posizioni) e non solo il primo."""
+    pytest.importorskip("torch")
+    import torch
+
+    img, grid, _truth = _synthetic(0)
+    req = next(r for r in le.plan_page(img, grid).requests if r.key.endswith("prog_entrata"))
+    rec = _real_recognizer()
+    with torch.inference_mode():
+        enc = rec.encode([req.image])
+        assert rec._verify_fast_path(enc)
+        original = rec._step
+
+        def shifted(tokens, pos, cache, cross, row_crop):
+            # posizioni sbagliate dal secondo passo (es. cambio di API di transformers)
+            return original(tokens, pos + 1 if pos else pos, cache, cross, row_crop)
+
+        monkeypatch.setattr(rec, "_step", shifted)
+        assert not rec._verify_fast_path(enc)
+
+
+@needs_model
+def test_truncated_weights_are_reported_as_damaged(tmp_path):
+    """Pesi troncati (download interrotto, disco danneggiato): errore di "danno", non tecnico."""
+    real = le.local_model_path(le.DEFAULT_MODEL, _hf_cache())
+    snap = tmp_path / "modello"
+    snap.mkdir()
+    for f in real.iterdir():
+        if f.name != "model.safetensors":
+            (snap / f.name).write_bytes(f.read_bytes())
+    with (real / "model.safetensors").open("rb") as src:
+        (snap / "model.safetensors").write_bytes(src.read(5_000_000))
+    with pytest.raises(le.ModelDamagedError) as info:
+        le._load_recognizer(snap, le.DEFAULT_MODEL, "cpu")
+    assert "deserializ" not in str(info.value).lower()
 
 
 @needs_model

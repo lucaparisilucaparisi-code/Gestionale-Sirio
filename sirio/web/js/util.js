@@ -31,6 +31,64 @@ export const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel
 
 export function setHTML(el, content) {
   el.innerHTML = content instanceof Raw ? content.s : renderVal(content);
+  SIG.delete(el);
+}
+
+// HTML impostato per ultimo da patchHTML/patchList (per non ricreare nodi invariati)
+const SIG = new WeakMap();
+
+/** Come setHTML, ma non tocca il DOM se il contenuto non è cambiato (true se aggiornato). */
+export function patchHTML(el, content) {
+  const s = content instanceof Raw ? content.s : renderVal(content);
+  if (SIG.get(el) === s) return false;
+  el.innerHTML = s;
+  SIG.set(el, s);
+  return true;
+}
+
+/**
+ * Aggiorna un elenco (righe di tabella, schede, voci della coda): `items` contiene l'HTML di un
+ * elemento ciascuno e vengono ricreati solo gli elementi cambiati. Gli elementi invariati restano
+ * gli stessi nodi, così il fuoco della tastiera e un clic in corso non vanno persi durante gli
+ * aggiornamenti periodici.
+ */
+export function patchList(el, items) {
+  const strs = items.map(renderVal);
+  const kids = Array.from(el.children);
+  SIG.delete(el);
+  if (kids.length !== strs.length || !kids.every((k) => SIG.has(k))) {
+    el.innerHTML = strs.join('');
+    Array.from(el.children).forEach((k, i) => SIG.set(k, strs[i]));
+    return;
+  }
+  strs.forEach((s, i) => {
+    if (SIG.get(kids[i]) === s) return;
+    const t = document.createElement('template');
+    t.innerHTML = s;
+    const node = t.content.firstElementChild;
+    if (!node) return;
+    kids[i].replaceWith(node);
+    SIG.set(node, s);
+  });
+}
+
+const FOCUS_ATTRS = ['data-id', 'data-check', 'data-act', 'data-open', 'data-filter', 'data-sort', 'data-view',
+  'data-nav', 'data-reprocess', 'data-engine', 'data-tab'];
+
+/**
+ * Esegue `render` (che ricostruisce parte di `root`) e, se l'elemento con il fuoco della tastiera
+ * è stato sostituito, lo riporta sull'elemento equivalente (stessi attributi identificativi).
+ */
+export function keepFocus(root, render) {
+  const a = document.activeElement;
+  let sel = null;
+  if (a && a !== document.body && root.contains(a)) {
+    const parts = FOCUS_ATTRS.filter((k) => a.hasAttribute(k)).map((k) => `[${k}="${CSS.escape(a.getAttribute(k))}"]`);
+    if (a.id) parts.unshift(`#${CSS.escape(a.id)}`);
+    if (parts.length) sel = a.tagName.toLowerCase() + parts.join('');
+  }
+  render();
+  if (sel && !a.isConnected) root.querySelector(sel)?.focus({ preventScroll: true });
 }
 
 /** Crea un elemento da una stringa HTML. */

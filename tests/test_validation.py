@@ -606,7 +606,8 @@ def test_codice_attivato(nome, build, codice, gravita, giorno):
 
 
 def test_tutti_i_codici_hanno_un_caso_e_una_descrizione():
-    coperti = {c[2] for c in CASI_ATTIVAZIONE} | {"E06_NON_FOGLIO_FIRMA"}
+    # E06 (validate_document) e W13 (controllo tra documenti) hanno test dedicati
+    coperti = {c[2] for c in CASI_ATTIVAZIONE} | {"E06_NON_FOGLIO_FIRMA", "W13_POSSIBILE_DUPLICATO"}
     assert coperti == set(v.CODICI)
     for codice, info in v.CODICI.items():
         assert codice[0] in "EWI"
@@ -1184,6 +1185,55 @@ def test_validate_document_non_foglio_firma():
     v.validate_document(doc)
     assert doc.anomalies[0].codice == "E06_NON_FOGLIO_FIRMA"
     assert doc.totals.ore_riconosciute == 60
+
+
+# --- Controlli tra documenti ---------------------------------------------------
+
+
+def _documento(id_: str, file: str, pagine: int = 1, pagina: int = 1, **header_kw) -> Document:
+    doc = Document(
+        id=id_,
+        source_file=file,
+        page_count=pagine,
+        source_page=pagina,
+        header=make_header(**header_kw),
+        rows=mese_pulito(),
+    )
+    return v.validate_document(doc)
+
+
+def test_w13_stesso_operatore_alunno_e_mese_su_piu_fogli():
+    a = _documento("a", "scan1.pdf")
+    b = _documento("b", "scan2.pdf", operatore="Rossi  Mario", alunno="bianchi luca")  # stessa persona
+    c = _documento("c", "lotto.pdf", pagine=4, pagina=3, operatore="MARIO ROSSI")  # ordine delle parole
+    altro_mese = _documento("d", "scan3.pdf", mese=3)
+    altro_alunno = _documento("e", "scan4.pdf", alunno="VERDI ANNA")
+    senza_alunno = [_documento(f"n{i}", f"vuoto{i}.pdf", alunno=None) for i in range(2)]
+    senza_mese = [_documento(f"m{i}", f"mese{i}.pdf", mese=None) for i in range(2)]
+    docs = [a, b, c, altro_mese, altro_alunno, *senza_alunno, *senza_mese]
+    prima = {d.id: (d.totals.n_attenzioni, d.totals.stato) for d in docs}
+    v.segnala_possibili_duplicati(docs)
+    v.segnala_possibili_duplicati(docs)  # idempotente: una sola W13 per documento
+
+    for doc in (a, b, c):
+        (w13,) = trova(doc.anomalies, "W13_POSSIBILE_DUPLICATO")
+        assert w13.gravita == "attenzione" and w13.giorno is None
+        assert w13.messaggio.startswith("Stesso operatore, alunno e mese di riferimento dei fogli firma di «")
+        assert w13.messaggio.endswith(".")
+        assert doc.totals.n_attenzioni == prima[doc.id][0] + 1
+        assert doc.totals.stato == "da_verificare"
+    assert "«scan2.pdf», «lotto.pdf» (pagina 3)" in trova(a.anomalies, "W13_POSSIBILE_DUPLICATO")[0].messaggio
+    assert "«scan1.pdf»" in b.anomalies[0].messaggio and "«scan2.pdf»" not in b.anomalies[0].messaggio
+    for doc in (altro_mese, altro_alunno, *senza_alunno, *senza_mese):
+        assert not trova(doc.anomalies, "W13_POSSIBILE_DUPLICATO"), doc.id
+        assert (doc.totals.n_attenzioni, doc.totals.stato) == prima[doc.id]
+
+    # due soli fogli: messaggio al singolare; se il duplicato viene tolto, la segnalazione sparisce
+    v.segnala_possibili_duplicati([a, b])
+    assert "del foglio firma di «scan2.pdf»:" in trova(a.anomalies, "W13_POSSIBILE_DUPLICATO")[0].messaggio
+    v.segnala_possibili_duplicati([a])
+    assert not trova(a.anomalies, "W13_POSSIBILE_DUPLICATO")
+    assert (a.totals.n_attenzioni, a.totals.stato) == prima["a"] == (0, "ok")
 
 
 # --- Aiuti per interfaccia ed Excel -------------------------------------------

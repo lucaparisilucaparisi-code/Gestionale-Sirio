@@ -174,11 +174,19 @@ async function route() {
   const { name, params, query } = parseHash();
   const def = ROUTES[name];
   const token = ++app.navToken;
-  // la vista corrente può chiedere di completare il salvataggio prima di uscire
+  // la vista corrente può chiedere di completare il salvataggio prima di uscire; se restituisce
+  // false (correzioni non salvate e l'utente sceglie di restare) la navigazione viene annullata
   if (app.current?.beforeLeave) {
-    try { await app.current.beforeLeave(); } catch { /* il salvataggio segnala da sé l'errore */ }
+    let stay = false;
+    try { stay = (await app.current.beforeLeave()) === false; } catch { /* il salvataggio segnala da sé l'errore */ }
+    if (token !== app.navToken) return;
+    if (stay) {
+      if (app.hash !== undefined && location.hash !== app.hash) history.replaceState(null, '', app.hash);
+      return;
+    }
   }
   if (token !== app.navToken) return;
+  app.hash = location.hash;
   if (app.current && app.name === name && app.current.update && app.current.update(params, query) !== false) {
     return;
   }
@@ -335,7 +343,15 @@ function initLifecycle() {
   const beat = () => post('/api/heartbeat').catch(() => {});
   beat();
   setInterval(beat, 20000);
-  window.addEventListener('pagehide', () => sendBye());
+  // chiusura della finestra: la vista invia subito le modifiche non ancora salvate (prima di «bye»)
+  // e, se ce n'erano, il browser chiede conferma
+  const exitView = () => {
+    try { return !!app.current?.onExit?.(); } catch (err) { console.warn(err); return false; }
+  };
+  window.addEventListener('beforeunload', (e) => {
+    if (exitView()) { e.preventDefault(); e.returnValue = ''; }
+  });
+  window.addEventListener('pagehide', () => { exitView(); sendBye(); });
 }
 
 let offlineEl = null;

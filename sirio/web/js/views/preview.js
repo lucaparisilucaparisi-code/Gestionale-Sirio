@@ -5,7 +5,7 @@ import { downloadFile, get, post, put } from '../api.js';
 import { SheetGrid } from '../grid.js';
 import { ART, icon } from '../icons.js';
 import { refreshState, saveSettings, store } from '../state.js';
-import { emptyState, statusKey, statusLabel, toast, toastError } from '../ui.js';
+import { confirmDialog, emptyState, statusKey, statusLabel, toast, toastError } from '../ui.js';
 import {
   $, capitalize, colLetter, debounce, esc, fmtBytes, fmtDateISO, fmtDateTime, fmtOre, fmtPeriodo, fmtSigned,
   hoursBetween, html, plural, raw, setHTML, storageGet, storageSet,
@@ -26,7 +26,8 @@ export function mount(root, ctx) {
   return {
     unmount: () => v.destroy(),
     onState: (kind) => v.onState(kind),
-    beforeLeave: () => v.flush(),
+    beforeLeave: () => v.leave(),
+    onExit: () => v.onExit(),
     update: (params, query) => { v.setScope(query); return true; },
   };
 }
@@ -41,7 +42,9 @@ class Preview {
     this.ids = null;
     this.onlyVerified = false;
     this.pending = new Map();      // doc_id -> Map(giorno -> patch)
-    this.saving = null;
+    this.saving = null;            // salvataggio in corso (promessa che non fallisce: true se riuscito)
+    this.inflight = null;          // modifiche della richiesta in corso
+    this.exitSent = new Map();     // doc_id -> ultimo salvataggio inviato alla chiusura della finestra
     this.result = null;
     this.exports = [];
     this.lastRevision = null;
@@ -142,6 +145,11 @@ class Preview {
 
   onState(kind) {
     if (kind === 'settings') { this.renderOptions(); return; }
+    if (kind === 'connection') {
+      // connessione ripristinata: si reinviano le correzioni rimaste in sospeso
+      if (store.connection === 'ok' && this.pending.size && !this.saving) this.flush();
+      return;
+    }
     if (kind !== 'state') return;
     if (this.onlyVerified || this.ids) this.renderOptions();
     // aggiorna l'anteprima se i documenti sono cambiati (non durante le modifiche)
@@ -462,33 +470,91 @@ class Preview {
     this.scheduleSave();
   }
 
+  /**
+   * Salva le correzioni nei documenti. Restituisce false se qualcuna non è stata salvata: per un
+   * errore di rete o del server resta in sospeso (si reinvia con la modifica successiva, alla
+   * generazione dell'Excel o al ritorno della connessione); se il server la rifiuta viene annullata.
+   */
   async flush() {
     this.scheduleSave.cancel();
-    if (this.saving) await this.saving.catch(() => {});
-    if (!this.pending.size) return;
+    while (this.saving) await this.saving;
+    if (!this.pending.size) return true;
     const work = this.pending;
     this.pending = new Map();
-    const run = (async () => {
+    this.inflight = work;
+    const op = (async () => {
       let saved = 0;
+      let failed = 0;
       for (const [docId, byDay] of work) {
         try {
           await put(`/api/documents/${encodeURIComponent(docId)}`, { rows: Array.from(byDay.values()) });
           saved += byDay.size;
         } catch (err) {
+          failed++;
+          if (!err.status || err.status >= 500) this.requeue(docId, byDay);
           toastError(err, 'Modifica non salvata');
         }
       }
-      return saved;
-    })();
-    this.saving = run;
-    try {
-      const saved = await run;
       if (saved) toast({ type: 'success', title: 'Modifica salvata nel documento', message: 'Esito, anomalie e totali sono stati ricalcolati.', duration: 2200 });
+      return failed === 0;
+    })();
+    this.saving = op;
+    let ok;
+    try {
+      ok = await op;
     } finally {
-      this.saving = null;
+      if (this.saving === op) { this.saving = null; this.inflight = null; }
     }
     refreshState().catch(() => {});
     if (!this.pending.size) await this.load();
+    return ok;
+  }
+
+  /** Rimette in sospeso le correzioni non salvate di un documento (quelle più recenti prevalgono). */
+  requeue(docId, byDay) {
+    const merged = new Map(byDay);
+    for (const [g, patch] of this.pending.get(docId) || []) merged.set(g, { ...(byDay.get(g) || {}), ...patch });
+    this.pending.set(docId, merged);
+  }
+
+  /** Prima di lasciare l'anteprima: salva; se non riesce chiede se uscire comunque (false per restare). */
+  async leave() {
+    if (this.grid?.editing) this.grid.commitEdit({ keepOnError: false });
+    await this.flush();
+    if (!this.pending.size) return true;
+    const discard = await confirmDialog({
+      title: 'Correzioni non salvate',
+      message: 'Non è stato possibile salvare alcune correzioni dell\'anteprima. Uscendo andranno perse: restare e riprovare (per esempio con «Genera Excel»).',
+      confirmLabel: 'Esci senza salvare',
+      cancelLabel: 'Resta nell\'anteprima',
+      danger: true,
+    });
+    if (!discard) return false;
+    this.pending = new Map();
+    return true;
+  }
+
+  /** Chiusura della finestra: invia subito (richiesta keepalive) le correzioni non ancora salvate. */
+  onExit() {
+    if (this.grid?.editing) this.grid.commitEdit({ keepOnError: false });
+    this.scheduleSave.cancel();
+    const all = new Map();
+    for (const src of [this.inflight, this.pending]) {
+      for (const [docId, byDay] of src || []) {
+        const m = all.get(docId) || new Map();
+        for (const [g, patch] of byDay) m.set(g, { ...(m.get(g) || {}), ...patch });
+        all.set(docId, m);
+      }
+    }
+    for (const [docId, byDay] of all) {
+      const body = { rows: Array.from(byDay.values()) };
+      const sig = JSON.stringify(body);
+      if (this.exitSent.get(docId) === sig) continue;
+      this.exitSent.set(docId, sig);
+      put(`/api/documents/${encodeURIComponent(docId)}`, body, { keepalive: true }).catch(() => {});
+    }
+    if (this.pending.size) this.scheduleSave();
+    return all.size > 0;
   }
 
   /* ============================================================ generazione */
@@ -518,7 +584,12 @@ class Preview {
 
   async generate() {
     if (this.generating) return;
-    await this.flush();
+    // la cella in modifica fa parte dei dati da esportare (valore non valido: si resta sulla cella)
+    if (this.grid?.editing && !this.grid.commitEdit()) return;
+    if (!(await this.flush())) {
+      toast({ type: 'error', title: 'Excel non generato', message: 'Alcune correzioni non sono state salvate nei documenti: verificare il messaggio e riprovare, così il file le comprende.' });
+      return;
+    }
     const docs = this.data?.documenti || [];
     if (!docs.length) return;
     this.generating = true;

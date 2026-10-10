@@ -8,9 +8,12 @@ di ``engine.extract`` prima della validazione.
 
 Apprendimento (solo da dati affidabili, mai dalla lettura OCR grezza)
 ---------------------------------------------------------------------
-* documento confermato (``user_verified``): tutti i campi anagrafici
+* documento confermato (``user_verified``): i campi anagrafici
   dell'intestazione e l'associazione operatore → {alunno, istituto, ente,
-  lotto, municipalità, ore PEI} (un operatore può seguire più alunni);
+  lotto, municipalità, ore PEI} (un operatore può seguire più alunni); i campi
+  ancora segnalati come incerti o illeggibili non vengono appresi (la conferma
+  del documento non dice che siano stati controllati; l'associazione conserva
+  i valori già noti), salvo se corretti a mano o confermati singolarmente;
 * campo anagrafico corretto a mano (``user_edited`` contiene ``header.<campo>``):
   il nuovo valore; il valore OCR sostituito non viene appreso;
 * aggiunta manuale (``aggiungi``, ``POST /api/anagrafica``).
@@ -587,23 +590,30 @@ class Anagrafica:
         if not doc.is_foglio_firma:
             return False
         header = doc.header
-        if doc.user_verified:
-            fidati = set(CAMPI)
-        else:
-            fidati = {c for c in CAMPI if f"header.{c}" in doc.user_edited}
+
+        def fidato(campo: str) -> bool:
+            # scritto a mano, oppure documento confermato e campo non più segnalato: un valore
+            # ancora incerto o illeggibile non è stato controllato (la conferma non basta)
+            return f"header.{campo}" in doc.user_edited or (
+                doc.user_verified and campo not in header.incerti and campo not in header.illeggibili)
+
         voluti: dict[str, tuple[str, str]] = {}
-        for campo in fidati:
+        for campo in CAMPI:
+            if not fidato(campo):
+                continue
             text = pulisci(getattr(header, campo))
             if text and valido(text) and len(text) <= MAX_LUNGHEZZA:
                 voluti[campo] = (chiave(text), text)
         assoc_voluta: tuple[str, dict[str, Any]] | None = None
         operatore = voluti.get("operatore")
         if doc.user_verified and operatore:
-            valori = {c: _valore_associazione(c, getattr(header, c, None)) for c in CAMPI_ASSOCIAZIONE}
-            for c in ("alunno", "istituto", "ente"):
-                if c not in voluti:
+            # i valori non affidabili non vengono scritti: l'associazione conserva quelli già noti
+            valori = {c: _valore_associazione(c, getattr(header, c, None)) for c in CAMPI_ASSOCIAZIONE if fidato(c)}
+            for c in ("istituto", "ente"):
+                if c in valori and c not in voluti:
                     valori[c] = None
             alunno = voluti.get("alunno")
+            valori["alunno"] = alunno[1] if alunno else None      # parte della chiave dell'associazione
             assoc_voluta = (_chiave_associazione(operatore[0], alunno[0] if alunno else None),
                             {"operatore": operatore[1], **valori})
         with self._lock:
@@ -665,7 +675,8 @@ class Anagrafica:
             key, valori = voluta
             current = assoc.get(key)
             if current is None:
-                assoc[key] = {**valori, "conteggio": 1, "ultimo_uso": adesso}
+                assoc[key] = {"operatore": valori["operatore"], **dict.fromkeys(CAMPI_ASSOCIAZIONE), **valori,
+                              "conteggio": 1, "ultimo_uso": adesso}
             else:
                 current.update(valori)
                 current["conteggio"] += 1

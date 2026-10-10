@@ -876,6 +876,9 @@ button.kpi:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); bo
 .table .col-thumb { width: 54px; padding-right: 0; }
 .table .ta-r { text-align: right; }
 .table .ta-c { text-align: center; }
+.table.is-compact { min-width: 860px; }
+.status-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.status-cell .verified-tick { flex: none; }
 .thumb { display: block; width: 36px; height: 50px; max-width: none; border-radius: 6px; object-fit: cover; object-position: top; border: 1px solid var(--border); background: #fff; box-shadow: var(--shadow-xs); }
 .doc-name { font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .doc-file { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -927,6 +930,8 @@ button.kpi:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); bo
   border-radius: var(--radius-lg);
 }
 .viewer-canvas.is-panning { cursor: grabbing; }
+/* indicatore di fuoco sopra la pagina (che copre lo sfondo dell'area) */
+.viewer-canvas:focus-visible::after { content: ""; position: absolute; inset: 0; z-index: 2; border-radius: inherit; box-shadow: inset 0 0 0 2px var(--azure-500); pointer-events: none; }
 .viewer-stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; box-shadow: var(--shadow-page); background: #fff; }
 .viewer-canvas.is-panning .viewer-stage { will-change: transform; }
 .viewer-stage.is-animating { transition: transform var(--t-slow) var(--ease); }

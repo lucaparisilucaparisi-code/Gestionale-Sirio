@@ -5,7 +5,9 @@ import { ART, icon } from '../icons.js';
 import { pokePolling, refreshState, store } from '../state.js';
 import { confirmDialog, emptyState, showMenu, skeletonRows, statusBadge, statusKey, toast, toastError } from '../ui.js';
 import { pickFiles } from '../upload.js';
-import { $, $$, debounce, esc, fmtOre, fmtPeriodo, html, normalizeText, plural, raw, setHTML, storageGet, storageSet } from '../util.js';
+import {
+  $, $$, debounce, esc, fmtOre, fmtPeriodo, html, keepFocus, normalizeText, patchHTML, patchList, plural, raw, storageGet, storageSet,
+} from '../util.js';
 
 const FILTERS = [
   { id: 'tutti', label: 'Tutti', test: () => true },
@@ -17,6 +19,9 @@ const FILTERS = [
   { id: 'in_lettura', label: 'In lettura', test: (d) => d.status === 'in_coda' || d.status === 'in_lavorazione' },
   { id: 'scartati', label: 'Scartati', test: (d) => d.status === 'scartato' || (d.status === 'completato' && d.is_foglio_firma === false) },
 ];
+// sotto questa larghezza (pixel dell'area dei contenuti) la tabella usa la disposizione compatta:
+// senza miniatura e con la conferma accanto allo stato, per stare senza scorrimento orizzontale
+const COMPACT_BELOW = 1090;
 const STATUS_RANK = { errore: 0, errori: 1, da_verificare: 2, in_lavorazione: 3, in_coda: 4, ok: 5, scartato: 6 };
 const SORTS = {
   operatore: (d) => normalizeText(d.header?.operatore || d.display_name),
@@ -46,6 +51,7 @@ export function mount(root, { navigate, query }) {
     view: storageGet('sirio.docs.view', 'table'),
     selected: new Set(),
     lastVisible: [],
+    compact: false,
   };
 
   root.innerHTML = `
@@ -192,7 +198,12 @@ export function mount(root, { navigate, query }) {
     }).map((x) => x.d);
   }
 
-  function render() {
+  // gli aggiornamenti periodici (ogni secondo durante la lettura) ricreano solo le righe cambiate
+  // e riportano il fuoco della tastiera sull'elemento equivalente
+  function render() { keepFocus(root, renderNow); }
+
+  function renderNow() {
+    state.compact = root.clientWidth > 0 && root.clientWidth < COMPACT_BELOW;
     // pulizia della selezione (documenti eliminati)
     for (const id of Array.from(state.selected)) if (!store.documents.some((d) => d.id === id)) state.selected.delete(id);
     renderFilters();
@@ -204,11 +215,11 @@ export function mount(root, { navigate, query }) {
     renderBulk();
     const body = $('#docs-body', root);
     if (!store.loaded) {
-      setHTML(body, html`<div class="card table-card"><table class="table"><tbody>${skeletonRows(6, ['18px', '36px', '60%', '50%', '50%', '40%', '30%', '40%'])}</tbody></table></div>`);
+      patchHTML(body, html`<div class="card table-card"><table class="table"><tbody>${skeletonRows(6, ['18px', '36px', '60%', '50%', '50%', '40%', '30%', '40%'])}</tbody></table></div>`);
       return;
     }
     if (!store.documents.length) {
-      setHTML(body, html`<div class="card">${emptyState({
+      patchHTML(body, html`<div class="card">${emptyState({
         art: ART.documents,
         title: 'Nessun foglio firma importato',
         text: 'Importa i PDF scansionati dei fogli firma: Sirio OCR leggerà intestazione e tabella giornaliera di ogni pagina.',
@@ -217,7 +228,7 @@ export function mount(root, { navigate, query }) {
       return;
     }
     if (!list.length) {
-      setHTML(body, html`<div class="card">${emptyState({
+      patchHTML(body, html`<div class="card">${emptyState({
         art: ART.documents,
         title: 'Nessun documento corrisponde ai filtri',
         text: 'Modifica la ricerca o lo stato selezionato per vedere altri documenti.',
@@ -231,7 +242,7 @@ export function mount(root, { navigate, query }) {
 
   function renderFilters() {
     const counts = Object.fromEntries(FILTERS.map((f) => [f.id, store.documents.filter((d) => f.test(d)).length]));
-    setHTML($('#docs-filters', root), FILTERS
+    patchList($('#docs-filters', root), FILTERS
       .filter((f) => f.id === 'tutti' || counts[f.id] > 0 || f.id === state.filter || ['da_verificare', 'ok'].includes(f.id))
       .map((f) => html`<button type="button" data-filter="${f.id}" aria-pressed="${String(state.filter === f.id)}">${f.label}<span class="count">${counts[f.id]}</span></button>`));
   }
@@ -252,8 +263,8 @@ export function mount(root, { navigate, query }) {
   function renderBulk() {
     const n = state.selected.size;
     const el = $('#docs-bulk', root);
-    if (!n) { el.innerHTML = ''; return; }
-    setHTML(el, html`<div class="bulkbar" role="region" aria-label="Azioni sui documenti selezionati">
+    if (!n) { patchHTML(el, ''); return; }
+    patchHTML(el, html`<div class="bulkbar" role="region" aria-label="Azioni sui documenti selezionati">
       <span class="bulkbar-count">${plural(n, 'documento selezionato', 'documenti selezionati')}</span>
       <span class="spacer"></span>
       <button type="button" class="btn btn-sm" data-act="export">${icon('excel')}Esporta selezionati</button>
@@ -272,11 +283,16 @@ export function mount(root, { navigate, query }) {
   function renderTable(body, list) {
     const allOn = list.length > 0 && list.every((d) => state.selected.has(d.id));
     const someOn = list.some((d) => state.selected.has(d.id));
-    setHTML(body, html`<div class="card table-card"><div class="table-wrap"><table class="table">
-      <colgroup><col style="width:44px"><col style="width:54px"><col><col style="width:13%"><col style="width:13%"><col style="width:124px"><col style="width:62px"><col style="width:128px"><col style="width:124px"><col style="width:84px"><col style="width:48px"></colgroup>
-      <thead><tr>
+    const c = state.compact;
+    const cols = c
+      ? '<col style="width:44px"><col><col style="width:12%"><col style="width:12%"><col style="width:116px"><col style="width:62px"><col style="width:122px"><col style="width:150px"><col style="width:48px">'
+      : '<col style="width:44px"><col style="width:54px"><col><col style="width:13%"><col style="width:13%"><col style="width:124px"><col style="width:62px"><col style="width:128px"><col style="width:124px"><col style="width:84px"><col style="width:48px">';
+    patchHTML(body, html`<div class="card table-card"><div class="table-wrap"><table class="table${c ? ' is-compact' : ''}">
+      <colgroup>${raw(cols)}</colgroup><thead></thead><tbody></tbody></table></div></div>`);
+    const table = body.querySelector('table');
+    patchHTML(table.tHead, html`<tr>
         <th class="col-check"><label class="check" aria-label="Seleziona tutti"><input type="checkbox" data-check="__all" ${allOn ? raw('checked') : ''}><span class="check-box">${raw('<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>')}</span></label></th>
-        <th class="col-thumb"></th>
+        ${c ? '' : raw('<th class="col-thumb"></th>')}
         ${sortHead('operatore', 'Operatore')}
         ${sortHead('alunno', 'Alunno')}
         ${sortHead('istituto', 'Istituto')}
@@ -284,12 +300,11 @@ export function mount(root, { navigate, query }) {
         ${sortHead('ore', 'Ore', 'ta-r')}
         <th>Segnalazioni</th>
         ${sortHead('stato', 'Stato')}
-        <th class="ta-c">Verificato</th>
+        ${c ? '' : raw('<th class="ta-c">Verificato</th>')}
         <th style="width:52px"></th>
-      </tr></thead>
-      <tbody>${list.map((d) => tableRow(d))}</tbody>
-    </table></div></div>`);
-    const all = body.querySelector('[data-check="__all"]');
+      </tr>`);
+    patchList(table.tBodies[0], list.map((d) => tableRow(d)));
+    const all = table.querySelector('[data-check="__all"]');
     if (all) all.indeterminate = someOn && !allOn;
   }
 
@@ -298,9 +313,10 @@ export function mount(root, { navigate, query }) {
     const t = d.totals || {};
     const done = isDone(d);
     const sel = state.selected.has(d.id);
+    const tick = d.user_verified ? html`<span class="verified-tick" data-tip="Documento confermato" aria-label="Confermato">${icon('check')}</span>` : '';
     return html`<tr data-id="${d.id}" tabindex="0" class="${sel ? 'is-selected' : ''}" aria-label="${d.display_name}">
       <td class="col-check"><label class="check" aria-label="Seleziona ${d.display_name}"><input type="checkbox" data-check="${d.id}" ${sel ? raw('checked') : ''}><span class="check-box">${raw('<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>')}</span></label></td>
-      <td class="col-thumb"><img class="thumb" src="${authUrl(d.thumb_url)}" alt="" loading="lazy" width="36" height="50"></td>
+      ${state.compact ? '' : html`<td class="col-thumb"><img class="thumb" src="${authUrl(d.thumb_url)}" alt="" loading="lazy" width="36" height="50"></td>`}
       <td><div class="doc-name">${h.operatore || (d.status === 'completato' ? 'Operatore non indicato' : d.display_name)}</div>
         <div class="doc-file" title="${d.source_file}">${d.source_file}${d.page_count > 1 ? ` · pag. ${d.source_page}/${d.page_count}` : ''}</div></td>
       <td><div class="cell-clip">${h.alunno || raw('<span class="muted">—</span>')}</div></td>
@@ -308,8 +324,10 @@ export function mount(root, { navigate, query }) {
       <td style="white-space:nowrap">${h.mese ? capital(fmtPeriodo(h.mese, h.anno)) : raw('<span class="muted">—</span>')}</td>
       <td class="ta-r ore-cell">${done ? fmtOre(t.ore_riconosciute || 0) || '0' : raw('<span class="muted">—</span>')}</td>
       <td>${done ? flags(t) : (d.status === 'errore' ? html`<span class="muted cell-clip" style="display:block;max-width:180px" data-tip="${d.error || d.status_message}">${d.error || d.status_message}</span>` : '')}</td>
-      <td>${statusBadge(d)}</td>
-      <td class="ta-c">${d.user_verified ? html`<span class="verified-tick" data-tip="Documento confermato">${icon('check')}</span>` : (done ? raw('<span class="verified-empty" aria-label="Non confermato"></span>') : '')}</td>
+      ${state.compact
+        ? html`<td><div class="status-cell">${statusBadge(d)}${tick}</div></td>`
+        : html`<td>${statusBadge(d)}</td>
+      <td class="ta-c">${tick || (done ? raw('<span class="verified-empty" aria-label="Non confermato"></span>') : '')}</td>`}
       <td><div class="row-actions"><button type="button" class="btn btn-sm btn-ghost btn-icon" data-act="menu" data-id="${d.id}" aria-label="Altre azioni">${icon('more')}</button></div></td>
     </tr>`;
   }
@@ -323,7 +341,8 @@ export function mount(root, { navigate, query }) {
   }
 
   function renderCards(body, list) {
-    setHTML(body, html`<div class="doc-cards">${list.map((d) => {
+    patchHTML(body, html`<div class="doc-cards"></div>`);
+    patchList(body.firstElementChild, list.map((d) => {
       const h = d.header || {};
       const t = d.totals || {};
       const sel = state.selected.has(d.id);
@@ -340,11 +359,19 @@ export function mount(root, { navigate, query }) {
           </div>
         </div>
       </article>`;
-    })}</div>`);
+    }));
   }
+
+  // passaggio tra disposizione completa e compatta (finestra o barra laterale ridimensionate)
+  const ro = new ResizeObserver(() => {
+    const compact = root.clientWidth > 0 && root.clientWidth < COMPACT_BELOW;
+    if (compact !== state.compact) render();
+  });
+  ro.observe(root);
 
   render();
   return {
+    unmount: () => ro.disconnect(),
     onState: (kind) => { if (kind === 'state') render(); },
     update: (params, q) => {
       const st = q.get('stato');

@@ -260,6 +260,9 @@ def test_processing_and_state_polling(env: Env, png: bytes) -> None:
     assert kpi["documenti"] == 1 and kpi["completati"] == 1 and kpi["ore_totali"] > 0
     assert kpi["illeggibili"] >= 1 and kpi["da_verificare"] == 1 and kpi["costo_usd"] > 0
     assert env.client.get("/api/state?since=abc").status_code == 200
+    for since in ("²", "¹²", "-", " ", "9" * 5000):   # cifre non ASCII, valori non interi
+        r = env.client.get("/api/state", params={"since": since})
+        assert r.status_code == 200 and "documents" in r.json(), since
 
 
 def test_get_document_and_images(env: Env, png: bytes) -> None:
@@ -372,6 +375,10 @@ def test_put_tracks_edits_and_revalidates(env: Env, png: bytes) -> None:
         ({"rows": [{"giorno": 4, "ore_dichiarate": "tre ore"}]}, "Giorno 4"),
         ({"rows": [{"giorno": 40, "note": "x"}]}, "Giorno non valido"),
         ({"header": {"mese": 13}}, "Mese"),
+        ({"header": {"mese": "inf"}}, "Mese"),
+        ({"header": {"mese": "1e309"}}, "Mese"),
+        ({"header": {"anno": "inf"}}, "Anno"),
+        ({"header": {"anno": "-1e309"}}, "Anno"),
         ({"header": {"sostituzione": "forse"}}, "Sostituzione"),
         ({"rows": "tutte"}, "righe"),
     ):
@@ -621,6 +628,30 @@ def test_export_errors_are_reported(env: Env, png: bytes, monkeypatch: pytest.Mo
     assert r.status_code == 422
 
 
+def test_export_folder_that_cannot_be_created(env: Env, png: bytes, monkeypatch: pytest.MonkeyPatch,
+                                              tmp_path: Path) -> None:
+    # es. Documenti bloccata dall'accesso controllato alle cartelle o su una cartella di rete offline
+    _ensure_exporter(monkeypatch)
+    blocker = tmp_path / "file_normale"
+    blocker.write_text("x", encoding="utf-8")
+    folder = blocker / "Sirio OCR" / "Export"
+    monkeypatch.setenv("SIRIO_EXPORT_DIR", str(folder))
+    opened: list[Path] = []
+    monkeypatch.setattr(server, "open_path", lambda p: opened.append(Path(p)))
+    # le impostazioni restano disponibili (motore, chiave API) e indicano il percorso
+    r = env.client.get("/api/settings")
+    assert r.status_code == 200 and r.json()["export_dir"] == str(folder)
+    assert env.client.get("/api/exports").json() == []
+    assert env.client.get("/api/exports/report.xlsx").status_code == 404
+    env.completed_doc(png)
+    for r in (env.client.post("/api/export", json={}), env.client.post("/api/open", json={"target": "export_dir"})):
+        detail = r.json()["detail"]
+        assert r.status_code == 500 and "Errore interno" not in detail, detail
+        assert f"Impossibile creare la cartella delle esportazioni «{folder}»" in detail
+        assert "accesso controllato alle cartelle" in detail
+    assert opened == []
+
+
 def test_open_endpoint_restricted(env: Env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     opened: list[Path] = []
     monkeypatch.setattr(server, "open_path", lambda p: opened.append(Path(p)))
@@ -681,14 +712,16 @@ def test_lifecycle_rules() -> None:
     clock.t += 20
     assert lc.check() is None
     lc.bye()
-    clock.t += 8.5
+    clock.t += sirio_app.BYE_GRACE - 1
+    assert lc.check() is None
+    clock.t += 1.5
     assert lc.check() == "finestra chiusa"
 
     lc = sirio_app.Lifecycle(auto_shutdown=True, clock=clock)
     lc.window_exited()
     clock.t += 5
     lc.heartbeat()               # finestra passata a un altro processo del browser: ancora viva
-    clock.t += 9
+    clock.t += sirio_app.WINDOW_GRACE - 1
     assert lc.check() is None
     clock.t += 2
     assert lc.check() == "processo della finestra terminato"
@@ -929,13 +962,18 @@ def test_put_learns_only_trusted_values_and_corrects_next_sheets(env: Env, png: 
     assert d["ocr_originali"] == {"header.operatore": "ROSSI MARIO"}
     assert _registry_values(env, "operatore") == ["ROSSINI MARIO"]
     assert _registry_values(env, "alunno") == []
-    # conferma del documento: tutta l'intestazione e l'associazione
-    env.client.put(f"/api/documents/{doc_id}", json={"user_verified": True})
+    # conferma del documento: l'intestazione e l'associazione, tranne i campi ancora incerti
+    d = env.client.put(f"/api/documents/{doc_id}", json={"user_verified": True}).json()
+    assert d["stati_intestazione"]["ore_pei"] == "incerto"
     data = env.client.get("/api/anagrafica").json()
     assert [v["valore"] for v in data["campi"]["alunno"]] == ["BIANCHI LUCA"]
     assert [v["valore"] for v in data["campi"]["istituto"]] == ["IC 1 VERDI"]
     (assoc,) = data["associazioni"]
-    assert (assoc["operatore"], assoc["alunno"], assoc["ore_pei"]) == ("ROSSINI MARIO", "BIANCHI LUCA", 15.0)
+    assert (assoc["operatore"], assoc["alunno"], assoc["ore_pei"]) == ("ROSSINI MARIO", "BIANCHI LUCA", None)
+    # valore incerto confermato singolarmente (segnalazione tolta): ora viene appreso
+    env.client.put(f"/api/documents/{doc_id}", json={"header": {"incerti": []}})
+    (assoc,) = env.client.get("/api/anagrafica").json()["associazioni"]
+    assert assoc["ore_pei"] == 15.0
     # il foglio del mese successivo, letto male, viene ricondotto ai nomi confermati
     nxt = default_data()
     nxt["header"].update(operatore="R0SSINI MAR1O", alunno="BlANCHI LUKA")
@@ -954,6 +992,23 @@ def test_put_learns_only_trusted_values_and_corrects_next_sheets(env: Env, png: 
     assert env.client.delete("/api/documents").status_code == 200
     assert _registry_values(env, "operatore") == ["ROSSINI MARIA"]
     assert _registry_values(env, "alunno") == ["BIANCHI LUCA"]
+
+
+def test_confirmation_does_not_learn_uncertain_header_fields(env: Env, png: bytes) -> None:
+    doc_id = env.completed_doc(png)
+
+    def misread(doc) -> None:                             # lettura errata, segnalata come incerta
+        doc.header.operatore = "R0SSI MAR1O"
+        doc.header.incerti.append("operatore")
+
+    env.store.update(doc_id, misread)
+    d = env.client.put(f"/api/documents/{doc_id}", json={"user_verified": True}).json()
+    assert d["user_verified"] is True and d["stati_intestazione"]["operatore"] == "incerto"
+    assert _registry_values(env, "operatore") == [] and _registry_values(env, "alunno") == ["BIANCHI LUCA"]
+    assert env.client.get("/api/anagrafica").json()["associazioni"] == []
+    # corretto a mano: appreso
+    env.client.put(f"/api/documents/{doc_id}", json={"header": {"operatore": "ROSSI MARIO"}})
+    assert _registry_values(env, "operatore") == ["ROSSI MARIO"]
 
 
 # ==========================================================================

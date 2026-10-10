@@ -520,6 +520,55 @@ def _fit_rows(strong: list[_Line], partial: list[_Line], bands: _BandStats, col_
     return best
 
 
+def _rows_anchored(fit: dict, strong: list[_Line], h: int) -> bool:
+    """True se le 31 righe trovate stanno fra l'intestazione e la riga dei
+    totali: almeno una delle due e' al suo posto e le righe non escono dalla
+    pagina ne' dalle linee che attraversano la tabella."""
+    if not (fit["header_found"] or fit["total_found"]):
+        return False
+    rows = fit["rows"]
+    margin = 0.5 * float(fit["period"])
+    if rows[0] < -margin or rows[-1] > h + margin:
+        return False
+    ys = [ln.pos for ln in strong]
+    return not ys or (rows[0] >= min(ys) - margin and rows[-1] <= max(ys) + margin)
+
+
+MAX_ROW_SLANT = 0.35     # dislivello massimo di una riga fra i bordi della tabella (frazione della riga)
+
+
+def _row_slant(hmask: np.ndarray, col_x: list[float], period: float) -> float:
+    """Dislivello tipico (80-esimo percentile) delle linee orizzontali fra il
+    bordo sinistro e il destro della tabella, in frazioni dell'altezza di una
+    riga. Dopo il raddrizzamento e' quasi zero; se la prospettiva non e' stata
+    corretta le righe sono inclinate in modo diverso e nessuna griglia di righe
+    orizzontali puo' seguirle. 0 se le linee non bastano per misurarlo."""
+    tw = col_x[-1] - col_x[0]
+    if period <= 0 or tw <= 0:
+        return 0.0
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(hmask, connectivity=8)
+    slants: list[float] = []
+    for i in range(1, n):
+        x, y, cw, ch, _area = (int(v) for v in stats[i])
+        if cw < 0.5 * tw or x < col_x[0] - 0.05 * tw or x + cw > col_x[-1] + 0.05 * tw:
+            continue
+        ys, xs = np.nonzero(labels[y:y + ch, x:x + cw] == i)
+        counts = np.bincount(xs)
+        sums = np.bincount(xs, weights=ys.astype(np.float64))
+        cols = np.nonzero(counts)[0]
+        if cols.size < 10:
+            continue
+        # colonne attraversate da altri tratti (spessore anomalo) escluse
+        ok = counts[cols] <= 2 * float(np.median(counts[cols])) + 1
+        if int(ok.sum()) < 10:
+            continue
+        slope = float(np.polyfit(cols[ok].astype(np.float64), sums[cols][ok] / counts[cols][ok], 1)[0])
+        slants.append(abs(slope) * tw / period)
+    if len(slants) < 5:
+        return 0.0
+    return float(np.percentile(slants, 80))
+
+
 def _detect(gray: np.ndarray) -> TableGrid | None:
     H, W = gray.shape[:2]
     small, scale = resize_to_width(gray, _WORK_WIDTH)
@@ -586,6 +635,16 @@ def _detect(gray: np.ndarray) -> TableGrid | None:
     body = max(0.0, min(1.0, fit["body"]))
     score = 0.35 * m_rows + 0.25 * m_cols + 0.25 * body + 0.15 * regularity
     detected = m_rows >= 0.6 and m_cols >= 0.6 and body >= 0.35 and tw >= 0.4 * w
+    if detected and not _rows_anchored(fit, strong, h):
+        # 31 righe regolari ma ne' intestazione ne' totali al loro posto, oppure
+        # righe oltre i bordi della tabella: la serie e' quasi certamente
+        # sfalsata (foto storta), i dati finirebbero nei giorni sbagliati
+        log.info("Righe della tabella non ancorate a intestazione e totali: allineamento non affidabile")
+        detected = False
+    slant = _row_slant(hmask, col_x, float(fit["period"])) if detected else 0.0
+    if slant > MAX_ROW_SLANT:
+        log.info("Righe della tabella inclinate (%.0f%% di riga): prospettiva non corretta", 100 * slant)
+        detected = False
     if not detected:
         log.info("Tabella riconosciuta solo in parte (righe %.0f%%, colonne %.0f%%)",
                  100 * m_rows, 100 * m_cols)

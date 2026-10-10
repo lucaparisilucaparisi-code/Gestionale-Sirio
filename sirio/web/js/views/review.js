@@ -34,6 +34,18 @@ const SEV = [
   { id: 'info', label: 'Informazioni', one: 'info', icon: 'info', chip: 'is-info' },
 ];
 
+/** Unisce due richieste di salvataggio: i valori di `newer` prevalgono su quelli di `older`. */
+function mergeBody(older, newer) {
+  if (!older) return newer;
+  if (!newer) return older;
+  const rows = new Map((older.rows || []).map((r) => [r.giorno, { ...r }]));
+  for (const r of newer.rows || []) rows.set(r.giorno, { ...(rows.get(r.giorno) || {}), ...r });
+  const out = { ...older, ...newer };
+  if (rows.size) out.rows = Array.from(rows.values());
+  if (older.header || newer.header) out.header = { ...(older.header || {}), ...(newer.header || {}) };
+  return out;
+}
+
 function asOriginal(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === 'boolean') return v ? 'true' : 'false';
@@ -54,7 +66,8 @@ export function mount(root, ctx) {
   return {
     unmount: () => view.destroy(),
     onState: (kind) => view.onState(kind),
-    beforeLeave: () => view.flush(),
+    beforeLeave: () => view.leave(),
+    onExit: () => view.onExit(),
     update: (params, query) => {
       if (view.broken) return false;
       if (params[0] === view.id) { view.applyQuery(query); return true; }
@@ -72,7 +85,9 @@ class Review {
     this.doc = null;
     this.giorni = new Map();
     this.pending = { rows: new Map(), header: {}, extra: {} };
-    this.saving = null;
+    this.saving = null;            // salvataggio in corso (promessa che non fallisce: true se riuscito)
+    this.inflight = null;          // corpo della richiesta in corso
+    this.exitSent = null;          // ultimo salvataggio inviato alla chiusura della finestra
     this.saveState = 'idle';
     this.lastSaved = null;
     this.needsGridRefresh = false;
@@ -165,7 +180,7 @@ class Review {
     $('#rv-confirm', r).addEventListener('click', () => this.toggleVerified());
     $('#rv-reprocess', r).addEventListener('click', () => this.reprocess());
     $('#rv-more', r).addEventListener('click', (e) => this.moreMenu(e.currentTarget));
-    $('#rv-save', r).addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) this.flush(); });
+    $('#rv-save', r).addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) this.retry(); });
     this.initSplitter();
 
     this.viewer = new ScanViewer($('#rv-canvas', r), {
@@ -274,7 +289,11 @@ class Review {
   /* ============================================================ caricamento */
   async open(id, query) {
     if (!id) { this.ctx.navigate('#/documenti', { replace: true }); return; }
-    if (this.id && this.id !== id) await this.flush();
+    if (this.id && this.id !== id) {
+      // una cella o un campo ancora in modifica appartengono al documento che si lascia
+      this.commitOpenEdits();
+      await this.flush();
+    }
     this.id = id;
     this.doc = null;
     this.pending = { rows: new Map(), header: {}, extra: {} };
@@ -302,6 +321,8 @@ class Review {
     if (this.id !== id) return;
     this.updateMarks();
     this.applyQuery(query, true);
+    // pagina scartata o lettura non riuscita: il fuoco va sull'azione proposta nel riquadro
+    if (!this.editable() && !this.busy()) $('#rv-overlay [data-ov].btn-primary', this.root)?.focus();
   }
 
   applyQuery(query, initial = false) {
@@ -363,10 +384,21 @@ class Review {
   }
 
   editable() {
-    return !!this.doc && this.doc.status !== 'in_coda' && this.doc.status !== 'in_lavorazione';
+    // pagina scartata o lettura non riuscita: si modifica solo dopo «È un foglio firma» o «Rielabora»
+    return !!this.doc && !this.busy() && this.doc.status !== 'errore' && this.doc.status !== 'scartato'
+      && this.doc.is_foglio_firma !== false;
+  }
+
+  busy() {
+    return !!this.doc && (this.doc.status === 'in_coda' || this.doc.status === 'in_lavorazione');
   }
 
   onState(kind) {
+    if (kind === 'connection') {
+      // connessione ripristinata: si reinviano le modifiche rimaste in sospeso
+      if (store.connection === 'ok' && this.saveState === 'error' && this.hasPending() && !this.saving) this.flush();
+      return;
+    }
     if (kind !== 'state' || !this.doc) return;
     this.renderNav();
     const s = docById(this.id);
@@ -416,7 +448,7 @@ class Review {
       btn.setAttribute('data-tip', 'Segna il documento come verificato (Ctrl+Invio)');
     }
     btn.disabled = !this.editable();
-    $('#rv-reprocess', this.root).disabled = !this.editable() && d.status !== 'errore';
+    $('#rv-reprocess', this.root).disabled = this.busy();
     document.title = `${h.operatore || d.display_name} — Revisione — Sirio OCR`;
   }
 
@@ -430,13 +462,70 @@ class Review {
     if (next) next.disabled = i < 0 || i >= order.length - 1;
   }
 
-  async go(delta) {
+  go(delta) {
     const order = reviewOrder();
     const i = order.indexOf(this.id);
     const target = order[i + delta];
     if (!target) return;
-    await this.flush();
+    // valore non valido nella cella in modifica: si resta sul documento (messaggio sulla cella)
+    if (!this.commitOpenEdits({ keepOnError: true })) return;
+    // il salvataggio avviene prima del cambio di documento (beforeLeave)
     this.ctx.navigate(`#/revisione/${encodeURIComponent(target)}`);
+  }
+
+  /**
+   * Conferma la modifica ancora aperta nella griglia o in un campo dell'intestazione (prima di
+   * cambiare documento, uscire o chiudere la finestra). False se il valore non è valido.
+   */
+  commitOpenEdits({ keepOnError = false } = {}) {
+    let ok = true;
+    if (this.grid.editing) ok = this.grid.commitEdit({ keepOnError });
+    const a = document.activeElement;
+    if (a && this.hdrEl?.contains(a) && a.matches('input.input') && a.value !== (a.dataset.orig ?? '')) {
+      ok = this.onHeaderChange({ target: a }) !== false && ok;
+    }
+    return ok;
+  }
+
+  /**
+   * Prima di lasciare il documento (altro documento o altra sezione): salva le modifiche. Se il
+   * salvataggio non riesce chiede se uscire comunque; false per restare sul documento.
+   */
+  async leave() {
+    this.commitOpenEdits();
+    await this.flush();
+    if (!this.hasPending()) return true;
+    const discard = await confirmDialog({
+      title: 'Correzioni non salvate',
+      message: 'Non è stato possibile salvare le ultime correzioni di questo documento. Uscendo andranno perse: restare sul documento e usare «Riprova» per salvarle.',
+      confirmLabel: 'Esci senza salvare',
+      cancelLabel: 'Resta sul documento',
+      danger: true,
+    });
+    if (!discard) return false;
+    this.pending = { rows: new Map(), header: {}, extra: {} };
+    this.setSaveState('idle');
+    return true;
+  }
+
+  /**
+   * Chiusura della finestra: invia subito (richiesta keepalive, che sopravvive alla chiusura) le
+   * modifiche non ancora salvate. True se ce n'erano, così il browser chiede conferma.
+   */
+  onExit() {
+    this.commitOpenEdits();
+    this.scheduleSave.cancel();
+    if (!this.id) return false;
+    const body = mergeBody(this.inflight, this.pendingBody());
+    if (!body) return false;
+    const sig = JSON.stringify(body);
+    if (sig !== this.exitSent) {
+      this.exitSent = sig;
+      put(`/api/documents/${encodeURIComponent(this.id)}`, body, { keepalive: true }).catch(() => {});
+    }
+    // se la chiusura viene annullata, il salvataggio automatico riprende normalmente
+    if (this.hasPending()) this.scheduleSave();
+    return true;
   }
 
   setSaveState(state, err) {
@@ -538,7 +627,8 @@ class Review {
   /* ============================================================ modifica della griglia */
   onGridCommit(changes, meta) {
     if (!this.editable()) {
-      toast({ type: 'warning', title: 'Documento in lettura', message: 'Attendere il termine della lettura prima di modificarlo.' });
+      if (this.busy()) toast({ type: 'warning', title: 'Documento in lettura', message: 'Attendere il termine della lettura prima di modificarlo.' });
+      else toast({ type: 'warning', title: 'Documento non modificabile', message: 'Includere la pagina come foglio firma oppure rielaborarla prima di modificarne i dati.' });
       return;
     }
     for (const ch of changes) {
@@ -633,43 +723,98 @@ class Review {
   flushSoon() { this.scheduleSave.cancel(); setTimeout(() => this.flush(), 0); }
 
   async saveNow() {
-    await this.flush();
-    if (this.saveState !== 'error') toast({ type: 'success', title: 'Modifiche salvate', duration: 1800 });
+    if (await this.flush()) toast({ type: 'success', title: 'Modifiche salvate', duration: 1800 });
   }
 
-  /** Invia le modifiche in sospeso (una richiesta alla volta). */
-  async flush() {
-    this.scheduleSave.cancel();
-    if (this.saving) { await this.saving.catch(() => {}); }
-    if (!this.hasPending() || !this.id) return;
-    const id = this.id;
+  /** Corpo della richiesta di salvataggio con le modifiche in sospeso (null se non ce ne sono). */
+  pendingBody() {
+    if (!this.hasPending()) return null;
     const body = {};
-    if (this.pending.rows.size) body.rows = Array.from(this.pending.rows.values());
+    if (this.pending.rows.size) body.rows = Array.from(this.pending.rows.values(), (p) => ({ ...p }));
     if (Object.keys(this.pending.header).length) body.header = { ...this.pending.header };
     Object.assign(body, this.pending.extra);
+    return body;
+  }
+
+  /** Rimette in sospeso un salvataggio non riuscito (le modifiche fatte nel frattempo prevalgono). */
+  requeue(body) {
+    const merged = mergeBody(body, this.pendingBody());
+    const extra = {};
+    for (const key of ['is_foglio_firma', 'user_verified']) if (key in merged) extra[key] = merged[key];
+    this.pending = {
+      rows: new Map((merged.rows || []).map((r) => [r.giorno, r])),
+      header: { ...(merged.header || {}) },
+      extra,
+    };
+  }
+
+  /**
+   * Invia le modifiche in sospeso (una richiesta alla volta). Restituisce false se il salvataggio
+   * non è riuscito: per un errore di rete o del server le modifiche restano in sospeso (pulsante
+   * «Riprova» e salvataggio successivo); se il server le rifiuta (per esempio documento rimesso
+   * in lettura) vengono annullate e si ricaricano i dati salvati.
+   */
+  async flush() {
+    this.scheduleSave.cancel();
+    while (this.saving) await this.saving;
+    const body = this.pendingBody();
+    if (!body || !this.id) return true;
+    const id = this.id;
     this.pending = { rows: new Map(), header: {}, extra: {} };
-    this.setSaveState('saving');
-    this.saving = put(`/api/documents/${encodeURIComponent(id)}`, body);
+    this.inflight = body;
+    const op = this.save(id, body);
+    this.saving = op;
     try {
-      const data = await this.saving;
-      this.saving = null;
-      if (this.id !== id) return;
+      return await op;
+    } finally {
+      if (this.saving === op) { this.saving = null; this.inflight = null; }
+    }
+  }
+
+  async save(id, body) {
+    this.setSaveState('saving');
+    try {
+      const data = await put(`/api/documents/${encodeURIComponent(id)}`, body);
+      if (this.id !== id) return true;
       this.lastSaved = new Date();
       this.setDoc(data);
       this.setSaveState(this.hasPending() ? 'dirty' : 'saved');
       refreshState().catch(() => {});
       if (this.hasPending()) this.scheduleSave();
+      return true;
     } catch (err) {
-      this.saving = null;
-      if (this.id !== id) return;
-      this.setSaveState('error', err);
-      toastError(err, 'Modifica non salvata');
-      // riallinea con il server (le modifiche rifiutate vengono annullate)
-      try {
-        const data = await get(`/api/documents/${encodeURIComponent(id)}`);
-        if (this.id === id) this.setDoc(data);
-      } catch { /* resta lo stato di errore */ }
+      if (this.id !== id) { toastError(err, 'Modifica non salvata'); return false; }
+      if (!err.status || err.status >= 500) {
+        // rete assente o errore interno: le modifiche restano in sospeso e si possono reinviare
+        this.requeue(body);
+        this.setSaveState('error', err);
+        toastError(err, 'Modifica non salvata');
+        return false;
+      }
+      // modifica rifiutata dal server: si annulla e si mostrano i dati salvati
+      toastError(err, err.status === 409 ? 'Modifica annullata' : 'Modifica non salvata');
+      await this.reload(id);
+      return false;
     }
+  }
+
+  /** Ricarica il documento dal server (le modifiche ancora in sospeso vengono riapplicate). */
+  async reload(id = this.id) {
+    try {
+      const data = await get(`/api/documents/${encodeURIComponent(id)}`);
+      if (this.id !== id) return;
+      this.setDoc(data);
+      this.setSaveState(this.hasPending() ? 'dirty' : 'idle');
+      if (this.hasPending()) this.scheduleSave();
+    } catch (err) {
+      if (this.id === id) this.setSaveState('error', err);
+    }
+  }
+
+  /** Pulsante «Riprova»: reinvia le modifiche in sospeso o, se non ce ne sono, riallinea i dati. */
+  retry() {
+    if (this.hasPending()) this.flush();
+    else this.reload();
   }
 
   /* ============================================================ intestazione */
@@ -696,8 +841,11 @@ class Review {
     if (flagged.some((k) => HEADER_MORE.has(k))) this.hdrMore = true;
     const active = document.activeElement;
     const focusedKey = this.hdrEl.contains(active) ? active.dataset.key : null;
-    // testo che l'utente sta digitando (non ancora confermato): va conservato
-    const typing = focusedKey && active.matches('input.input') && active.value !== (active.dataset.orig ?? '')
+    // testo che l'utente sta digitando (non ancora confermato): va conservato, ma solo se il
+    // documento è lo stesso (non va mai riportato nel campo di un altro documento)
+    const sameDoc = this.hdrDocId === d.id;
+    this.hdrDocId = d.id;
+    const typing = sameDoc && focusedKey && active.matches('input.input') && active.value !== (active.dataset.orig ?? '')
       ? { value: active.value, start: active.selectionStart, end: active.selectionEnd } : null;
     const ro = !this.editable();
     const label = (key) => {
@@ -833,14 +981,14 @@ class Review {
       if (!t) value = null;
       else if (/^\d{2}$/.test(t)) value = 2000 + Number(t);
       else if (/^\d{4}$/.test(t) && Number(t) >= 2000 && Number(t) <= 2100) value = Number(t);
-      else { this.headerError(el, 'Anno non valido: indicare quattro cifre, ad esempio 2026.'); return; }
+      else { this.headerError(el, 'Anno non valido: indicare quattro cifre, ad esempio 2026.'); return false; }
     } else if (kind === 'hours') {
       const p = parseHours(el.value, key === 'ore_pei' ? 60 : 744);
-      if (!p.ok) { this.headerError(el, p.error); return; }
+      if (!p.ok) { this.headerError(el, p.error); return false; }
       value = p.value;
     } else {
       const t = el.value.replace(/\s+/g, ' ').trim();
-      if (t.length > 200) { this.headerError(el, 'Testo troppo lungo (massimo 200 caratteri).'); return; }
+      if (t.length > 200) { this.headerError(el, 'Testo troppo lungo (massimo 200 caratteri).'); return false; }
       value = t || null;
     }
     this.pending.header[key] = value;
@@ -850,6 +998,7 @@ class Review {
     this.renderTotals();
     this.renderFlags();
     if (key === 'mese' || key === 'anno' || key === 'totale_mensile_dichiarato') this.flushSoon();
+    return true;
   }
 
   headerError(el, message) {
@@ -1108,7 +1257,7 @@ class Review {
 
   async setFoglioFirma(value) {
     this.pending.extra.is_foglio_firma = value;
-    await this.flush();
+    if (!(await this.flush())) return;
     toast({ type: 'success', title: value ? 'Documento incluso' : 'Documento escluso', message: value ? 'La pagina verrà inclusa nell\'Excel.' : 'La pagina non verrà inclusa nell\'Excel.', duration: 3000 });
   }
 
@@ -1137,8 +1286,7 @@ class Review {
     this.pending.extra.user_verified = verify;
     this.doc.user_verified = verify;
     this.renderTitle();
-    await this.flush();
-    if (this.saveState === 'error') return;
+    if (!(await this.flush())) return;
     loadRegistry(true);
     if (verify) {
       const next = this.nextToVerify();
@@ -1255,7 +1403,7 @@ class Review {
     const ctrl = e.ctrlKey || e.metaKey;
     if (e.altKey && !ctrl && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
       e.preventDefault();
-      this.go(e.key === 'ArrowLeft' ? -1 : 1);
+      this.go(e.key === 'ArrowLeft' ? -1 : 1);   // conferma prima la cella o il campo in modifica
       return;
     }
     if (e.key === 'F8') {

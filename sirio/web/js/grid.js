@@ -528,7 +528,17 @@ export class SheetGrid {
       case 'ArrowDown': e.preventDefault(); this.move(1, 0); return;
       case 'ArrowLeft': e.preventDefault(); this.move(0, -1); return;
       case 'ArrowRight': e.preventDefault(); this.move(0, 1); return;
-      case 'Tab': e.preventDefault(); this.move(0, e.shiftKey ? -1 : 1, { wrap: true }); return;
+      case 'Tab': {
+        // dall'ultima cella (o dalla prima con Maiusc) Tab porta il fuoco fuori dalla griglia
+        const { r: ar, c: ac } = this.active;
+        const atEdge = e.shiftKey
+          ? ar === 0 && ac <= this.firstSelectable()
+          : ar === this.rows.length - 1 && ac >= this.lastSelectable();
+        if (atEdge) return;
+        e.preventDefault();
+        this.move(0, e.shiftKey ? -1 : 1, { wrap: true });
+        return;
+      }
       case 'Home': e.preventDefault(); this.select(this.active.r, this.firstSelectable()); return;
       case 'End': e.preventDefault(); this.select(this.active.r, this.lastSelectable()); return;
       case 'PageDown': e.preventDefault(); this.move(Math.max(1, Math.floor(this.host.clientHeight / this.rowH) - 2), 0); return;
