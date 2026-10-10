@@ -73,6 +73,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from sirio import config
+from sirio.fsutil import replace_with_retry
 from sirio.models import Document, ExtractionResult, Header
 
 log = logging.getLogger(__name__)
@@ -467,7 +468,7 @@ class Anagrafica:
     def _metti_da_parte(self) -> None:
         try:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            os.replace(self.path, self.path.with_name(f"{self.path.name}.illeggibile-{stamp}"))
+            replace_with_retry(self.path, self.path.with_name(f"{self.path.name}.illeggibile-{stamp}"))
         except OSError:
             pass
 
@@ -478,7 +479,7 @@ class Anagrafica:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
-            os.replace(tmp, self.path)
+            replace_with_retry(tmp, self.path)
         except BaseException:
             try:
                 os.unlink(tmp)

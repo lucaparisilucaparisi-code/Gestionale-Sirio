@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import types
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -153,13 +154,38 @@ def test_host_header_must_be_local(env: Env) -> None:
         assert env.client.get("/api/health", headers={"Host": host}).status_code == 200, host
 
 
+def test_index_without_launch_secret_gives_no_token(env: Env) -> None:
+    """Un altro utente dello stesso computer raggiunge 127.0.0.1 ma senza ?k= né cookie non
+    riceve il token: solo una pagina che invita ad aprire Sirio OCR dal collegamento."""
+    for client, path in (
+        (env.anon, "/"), (env.anon, "/index.html"), (env.anon, "/?k=sbagliato"), (env.anon, "/?k="),
+        (env.anon, f"/?t={TOKEN[:-1]}"), (env.client, "/"),   # l'header delle API non basta per la pagina
+        (TestClient(env.app, base_url=BASE, cookies={server.TOKEN_COOKIE: "scaduto"}), "/"),
+    ):
+        r = client.get(path)
+        assert r.status_code == 403, path
+        assert TOKEN not in r.text and "__SIRIO_TOKEN__" not in r.text and "sirio-token" not in r.text
+        assert "Per motivi di sicurezza apri Sirio OCR dal collegamento sul desktop" in r.text
+        assert "«Avvia Sirio OCR»" in r.text and r.headers["content-type"].startswith("text/html")
+        assert r.headers["cache-control"] == "no-store" and "set-cookie" not in r.headers
+    assert env.anon.get("/api/state").status_code == 403
+    # i file statici restano pubblici (non contengono segreti)
+    assert env.anon.get("/static/styles.css").status_code == 200
+    assert TOKEN not in env.anon.get("/static/index.html").text
+
+
 def test_index_injects_token_and_sets_cookie(env: Env) -> None:
-    r = env.anon.get("/")
+    r = env.anon.get(f"/?k={TOKEN}")
     assert r.status_code == 200
     assert f'content="{TOKEN}"' in r.text and "__SIRIO_TOKEN__" not in r.text
     assert r.headers["cache-control"] == "no-store"
     cookie = r.headers["set-cookie"].lower()
     assert "httponly" in cookie and "samesite=strict" in cookie
+    # ricaricamento della pagina (indirizzo ormai senza ?k=): basta il cookie di sessione
+    r = env.anon.get("/")
+    assert r.status_code == 200 and f'content="{TOKEN}"' in r.text
+    with_cookie = TestClient(env.app, base_url=BASE, cookies={server.TOKEN_COOKIE: TOKEN})
+    assert f'content="{TOKEN}"' in with_cookie.get("/index.html").text
     # il cookie vale per le letture (immagini, download) e per heartbeat/bye...
     assert env.anon.get("/api/state").status_code == 200
     assert env.anon.post("/api/heartbeat").status_code == 200
@@ -388,6 +414,35 @@ def test_put_tracks_edits_and_revalidates(env: Env, png: bytes) -> None:
     assert env.client.put("/api/documents/000000000000", json={}).status_code == 404
 
 
+def test_put_header_hours_above_24(env: Env, png: bytes) -> None:
+    """Totale mensile (fino a 744) e ore PEI (fino a 60) superano le 24 ore di un giorno."""
+    doc_id = env.completed_doc(png)
+    for payload, campo, atteso in (
+        ({"totale_mensile_dichiarato": "49,5"}, "totale_mensile_dichiarato", 49.5),
+        ({"totale_mensile_dichiarato": 52}, "totale_mensile_dichiarato", 52.0),
+        ({"totale_mensile_dichiarato": "744"}, "totale_mensile_dichiarato", 744.0),
+        ({"ore_pei": 30}, "ore_pei", 30.0),
+        ({"ore_pei": "25,5"}, "ore_pei", 25.5),
+    ):
+        r = env.client.put(f"/api/documents/{doc_id}", json={"header": payload})
+        assert r.status_code == 200, (payload, r.text)
+        d = r.json()
+        assert d["header"][campo] == atteso
+        assert getattr(env.store.get(doc_id).header, campo) == atteso
+    assert {"header.totale_mensile_dichiarato", "header.ore_pei"} <= set(d["user_edited"])
+    assert d["totals"]["totale_mensile_dichiarato"] == 744.0
+    saved = env.store.get(doc_id)
+    for payload, needle in (
+        ({"header": {"totale_mensile_dichiarato": "745"}}, "tra 0 e 744"),
+        ({"header": {"ore_pei": 61}}, "tra 0 e 60"),
+        ({"header": {"ore_pei": "trenta"}}, "Ore da PEI"),
+        ({"rows": [{"giorno": 4, "ore_dichiarate": "25"}]}, "tra 0 e 24"),   # un giorno: massimo 24
+    ):
+        r = env.client.put(f"/api/documents/{doc_id}", json=payload)
+        assert r.status_code == 422 and needle in r.json()["detail"], (payload, r.text)
+    assert env.store.get(doc_id).header == saved.header and env.store.get(doc_id).rows == saved.rows
+
+
 def test_put_rejected_while_processing_and_manual_classification(env: Env, png: bytes) -> None:
     env.engine.delay = 1.0
     r = env.upload(("foglio.png", png))
@@ -436,6 +491,60 @@ def test_preview(env: Env, png: bytes) -> None:
     assert any(a["codice"] == "E05_CAMPO_ILLEGGIBILE" for a in p["anomalie"])
     full = env.client.get("/api/preview?giorni_vuoti=true").json()
     assert len(full["dettaglio"]) == 28
+
+
+def test_possible_duplicates_flagged_on_the_fly(env: Env, png: bytes, pdf: bytes) -> None:
+    """Stesso operatore, alunno e mese in due file diversi: W13 visibile nell'app prima dell'export."""
+    w13 = "W13_POSSIBILE_DUPLICATO"
+
+    def codici(d: dict) -> list[str]:
+        return [a["codice"] for a in d["anomalies"]]
+
+    env.engine.flags = False   # fogli senza segnalazioni: lo stato dipende solo dalla W13
+    a = env.completed_doc(png)
+    assert w13 not in codici(env.doc(a)) and env.doc(a)["totals"]["stato"] == "ok"
+    assert env.client.get("/api/state").json()["kpi"]["possibili_duplicati"] == 0
+    b = env.upload(("seconda_scansione.pdf", pdf)).json()["documents"][0]["id"]
+    env.wait_status(b)
+
+    # dettaglio del documento: attenzione che cita l'altro file, stato «da verificare»
+    for doc_id, altro in ((a, "«seconda_scansione.pdf»"), (b, "«foglio.png»")):
+        d = env.doc(doc_id)
+        (anomalia,) = [x for x in d["anomalies"] if x["codice"] == w13]
+        assert anomalia["gravita"] == "attenzione" and altro in anomalia["messaggio"]
+        assert d["totals"]["stato"] == "da_verificare" and d["totals"]["n_attenzioni"] == 1
+    # riepiloghi e indicatori della dashboard
+    st = env.client.get("/api/state").json()
+    assert st["kpi"]["possibili_duplicati"] == 2 and st["kpi"]["da_verificare"] == 2
+    assert [x["totals"]["stato"] for x in st["documents"]] == ["da_verificare", "da_verificare"]
+    assert [x["totals"]["n_attenzioni"] for x in st["documents"]] == [1, 1]
+    assert {x["totals"]["stato"] for x in env.client.get("/api/documents").json()} == {"da_verificare"}
+    # anteprima dell'Excel: come nel file, la W13 riguarda solo i documenti esportati insieme
+    p = env.client.get("/api/preview").json()
+    assert sorted(x["doc_id"] for x in p["anomalie"] if x["codice"] == w13) == sorted([a, b])
+    assert p["kpi"]["possibili_duplicati"] == 2
+    assert {x["totals"]["stato"] for x in p["documenti"]} == {"da_verificare"}
+    p = env.client.get(f"/api/preview?ids={a}").json()
+    assert not [x for x in p["anomalie"] if x["codice"] == w13] and p["documenti"][0]["totals"]["stato"] == "ok"
+
+    # calcolata al volo: mai salvata nei dati del documento, nemmeno dopo una modifica
+    d = env.client.put(f"/api/documents/{a}", json={"rows": [{"giorno": 3, "note": "VERIFICATO"}]}).json()
+    assert w13 in codici(d)
+    for doc_id in (a, b):
+        assert w13 not in [x.codice for x in env.store.get(doc_id).anomalies]
+        assert w13 not in (env.store.root / doc_id / "doc.json").read_text(encoding="utf-8")
+    # una correzione che distingue i due fogli fa sparire la segnalazione (e la ripristina)
+    env.client.put(f"/api/documents/{b}", json={"header": {"mese": 3}})
+    assert w13 not in codici(env.doc(a))
+    assert env.client.get("/api/state").json()["kpi"]["possibili_duplicati"] == 0
+    env.client.put(f"/api/documents/{b}", json={"header": {"mese": 2}})
+    assert w13 in codici(env.doc(a))
+    # eliminato uno dei due fogli, l'altro torna senza segnalazione
+    assert env.client.delete(f"/api/documents/{b}").status_code == 200
+    d = env.doc(a)
+    assert w13 not in codici(d) and d["totals"]["n_attenzioni"] == 0
+    st = env.client.get("/api/state").json()
+    assert st["kpi"]["possibili_duplicati"] == 0 and st["documents"][0]["totals"]["stato"] == "ok"
 
 
 # ==========================================================================
@@ -584,8 +693,8 @@ def test_export_download_and_listing(env: Env, png: bytes, monkeypatch: pytest.M
     dl = env.client.get(out["url"])
     assert dl.status_code == 200 and dl.content[:2] == b"PK"
     assert "attachment" in dl.headers["content-disposition"]
-    # il download funziona anche con il solo cookie (link nella pagina)
-    env.anon.get("/")
+    # il download funziona anche con il solo cookie (link nella pagina aperta dall'avvio)
+    env.anon.get(f"/?k={TOKEN}")
     assert env.anon.get(out["url"]).status_code == 200
 
 
@@ -784,6 +893,66 @@ def test_open_window_launches_app_mode(tmp_path: Path, monkeypatch: pytest.Monke
     assert (tmp_path / "finestra").is_dir()
 
 
+def test_window_url_carries_launch_secret(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert sirio_app.instance_url(5000) == "http://127.0.0.1:5000/"
+    assert sirio_app.instance_url(5000, "a-b_C") == "http://127.0.0.1:5000/?k=a-b_C"
+    assert sirio_app._without_secret("http://127.0.0.1:5000/?k=segreto") == "http://127.0.0.1:5000/?k=…"
+    # seconda istanza: la finestra verso l'istanza attiva usa il segreto letto da istanza.json
+    monkeypatch.setenv("SIRIO_DATA_DIR", str(tmp_path / "dati"))
+    opened: list[str] = []
+    monkeypatch.setattr(sirio_app, "open_window", lambda url, _profile: opened.append(url))
+    assert sirio_app._delegate_to({"port": 5000, "pid": 1, "token": "segreto"}, True) == 0
+    assert sirio_app._delegate_to({"port": 5000, "pid": 1}, True) == 0     # istanza di una versione precedente
+    assert opened == ["http://127.0.0.1:5000/?k=segreto", "http://127.0.0.1:5000/"]
+    # browser predefinito (nessun Edge/Chrome): stesso indirizzo, segreto mai scritto nel registro
+    monkeypatch.undo()
+    monkeypatch.setattr(sirio_app, "find_browser", lambda: None)
+    monkeypatch.setattr(sirio_app.webbrowser, "open", lambda url, new=0: opened.append(url) or True)
+    assert sirio_app.open_window("http://127.0.0.1:5000/?k=segreto", tmp_path / "f") is None
+    assert opened[-1] == "http://127.0.0.1:5000/?k=segreto"
+
+
+def test_main_opens_window_with_launch_secret(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L'avvio apre la finestra su /?k=<token>: solo quell'indirizzo (o il cookie) dà il token."""
+    data = tmp_path / "dati"
+    monkeypatch.setenv("SIRIO_DATA_DIR", str(data))
+    monkeypatch.setenv("SIRIO_EXPORT_DIR", str(tmp_path / "export"))
+    monkeypatch.setattr(sirio_app, "setup_logging", lambda *_a, **_k: None)       # nessun hook globale
+    monkeypatch.setattr(sirio_app, "_install_signal_handlers", lambda _lc: None)
+    errors: list[str] = []
+    monkeypatch.setattr(sirio_app, "show_error", errors.append)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    seen: list[str] = []
+
+    def fake_open_window(url: str, _profile: Path) -> None:
+        seen.append(url)
+        info = json.loads((data / "istanza.json").read_text(encoding="utf-8"))
+        port, token = info["port"], info["token"]
+        assert url == f"http://127.0.0.1:{port}/?k={token}"
+        assert info["url"] == f"http://127.0.0.1:{port}/"          # il file dell'istanza resta senza segreto
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            opener.open(f"http://127.0.0.1:{port}/", timeout=10)
+        assert exc.value.code == 403 and token not in exc.value.read().decode("utf-8")
+        with opener.open(url, timeout=10) as resp:
+            assert f'content="{token}"' in resp.read().decode("utf-8")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/shutdown", data=b"", method="POST",
+                                     headers={"X-Sirio-Token": token})
+        with opener.open(req, timeout=10) as resp:
+            assert json.loads(resp.read()) == {"ok": True}
+        return None
+
+    # importazione interrotta da una chiusura precedente: ripresa all'avvio, pagine messe in coda
+    resumed: list[Callable] = []
+    monkeypatch.setattr(DocumentStore, "pending_imports", lambda _self: ["lotto.pdf"])
+    monkeypatch.setattr(DocumentStore, "resume_pending_imports",
+                        lambda _self, on_document=None: resumed.append(on_document) or [])
+    monkeypatch.setattr(sirio_app, "open_window", fake_open_window)
+    assert sirio_app.main([]) == 0, errors
+    assert len(seen) == 1 and not errors
+    assert len(resumed) == 1 and callable(resumed[0])
+    assert not (data / "istanza.json").exists()
+
+
 def test_instance_lock_is_exclusive(tmp_path: Path) -> None:
     a = sirio_app.InstanceLock(tmp_path / "istanza.lock")
     b = sirio_app.InstanceLock(tmp_path / "istanza.lock")
@@ -901,10 +1070,12 @@ def test_dev_server_runs(tmp_path: Path) -> None:
     finally:
         proc.terminate()
         try:
-            proc.communicate(timeout=20)
+            out, _ = proc.communicate(timeout=20)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.communicate()
+            out, _ = proc.communicate()
+    # indirizzo da aprire nel browser: con il segreto dell'avvio, senza il quale la pagina non ha il token
+    assert f"su http://127.0.0.1:{port}/?k=sviluppo" in out, out
 
 
 # ==========================================================================

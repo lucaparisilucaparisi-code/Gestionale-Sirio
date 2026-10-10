@@ -198,6 +198,20 @@ def test_parse_hours_non_valido(valore):
     assert v.parse_hours(valore) is None
 
 
+def test_parse_hours_massimo_per_i_campi_d_intestazione():
+    # totale mensile (fino a 744 ore) e ore PEI settimanali (fino a 60) superano le 24 ore
+    assert v.parse_hours("49,5", massimo=v.MAX_ORE_CAMPO["totale_mensile_dichiarato"]) == pytest.approx(49.5)
+    assert v.parse_hours(52, massimo=744) == pytest.approx(52.0)
+    assert v.parse_hours("744", massimo=744) == pytest.approx(744.0)
+    assert v.parse_hours("49:30", massimo=744) == pytest.approx(49.5)
+    assert v.parse_hours("30", massimo=v.MAX_ORE_CAMPO["ore_pei"]) == pytest.approx(30.0)
+    assert v.parse_hours("745", massimo=744) is None
+    assert v.parse_hours(61, massimo=60) is None
+    # le ore di un giorno restano limitate a 24
+    assert v.MAX_ORE_CAMPO["ore_dichiarate"] == 24
+    assert v.parse_hours("49,5") is None and v.parse_hours(30) is None
+
+
 @pytest.mark.parametrize(
     "a, b, atteso",
     [

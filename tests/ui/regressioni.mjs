@@ -11,7 +11,9 @@
 //   7. indicatore di fuoco sulla scansione;
 //   8. tabella dei documenti senza scorrimento orizzontale a 1366 e 1280 pixel;
 //   9. passaggio a Claude Vision solo dopo una conferma; nessun costo in Dashboard
-//      con il motore locale.
+//      con il motore locale;
+//  10. stesso foglio firma importato due volte (file diversi): «possibile duplicato» già nella
+//      Dashboard e nelle anomalie della revisione, e sparisce eliminando la copia.
 //
 //   NODE_PATH=/opt/node22/lib/node_modules node tests/ui/regressioni.mjs
 
@@ -366,6 +368,33 @@ try {
     check(await page.evaluate(() => document.activeElement?.dataset?.nav === '#/documenti'), 'Dashboard: l\'indicatore con il fuoco lo mantiene');
     await page.close();
     await waitIdle(server, { min: 1, timeout: 60000 });
+  });
+
+  await section('10. Possibile foglio duplicato', async () => {
+    // la stessa pagina con un altro contenuto binario (sha256 diverso) e lo stesso nome: per il
+    // motore finto è lo stesso foglio (stesso operatore, alunno e mese)
+    const orig = (await api(server, '/api/state')).documents.find((d) => isFF(d) && /\.jpe?g$/i.test(d.source_file));
+    if (!orig) { console.log('  – nessun foglio JPEG: verifica saltata'); return; }
+    const jpeg = await (await fetch(new URL(`/api/documents/${orig.id}/image?max=1600`, server.base), { headers: { 'X-Sirio-Token': server.token } })).arrayBuffer();
+    const form = new FormData();
+    form.append('files', new Blob([jpeg], { type: 'image/jpeg' }), orig.source_file);
+    const res = await fetch(new URL('/api/upload', server.base), { method: 'POST', headers: { 'X-Sirio-Token': server.token }, body: form });
+    const copy = (await res.json()).documents?.[0];
+    check(res.ok && copy && copy.id !== orig.id, 'seconda scansione dello stesso foglio importata come nuovo documento');
+    await waitIdle(server, { min: 1, timeout: 60000 });
+    const page = await newPage(ctx);
+    await page.goto(`${server.url}#/dashboard`);
+    await until(async () => (await page.locator('.kpi', { hasText: 'Da verificare' }).textContent()).includes('2 possibili duplicati'),
+      'Dashboard: «Da verificare» indica i 2 possibili duplicati');
+    await openReview(page, orig.id);
+    const anoms = async () => (await page.locator('#rv-anoms, .anoms-list').first().textContent()) || '';
+    check(/W13_POSSIBILE_DUPLICATO/.test(await anoms()) && (await anoms()).includes(orig.source_file),
+      'revisione: anomalia «possibile foglio duplicato» con il nome dell\'altro file');
+    await api(server, `/api/documents/${copy.id}`, { method: 'DELETE' });
+    await page.goto(`${server.url}#/documenti`);
+    await openReview(page, orig.id);
+    check(!/W13_POSSIBILE_DUPLICATO/.test(await anoms()), 'eliminata la copia, la segnalazione sparisce');
+    await page.close();
   });
 
   await section('9. Claude Vision solo dopo conferma; costi in Dashboard', async () => {

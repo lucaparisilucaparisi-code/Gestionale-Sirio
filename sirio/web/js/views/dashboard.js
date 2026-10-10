@@ -173,7 +173,9 @@ function renderKpis(root) {
     }),
     kpiCard({
       tone: 'k-amber', ic: 'flag', label: 'Da verificare', value: fmtInt(k.da_verificare || 0),
-      foot: `${fmtInt(k.verificati || 0)} confermati`, nav: '#/documenti?stato=da_verificare',
+      foot: `${fmtInt(k.verificati || 0)} confermati${k.possibili_duplicati ? ` · ${plural(k.possibili_duplicati, 'possibile duplicato', 'possibili duplicati')}` : ''}`,
+      nav: '#/documenti?stato=da_verificare',
+      tip: k.possibili_duplicati ? 'Fogli con lo stesso operatore, alunno e mese: verificare che non siano la stessa pagina scansionata due volte.' : '',
     }),
     kpiCard({
       tone: 'k-illeg', ic: 'eye-off', label: 'Campi illeggibili', value: fmtInt(k.illeggibili || 0),

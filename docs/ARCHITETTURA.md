@@ -41,6 +41,7 @@ sirio/
   __main__.py                  python -m sirio  -> sirio.app.main()
   app.py                       avvio server + finestra applicazione + ciclo di vita
   config.py                    percorsi, impostazioni, chiave API
+  fsutil.py                    sostituzione atomica dei file con nuovi tentativi (Windows)
   models.py                    modello dati (contratto)
   pdf_io.py                    lettura PDF/immagini -> pagine (numpy BGR)
   calendario.py                giorni della settimana, festività italiane
@@ -117,7 +118,7 @@ class Settings(BaseModel):
     tema: Literal["auto", "chiaro", "scuro"] = "auto"
 
 def load_settings() -> Settings     # da data_dir()/"impostazioni.json"; valori mancanti -> default
-def save_settings(s: Settings) -> None   # scrittura atomica
+def save_settings(s: Settings) -> None   # scrittura atomica (fsutil.replace_with_retry)
 def get_api_key() -> str | None     # 1) env ANTHROPIC_API_KEY 2) keyring("SirioOCR","anthropic_api_key") 3) file data_dir()/".chiave" (permessi 600)
 def set_api_key(key: str | None) -> None   # None/"" = cancella; prova keyring, altrimenti file
 def api_key_source() -> Literal["env", "keyring", "file"] | None
@@ -262,13 +263,20 @@ def settimane_del_mese(anno: int, mese: int) -> list[tuple[int, int]]   # [(dal,
 
 ```python
 TOLLERANZA = 0.01
+MAX_ORE_GIORNO = 24.0 ; MAX_ORE_PEI = 60.0 ; MAX_ORE_MESE = 744.0
+MAX_ORE_CAMPO = {"ore_dichiarate": 24, "ore_pei": 60, "totale_mensile_dichiarato": 744}
 def parse_time(s: str | None) -> tuple[int, int] | None     # "8:00","8.00","8,00","800","8","08:00","8h","ore 8" -> (8,0); invalido -> None
 def normalize_time(s: str | None) -> str | None             # -> "08:00" | None
-def parse_hours(s: str | float | None) -> float | None      # "1,5","1.5","3","3h","2:30"(=2.5),"1 e 30" -> float
+def parse_hours(s: str | float | None, *, massimo: float = 24.0) -> float | None
+    # "1,5","1.5","3","3h","2:30"(=2.5),"1 e 30" -> float; None se < 0 o > massimo.
+    # massimo = 24 per le ore di un giorno; per l'intestazione MAX_ORE_CAMPO[campo]
+    # (60 ore PEI settimanali, 744 totale mensile): server (PUT) ed Excel usano lo stesso limite
 def hours_between(a: str | None, b: str | None) -> float | None   # uscita - entrata in ore; None se mancante/invalido/negativo
 def ore_riconosciute(row: DayRow) -> float                  # dichiarate se presenti, altrimenti calcolate (0 se assenza operatore)
 def validate(header: Header, rows: list[DayRow]) -> tuple[list[Anomaly], Totals]
 def validate_document(doc: Document) -> Document            # imposta doc.anomalies e doc.totals e restituisce doc
+def gruppi_possibili_duplicati(docs) -> list[list[Document]]   # ≥ 2 fogli con stesso operatore, alunno, mese e anno
+def segnala_possibili_duplicati(docs) -> None               # aggiunge W13 a ogni documento dei gruppi (idempotente)
 ```
 
 Codici anomalia (gravità tra parentesi). Messaggi sempre in italiano, concreti, con giorno e valori:
@@ -293,6 +301,7 @@ Codici anomalia (gravità tra parentesi). Messaggi sempre in italiano, concreti,
 | `W10_TOTALE_MENSILE_ASSENTE` | attenzione | totale mensile non scritto |
 | `W11_DOPPIA_ASSENZA` | attenzione | crocette in entrambe le colonne assenza |
 | `W12_ORE_NON_INDICATE` | attenzione | orari effettivi presenti ma colonna "Tot. ore" vuota (ore ricavate dagli orari) |
+| `W13_POSSIBILE_DUPLICATO` | attenzione | un altro foglio firma ha lo stesso operatore, alunno, mese e anno (es. stessa pagina scansionata due volte in file diversi: le ore verrebbero conteggiate due volte); controllo **tra documenti**, vedi sotto |
 | `I01_ASSENZA_ALUNNO` | info | assenza alunno (con ore riconosciute e % sul programmato) |
 | `I02_ASSENZA_OPERATORE` | info | assenza operatore (con eventuale nota, es. 104) |
 | `I03_ORARIO_DIVERSO` | info | orario effettivo diverso dal programmato |
@@ -306,6 +315,12 @@ che la settimana contiene nel mese (W06 confronta invece con le ore PEI settiman
 assenza alunno sono ammesse ore dichiarate inferiori all'orario effettivo. Dal 2026 il 4 ottobre
 (San Francesco) è di nuovo festa nazionale (L. 151/2025). Helper per Excel e interfaccia:
 `CODICI` (legenda), `esito_riga`, `stato_campo` ("illeggibile" | "incerto" | ""), `etichetta_campo`.
+
+**W13 (possibile foglio duplicato)** non dipende da un solo foglio: i nomi sono confrontati senza
+maiuscole, accenti, punteggiatura e ordine delle parole; i fogli senza operatore, alunno o periodo
+valido non sono confrontati. Non viene mai salvata in `doc.json`: l'Excel la calcola sui documenti
+esportati e il server (4.10) la calcola al volo sui documenti correnti, così sparisce da sola
+quando uno dei due fogli viene eliminato o corretto.
 
 ### 4.7 `sirio/excel_export.py`
 
@@ -339,6 +354,9 @@ Fogli:
 6. **Legenda e note** — significato dei colori, regole di calcolo, motore OCR e modello usati.
 
 Impostazione di stampa: A4 orizzontale, adatta alla larghezza, righe d'intestazione ripetute.
+Il file viene scritto accanto alla destinazione e poi sostituito atomicamente
+(`fsutil.replace_with_retry`): se il blocco persiste (file aperto in Excel) `PermissionError` con
+messaggio italiano «… il file è aperto in un altro programma …».
 
 ### 4.8 `sirio/store.py`
 
@@ -346,10 +364,14 @@ Impostazione di stampa: A4 orizzontale, adatta alla larghezza, righe d'intestazi
 class DocumentStore:
     def __init__(self, root: Path)                       # root = config.documents_dir()
     revision: int                                        # incrementata a ogni modifica (per il polling)
-    def add_file(self, filename: str, data: bytes) -> list[Document]
+    def add_file(self, filename: str, data: bytes,
+                 on_document: Callable[[Document], None] | None = None) -> list[Document]
         # una Document per pagina; salva <root>/<id>/page.jpg (pagina normalizzata, JPEG q92, ≤ 3600 px),
         # thumb.jpg (≤ 480 px), grid.json (TableGrid.to_dict), doc.json; status "in_coda".
         # Dedup: se esiste già un documento con lo stesso sha256+pagina lo restituisce senza duplicarlo.
+        # on_document: chiamata per ogni pagina nuova appena salvata (il server la mette in coda).
+    def pending_imports(self) -> list[str]               # file la cui importazione è rimasta in sospeso
+    def resume_pending_imports(self, on_document=None) -> list[Document]   # completa le importazioni interrotte
     def list(self) -> list[Document]                     # ordinati per created_at, source_file, source_page
     def get(self, doc_id: str) -> Document | None
     def save(self, doc: Document) -> None                # scrittura atomica (tmp + os.replace), aggiorna updated_at
@@ -359,7 +381,20 @@ class DocumentStore:
     def load_page(self, doc_id) -> np.ndarray ; def load_grid(self, doc_id) -> TableGrid | None
 ```
 
-Thread-safe (`threading.RLock`). Id documento: `uuid4().hex[:12]`.
+Thread-safe (`threading.RLock`). Id documento: `uuid4().hex[:12]`. Scritture atomiche
+(tmp + `fsutil.replace_with_retry`, che ritenta se un antivirus blocca per un istante la destinazione).
+
+**Ripresa delle importazioni interrotte.** Le pagine di un file vengono importate in una sola
+richiesta: prima del ciclo sulle pagine `add_file` salva una copia del file in
+`<root>/.import-<sha256>.bin` e il nome in `.import-<sha256>.json`, eliminate al termine (anche se
+l'importazione non riesce: l'errore è già segnalato all'utente). Se il programma si chiude a metà
+(es. pagina 2 di 4), i due file restano: all'avvio `app.py` chiama `resume_pending_imports`, che
+ripete `add_file` sulla copia salvata (le pagine già presenti sono riconosciute da sha256 e numero
+di pagina, quelle mancanti vengono aggiunte e messe in coda con la stessa callback del caricamento).
+Una copia scritta a metà (senza `.json`) viene eliminata al caricamento dell'archivio; una copia
+danneggiata (sha256 diverso) viene scartata. Ogni ripresa incrementa `tentativi` nel `.json`
+prima di iniziare: dopo 3 riprese non completate (es. un file che fa chiudere il programma)
+l'importazione viene abbandonata, così un file problematico non blocca ogni avvio.
 
 ### 4.9 `sirio/processing.py`
 
@@ -391,19 +426,31 @@ Concorrenza: `settings.concorrenza` per Claude, 1 per il motore locale.
 `create_app(store, processor, token: str, on_shutdown: Callable | None = None, ..., anagrafica: Anagrafica | None = None) -> FastAPI`
 (anagrafica predefinita: `processor.anagrafica`).
 Ascolto solo su `127.0.0.1`. Ogni richiesta `/api/*` deve avere l'header `X-Sirio-Token: <token>`
-(403 altrimenti) e un header `Host` locale (`127.0.0.1:<porta>` o `localhost:<porta>`). La pagina
-`index.html` è servita con il token inserito in `<meta name="sirio-token" content="...">`
-(sostituzione del segnaposto `__SIRIO_TOKEN__`). File statici da `sirio/web/` su `/static/...`.
+(403 altrimenti) e un header `Host` locale (`127.0.0.1:<porta>` o `localhost:<porta>`).
+
+**Il token è un segreto dell'avvio.** L'indirizzo 127.0.0.1 è condiviso da tutti gli utenti dello
+stesso computer (PC condivisi, Desktop remoto/RDS), quindi la pagina principale non consegna il
+token a chiunque la chieda: `index.html` è servita con il token inserito in
+`<meta name="sirio-token" content="...">` (sostituzione del segnaposto `__SIRIO_TOKEN__`) e con il
+cookie `sirio_token` (HttpOnly, SameSite=Strict) **solo** se l'indirizzo contiene `?k=<token>`
+(confronto a tempo costante) — è l'indirizzo con cui `app.py` apre la finestra — oppure se la
+richiesta ha già il cookie valido (ricaricamento della pagina). Altrimenti risponde 403 con una
+piccola pagina in italiano, senza token: «Per motivi di sicurezza apri Sirio OCR dal collegamento
+sul desktop o con «Avvia Sirio OCR».». Appena caricata, la pagina toglie `k` dalla barra degli
+indirizzi (`history.replaceState`), così non resta nella cronologia né nei preferiti
+(`Referrer-Policy: no-referrer` su tutte le risposte). I file statici da `sirio/web/` su
+`/static/...` restano pubblici (non contengono segreti).
+Per le sole letture (GET/HEAD: immagini, download) e per `heartbeat`/`bye` vale anche il cookie.
 Risposte JSON; errori `{"detail": "messaggio italiano"}`.
 
 | Metodo e percorso | Corpo / parametri | Risposta |
 |---|---|---|
-| `GET /` | — | index.html con token |
+| `GET /` | `?k=<token>` (o cookie `sirio_token`) | index.html con token; senza: 403, pagina «apri Sirio OCR dal collegamento» |
 | `GET /api/health` | — | `{"ok": true, "version": "1.0.0"}` (senza token) |
 | `GET /api/state?since=<rev>` | — | se `since == revision`: `{"revision": n, "unchanged": true}`; altrimenti `{"revision", "documents": [DocSummary], "queue": Processor.status(), "kpi": {...}}` |
 | `POST /api/upload` | multipart `files` (più file) | `{"documents": [DocSummary], "errors": [{"file", "message"}]}` |
-| `GET /api/documents/{id}` | — | `Document` completo + `"grid": TableGrid.to_dict()` + `"image_url"` |
-| `PUT /api/documents/{id}` | `{"header"?: Header, "rows"?: [DayRow], "user_verified"?: bool}` | `Document` aggiornato (rivalidato) |
+| `GET /api/documents/{id}` | — | `Document` completo (con l'eventuale W13) + `"grid": TableGrid.to_dict()` + `"image_url"` |
+| `PUT /api/documents/{id}` | `{"header"?: Header, "rows"?: [DayRow], "user_verified"?: bool}` | `Document` aggiornato (rivalidato, con l'eventuale W13) |
 | `POST /api/documents/{id}/reprocess` | — | `DocSummary` |
 | `DELETE /api/documents/{id}` | — | `{"ok": true}` |
 | `DELETE /api/documents` | — | cancella tutto `{"ok": true}` |
@@ -430,11 +477,21 @@ Risposte JSON; errori `{"detail": "messaggio italiano"}`.
 differenza_totale, giorni_lavorati, n_errori, n_attenzioni, n_info, campi_incerti,
 campi_illeggibili, stato}, "cost_usd", "thumb_url"}`.
 
-`kpi` = `{"documenti", "completati", "ore_totali", "errori", "attenzioni", "illeggibili", "da_verificare", "verificati", "costo_usd"}`.
+`kpi` = `{"documenti", "completati", "ore_totali", "errori", "attenzioni", "illeggibili", "incerti",
+"da_verificare", "verificati", "possibili_duplicati", "documenti_con_errori", "in_coda", "in_lavorazione",
+"errori_elaborazione", "scartati", "costo_usd"}` (`possibili_duplicati` = fogli con la W13).
+
+**Possibili duplicati (W13).** `/api/state`, `GET /api/documents`, `GET`/`PUT /api/documents/{id}` e
+`/api/preview` calcolano al volo `validation.segnala_possibili_duplicati` sui fogli firma completati
+(per l'anteprima: sui documenti dell'anteprima, gli stessi che finirebbero nell'Excel): i documenti
+coinvolti mostrano l'attenzione nell'elenco delle anomalie, contatori aggiornati e stato «da
+verificare» già prima dell'esportazione. La W13 non viene salvata in `doc.json`.
 
 Modifica (`PUT`): i campi cambiati rispetto al valore precedente vengono aggiunti a
 `user_edited` (chiavi `header.<campo>` / `rows.<giorno>.<campo>`), il valore OCR originale viene
 memorizzato in `ocr_originali` (solo la prima volta) e il campo viene tolto da `incerti`/`illeggibili`.
+Ore ammesse: 0–24 per `ore_dichiarate`, 0–60 per `ore_pei`, 0–744 per `totale_mensile_dichiarato`
+(`validation.MAX_ORE_CAMPO`; fuori intervallo → 422 «… indicare un numero di ore tra 0 e N»).
 Dopo ogni `PUT` riuscito il documento viene passato a `Anagrafica.impara_documento` (vedi 4.13: se
 confermato si apprende l'intera intestazione, altrimenti solo i campi anagrafici corretti a mano).
 L'eliminazione di documenti (`DELETE /api/documents[/{id}]`) scollega i loro contributi senza
@@ -452,16 +509,27 @@ finestra né lucchetto d'istanza. Uscita 0 se il modello è disponibile (anche "
 
 Avvio normale:
 
-1. istanza singola: file `data_dir()/istanza.json` `{port, pid, token}`; se un'istanza risponde a
-   `/api/health`, apre solo una nuova finestra verso di essa ed esce;
+1. istanza singola: lucchetto `data_dir()/istanza.lock` e file `data_dir()/istanza.json`
+   `{port, pid, token, version, url, started_at}` (scrittura atomica, permessi 600); se
+   un'istanza risponde a `/api/health`, apre solo una nuova finestra verso di essa (con il
+   segreto `?k=` letto da `istanza.json`) ed esce;
 2. avvia uvicorn su `127.0.0.1:<porta libera>` in un thread; token casuale (`secrets.token_urlsafe`);
-3. apre la finestra applicazione: Microsoft Edge / Google Chrome / Chromium in modalità app
-   (`--app=URL --user-data-dir=<data_dir>/finestra --window-size=1480,940 --no-first-run
-   --no-default-browser-check`), attende la chiusura del processo; se non trovato, browser
-   predefinito (`webbrowser.open`);
-4. chiusura: quando il processo della finestra termina (e non arrivano heartbeat per 10 s), oppure
-   dopo `/api/bye` senza nuovi heartbeat per 8 s, oppure senza heartbeat per 15 minuti → arresto
-   ordinato (processor.stop, server.should_exit);
+   avvia la coda di elaborazione e, in un thread a parte, `store.resume_pending_imports` (pagine
+   mancanti delle importazioni interrotte, messe in coda con `processor.enqueue`: la finestra non
+   attende la conversione delle pagine);
+3. apre la finestra applicazione all'indirizzo `http://127.0.0.1:<porta>/?k=<token>` (segreto
+   dell'avvio, vedi 4.10; mai scritto nel registro): Microsoft Edge / Google Chrome / Chromium in
+   modalità app (`--app=URL --user-data-dir=<data_dir>/finestra --window-size=1480,940
+   --no-first-run --no-default-browser-check`), attende la chiusura del processo; se non trovato,
+   browser predefinito (`webbrowser.open`, stesso indirizzo); con `--senza-finestra` l'indirizzo
+   completo è stampato sulla console;
+4. chiusura: quando il processo della finestra termina e non arrivano heartbeat per 75 s
+   (`WINDOW_GRACE`), oppure dopo `/api/bye` senza nuovi heartbeat per 75 s (`BYE_GRACE`), oppure
+   senza heartbeat per 15 minuti → arresto ordinato (processor.stop, server.should_exit). Le attese
+   superano l'intervallo tra due heartbeat anche di una finestra ridotta a icona (il browser ne
+   rallenta i timer fino a circa uno al minuto): un'altra finestra ancora aperta, o il passaggio
+   della finestra a un processo del browser già attivo, non provocano l'arresto; dopo una
+   sospensione del sistema i tempi ripartono da zero;
 5. log su `logs_dir()/sirio.log` (rotazione), eccezioni non gestite registrate.
 
 ### 4.12 Interfaccia (sirio/web)
@@ -469,7 +537,8 @@ Avvio normale:
 Stile premium e professionale, HTML/CSS/JS senza dipendenze esterne (funziona offline), tema chiaro e
 scuro. Viste:
 
-* **Dashboard / Importa**: indicatori (fogli, ore totali, da verificare, illeggibili, errori), grande
+* **Dashboard / Importa**: indicatori (fogli, ore totali, da verificare con gli eventuali possibili
+  duplicati, illeggibili, errori), grande
   area di trascinamento PDF/immagini (anche cartelle intere e selezione multipla), coda con barre di
   avanzamento per documento.
 * **Documenti**: elenco filtrabile/ordinabile (stato, operatore, mese) con miniature e badge.
@@ -568,9 +637,12 @@ di persone nuove sostituite — e comunque segnalate incerte):
 * Windows: doppio clic su `Avvia Sirio OCR.bat` → `launcher/avvia.ps1`.
 * macOS: `Avvia Sirio OCR.command`; Linux: `avvia-sirio-ocr.sh` → `launcher/avvia.sh`.
 
-Il bootstrap scarica **uv** (Astral) nella cartella `.runtime/` del programma, che installa Python
-3.12 gestito e tutte le dipendenze (`uv sync --extra offline`, PyTorch solo CPU) in
-`.runtime/venv`; subito dopo un'installazione riuscita (salvo `SIRIO_SENZA_OFFLINE=1`) esegue
+Il bootstrap scarica **uv** (Astral) nella cartella dei componenti — su Windows
+`%LOCALAPPDATA%\SirioOCR\runtime` (locale, non sincronizzata con OneDrive; `.runtime\` del programma
+solo se `LOCALAPPDATA` manca; la vecchia `.runtime\` delle versioni precedenti viene eliminata se non
+in uso), su macOS e Linux `.runtime/` nella cartella del programma — che installa Python 3.12
+gestito e tutte le dipendenze (`uv sync --extra offline`, PyTorch solo CPU) in `<componenti>/venv`;
+subito dopo un'installazione riuscita (salvo `SIRIO_SENZA_OFFLINE=1`) esegue
 `<python> -m sirio --scarica-modello` per scaricare il modello di riconoscimento (circa 1,3 GB, con
 l'avanzamento in console): un errore non blocca l'avvio, il modello verrà scaricato al primo
 utilizzo. Ai successivi avvii verifica solo che tutto sia aggiornato (pochi secondi). Ripiego:

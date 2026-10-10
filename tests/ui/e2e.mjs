@@ -63,6 +63,19 @@ try {
   check(await page.locator('.kpi').count() === 6, 'sei indicatori nella dashboard');
   const tokenOk = await page.evaluate(() => document.querySelector('meta[name="sirio-token"]').content !== '__SIRIO_TOKEN__');
   check(tokenOk, 'token di sessione inserito dal server');
+  check(!new URL(page.url()).searchParams.has('k'), 'codice d\'accesso dell\'avvio tolto dalla barra degli indirizzi');
+  // ricaricamento senza ?k=: la pagina riceve ancora il token grazie al cookie di sessione
+  await page.reload();
+  await page.waitForSelector('#splash', { state: 'detached' });
+  check(await page.locator('.kpi').count() === 6, 'ricaricamento della pagina con il cookie di sessione');
+  // senza codice d'accesso né cookie (es. un altro utente dello stesso PC): nessun token
+  const anon = await browser.newContext();
+  const anonPage = await anon.newPage();
+  const resp = await anonPage.goto(new URL('/', server.url).href);
+  const anonHtml = await anonPage.content();
+  check(resp.status() === 403 && anonHtml.includes('Per motivi di sicurezza apri Sirio OCR') && !anonHtml.includes(server.token),
+    'senza il codice d\'accesso la pagina non contiene il token');
+  await anon.close();
 
   // ricerca globale
   await page.keyboard.press('Control+k');

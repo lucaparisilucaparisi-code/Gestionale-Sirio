@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -13,7 +14,7 @@ import pytest
 
 from sirio import pdf_io
 from sirio.models import Document
-from sirio.store import DocumentNotFound, DocumentStore, PartialImportError
+from sirio.store import MAX_RESUME_ATTEMPTS, DocumentNotFound, DocumentStore, PartialImportError
 from tests.synthetic import make_synthetic_sheet, sheet_to_pdf
 
 
@@ -137,6 +138,119 @@ def test_partial_import_keeps_first_pages(store: DocumentStore, sheet: np.ndarra
     assert len(info.value.documents) == 1
     assert "pagina 2" in str(info.value)
     assert len(store.list()) == 1
+
+
+class _Interruzione(BaseException):
+    """Chiusura improvvisa del programma: nessuna gestione degli errori viene eseguita."""
+
+
+def test_interrupted_multipage_import_resumes_at_next_start(tmp_path: Path, sheet: np.ndarray,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "documenti"
+    pdf = sheet_to_pdf([sheet, cv2.flip(sheet, 1), sheet, cv2.flip(sheet, 0)], dpi=150)
+    s1 = DocumentStore(root)
+    real_import = DocumentStore._import_page
+
+    def stop_after_page_2(self, image, name, page_no, n_pages, sha):
+        if page_no == 3:
+            raise _Interruzione()
+        return real_import(self, image, name, page_no, n_pages, sha)
+
+    monkeypatch.setattr(DocumentStore, "_import_page", stop_after_page_2)
+    queued: list[Document] = []
+    with pytest.raises(_Interruzione):
+        s1.add_file("lotto.pdf", pdf, queued.append)
+    monkeypatch.undo()
+    assert [d.source_page for d in queued] == [1, 2]
+    assert s1.pending_imports() == ["lotto.pdf"]
+
+    # avvio successivo: le pagine 3 e 4 vengono importate e messe in coda, senza duplicare 1 e 2
+    s2 = DocumentStore(root)
+    assert [d.source_page for d in s2.list()] == [1, 2]
+    queued.clear()
+    added = s2.resume_pending_imports(queued.append)
+    assert [d.source_page for d in added] == [3, 4]
+    assert [d.source_page for d in queued] == [3, 4] and all(d.status == "in_coda" for d in queued)
+    docs = s2.list()
+    assert [(d.source_file, d.source_page, d.page_count) for d in docs] == [("lotto.pdf", n, 4) for n in (1, 2, 3, 4)]
+    assert len({d.source_sha256 for d in docs}) == 1 and len({d.id for d in docs}) == 4
+    assert s2.pending_imports() == [] and not list(root.glob(".import-*"))
+    assert s2.resume_pending_imports(queued.append) == [] and len(queued) == 2
+    # al riavvio successivo nulla da riprendere
+    assert len(DocumentStore(root).list()) == 4
+
+
+def test_pending_import_copy_removed_after_import_and_cleaned_at_start(
+        store: DocumentStore, sheet: np.ndarray, png_bytes: bytes, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = store.root
+    sha = hashlib.sha256(png_bytes).hexdigest()
+    during: list[list[str]] = []
+    real_import = DocumentStore._import_page
+
+    def spy(self, *args):
+        during.append(sorted(p.name for p in root.glob(".import-*")))
+        return real_import(self, *args)
+
+    monkeypatch.setattr(DocumentStore, "_import_page", spy)
+    store.add_file("g.png", png_bytes)
+    assert during == [[f".import-{sha}.bin", f".import-{sha}.json"]]   # copia presente durante l'importazione
+    assert not list(root.glob(".import-*"))                            # ...ed eliminata alla fine
+    monkeypatch.undo()
+
+    # importazione non riuscita (errore segnalato all'utente): nessuna ripresa al prossimo avvio
+    real_iter = pdf_io.iter_pages
+
+    def broken(data: bytes, filename: str, dpi: int = 300):
+        for i, img in real_iter(data, filename, dpi):
+            if i == 1:
+                raise ValueError("Impossibile leggere la pagina 2 del PDF «y.pdf»: il file è danneggiato.")
+            yield i, img
+
+    monkeypatch.setattr("sirio.store.pdf_io.iter_pages", broken)
+    with pytest.raises(PartialImportError):
+        store.add_file("y.pdf", sheet_to_pdf([sheet, sheet], dpi=150))
+    assert not list(root.glob(".import-*"))
+    monkeypatch.undo()
+
+    # copia scritta a metà (senza .json) e file temporanei: eliminati all'avvio;
+    # copia che non corrisponde allo sha256 del nome: scartata alla ripresa
+    (root / f".import-{'a' * 64}.bin").write_bytes(b"x")
+    (root / f"..import-{'b' * 64}.bin.k3x9q1.tmp").write_bytes(b"x")   # nome di _atomic_write_bytes
+    (root / f".import-{'c' * 64}.bin").write_bytes(b"non corrisponde")
+    (root / f".import-{'c' * 64}.json").write_text('{"file": "c.pdf"}', encoding="utf-8")
+    s2 = DocumentStore(root)
+    assert sorted(p.name for p in root.glob(".import-*")) == [f".import-{'c' * 64}.bin", f".import-{'c' * 64}.json"]
+    assert not list(root.glob("*.tmp"))
+    assert s2.pending_imports() == ["c.pdf"]
+    assert s2.resume_pending_imports() == []
+    assert not list(root.glob(".import-*")) and len(s2.list()) == 2
+
+
+def test_pending_import_abandoned_after_repeated_failed_resumes(tmp_path: Path, sheet: np.ndarray,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    # un file che fa chiudere il programma durante la ripresa non deve bloccare ogni avvio
+    root = tmp_path / "documenti"
+    pdf = sheet_to_pdf([sheet, sheet, sheet], dpi=150)
+    real_import = DocumentStore._import_page
+
+    def crash_at_page_2(self, image, name, page_no, n_pages, sha):
+        if page_no == 2:
+            raise _Interruzione()
+        return real_import(self, image, name, page_no, n_pages, sha)
+
+    monkeypatch.setattr(DocumentStore, "_import_page", crash_at_page_2)
+    with pytest.raises(_Interruzione):
+        DocumentStore(root).add_file("pesante.pdf", pdf)
+    for _ in range(MAX_RESUME_ATTEMPTS):
+        s = DocumentStore(root)
+        assert s.pending_imports() == ["pesante.pdf"]
+        with pytest.raises(_Interruzione):
+            s.resume_pending_imports()
+    monkeypatch.undo()
+    s = DocumentStore(root)
+    assert s.resume_pending_imports() == []          # abbandonata: nessun nuovo tentativo
+    assert s.pending_imports() == [] and not list(root.glob(".import-*"))
+    assert [d.source_page for d in s.list()] == [1]  # le pagine gia' importate restano
 
 
 def test_get_returns_copies_and_save_updates(store: DocumentStore, png_bytes: bytes) -> None:

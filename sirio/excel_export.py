@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import re
 import uuid
 from collections.abc import Iterable, Sequence
@@ -41,6 +40,7 @@ from xlsxwriter.worksheet import Worksheet
 
 from sirio import __version__, calendario
 from sirio import validation as val
+from sirio.fsutil import replace_with_retry
 from sirio.models import DayRow, Document, Header
 
 log = logging.getLogger(__name__)
@@ -306,8 +306,8 @@ def _valore_originale(campo: str, valore: str | None) -> str:
         return "presente" if vero else "assente"
     if campo in _ORARI:
         return val.normalize_time(testo) or testo
-    if campo in ("ore_dichiarate", "ore_pei", "totale_mensile_dichiarato"):
-        ore = val.parse_hours(testo)
+    if campo in val.MAX_ORE_CAMPO:
+        ore = val.parse_hours(testo, massimo=val.MAX_ORE_CAMPO[campo])
         return val.format_ore(ore) if ore is not None else testo
     return testo
 
@@ -3214,7 +3214,7 @@ def export_workbook(docs: list[Document], path: Path, options: ExportOptions | N
         except XlsxWriterException as exc:
             raise OSError(f"Impossibile scrivere il file Excel: {exc}") from exc
         try:
-            os.replace(tmp, path)
+            replace_with_retry(tmp, path)
         except PermissionError as exc:
             raise PermissionError(
                 f"Impossibile salvare «{path.name}»: il file è aperto in un altro programma (ad esempio Excel). "

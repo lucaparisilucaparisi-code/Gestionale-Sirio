@@ -2,6 +2,8 @@
 //
 // Avviano il server di sviluppo (motore OCR finto, documenti sintetici con nomi fittizi)
 // oppure usano un server già avviato indicato da SIRIO_UI_URL (+ SIRIO_UI_TOKEN).
+// ``server.url`` è l'indirizzo da aprire nel browser, con il segreto dell'avvio (?k=<token>)
+// senza il quale la pagina non riceve il token; ``server.base`` è la radice per le API.
 //
 // Variabili d'ambiente:
 //   SIRIO_UI_URL / SIRIO_UI_TOKEN  server esistente (facoltativo)
@@ -49,7 +51,9 @@ export function shotsDir() {
 /** Avvia tests/dev_server.py e attende che risponda. */
 export async function startServer({ documents = 6, delay = 1.2, concurrency = 2, extraArgs = [] } = {}) {
   if (process.env.SIRIO_UI_URL) {
-    return { url: process.env.SIRIO_UI_URL.replace(/\/?$/, '/'), token: process.env.SIRIO_UI_TOKEN || '', stop: async () => {} };
+    const base = new URL('/', process.env.SIRIO_UI_URL).href;
+    const token = process.env.SIRIO_UI_TOKEN || new URL(process.env.SIRIO_UI_URL).searchParams.get('k') || '';
+    return { url: appUrl(base, token), base, token, stop: async () => {} };
   }
   const port = 8800 + Math.floor(Math.random() * 900);
   const token = `ui-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
@@ -72,7 +76,7 @@ export async function startServer({ documents = 6, delay = 1.2, concurrency = 2,
     await sleep(200);
   }
   return {
-    url, token, dataDir, proc,
+    url: appUrl(url, token), base: url, token, dataDir, proc,
     log: () => log,
     stop: async () => {
       if (proc.exitCode !== null) return;
@@ -83,8 +87,13 @@ export async function startServer({ documents = 6, delay = 1.2, concurrency = 2,
   };
 }
 
+/** Indirizzo della finestra: radice con il segreto dell'avvio (come lo apre sirio.app). */
+function appUrl(base, token) {
+  return token ? `${base}?k=${encodeURIComponent(token)}` : base;
+}
+
 export async function api(server, pathname, init = {}) {
-  const res = await fetch(new URL(pathname, server.url), {
+  const res = await fetch(new URL(pathname, server.base || server.url), {
     ...init,
     headers: { 'X-Sirio-Token': server.token, 'Content-Type': 'application/json', ...(init.headers || {}) },
   });

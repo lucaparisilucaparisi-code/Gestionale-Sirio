@@ -17,6 +17,17 @@
       var scuro = tema === "scuro" || (tema === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
       document.documentElement.setAttribute("data-theme", scuro ? "dark" : "light");
     })();
+    // Il codice d'accesso dell'avvio (?k=…) non resta nella barra degli indirizzi, nella
+    // cronologia o nei preferiti: i ricaricamenti successivi usano il cookie di sessione.
+    (function () {
+      try {
+        var u = new URL(window.location.href);
+        if (u.searchParams.has("k")) {
+          u.searchParams.delete("k");
+          window.history.replaceState(window.history.state, "", u.pathname + u.search + u.hash);
+        }
+      } catch (e) { /* indirizzo lasciato invariato */ }
+    })();
   </script>
   <script type="module" src="/static/app.js"></script>
 </head>

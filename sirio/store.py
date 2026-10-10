@@ -8,7 +8,16 @@ Struttura: ``<root>/<id>/`` con
 * ``doc.json``  il ``Document`` (scritto per ultimo: una cartella senza ``doc.json``
   e' un'importazione interrotta e viene eliminata all'avvio).
 
-Tutte le scritture sono atomiche (file temporaneo + ``os.replace``). I documenti
+Importazioni in sospeso: prima di importare le pagine di un file, ``add_file`` ne salva
+una copia in ``<root>/.import-<sha256>.bin`` con ``.import-<sha256>.json`` (nome del
+file), eliminati alla fine dell'importazione (anche se non riuscita: l'errore e'
+segnalato all'utente). Se il programma si chiude a meta' di un PDF di piu' pagine i due
+file restano e ``resume_pending_imports`` (chiamato all'avvio) completa l'importazione:
+le pagine gia' presenti sono riconosciute (stesso sha256 e numero di pagina), quelle
+mancanti vengono aggiunte e messe in coda.
+
+Tutte le scritture sono atomiche (file temporaneo + ``os.replace``, ritentato se la
+destinazione e' bloccata per un istante: ``sirio.fsutil.replace_with_retry``). I documenti
 in memoria non vengono mai modificati sul posto: ``get``/``list`` restituiscono
 copie (salvo ``list(copy=False)``, in sola lettura) e ``save``/``update``
 sostituiscono la versione corrente. ``revision`` cresce a ogni modifica e serve
@@ -36,6 +45,7 @@ import numpy as np
 from pydantic import ValidationError
 
 from sirio import pdf_io
+from sirio.fsutil import replace_with_retry
 from sirio.models import Document
 from sirio.vision.grid import TableGrid, detect_grid
 from sirio.vision.preprocess import normalize_page
@@ -53,7 +63,11 @@ THUMB_FILE = "thumb.jpg"
 GRID_FILE = "grid.json"
 DOC_FILE = "doc.json"
 
+PENDING_PREFIX = ".import-"     # importazioni in sospeso: .import-<sha256>.bin / .json
+MAX_RESUME_ATTEMPTS = 3        # riprese di un'importazione in sospeso prima di abbandonarla
+
 _ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 STATUS_MESSAGE_QUEUED = "In coda"
 
@@ -94,26 +108,13 @@ def _atomic_write_bytes(path: Path, data: bytes, durable: bool = True) -> None:
             if durable:
                 fh.flush()
                 os.fsync(fh.fileno())
-        _replace(tmp, path)
+        replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-
-
-def _replace(src: str, dst: Path) -> None:
-    # Su Windows os.replace puo' fallire per qualche istante se un altro processo
-    # (antivirus, indicizzatore) ha appena aperto il file di destinazione.
-    for attempt in range(8):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == 7:
-                raise
-            time.sleep(0.05 * (attempt + 1))
 
 
 def _rmtree(path: Path) -> None:
@@ -189,6 +190,18 @@ class DocumentStore:
             loaded += 1
         if loaded:
             log.info("Archivio: %d documenti caricati da %s", loaded, self.root)
+        # importazioni in sospeso con la copia scritta a meta' (nessun .json): non recuperabili.
+        # I temporanei di _atomic_write_bytes si chiamano ".<nome>.<casuale>.tmp", cioe'
+        # "..import-<sha256>.bin.<casuale>.tmp"
+        for tmp in self.root.glob(f".{PENDING_PREFIX}*.tmp") if self.root.exists() else []:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        for data_path in self.root.glob(f"{PENDING_PREFIX}*.bin") if self.root.exists() else []:
+            sha = data_path.name[len(PENDING_PREFIX):-len(".bin")]
+            if _SHA_RE.match(sha) and not self._pending_paths(sha)[1].exists():
+                self._drop_pending_import(sha)
 
     # ------------------------------------------------------------------ percorsi
     def _dir(self, doc_id: str) -> Path:
@@ -332,6 +345,103 @@ class DocumentStore:
         with self._lock:
             return {d.source_page: d for d in self._docs.values() if d.source_sha256 == sha}
 
+    # ------------------------------------------------------- importazioni in sospeso
+    def _pending_paths(self, sha: str) -> tuple[Path, Path]:
+        return self.root / f"{PENDING_PREFIX}{sha}.bin", self.root / f"{PENDING_PREFIX}{sha}.json"
+
+    def _save_pending_import(self, sha: str, name: str, data: bytes) -> None:
+        """Copia del file da importare: se il programma si chiude prima della fine,
+        ``resume_pending_imports`` completa l'importazione al prossimo avvio."""
+        data_path, meta_path = self._pending_paths(sha)
+        try:
+            if meta_path.exists() and data_path.is_file() and data_path.stat().st_size == len(data):
+                return   # ripresa di un'importazione gia' in sospeso
+            _atomic_write_bytes(data_path, data)
+            meta = {"file": name, "sha256": sha, "creato": now_iso()}
+            _atomic_write_bytes(meta_path, json.dumps(meta, ensure_ascii=False).encode("utf-8"))
+        except OSError:
+            # l'importazione prosegue comunque: manca solo la ripresa dopo un'interruzione
+            log.warning("Impossibile salvare la copia di «%s» per la ripresa dell'importazione", name, exc_info=True)
+            self._drop_pending_import(sha)
+
+    def _drop_pending_import(self, sha: str) -> None:
+        for path in reversed(self._pending_paths(sha)):   # prima il .json: senza, il .bin e' ignorato
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                log.warning("Impossibile eliminare %s", path, exc_info=True)
+
+    def pending_imports(self) -> list[str]:
+        """Nomi dei file la cui importazione e' rimasta in sospeso."""
+        out = []
+        for meta_path in sorted(self.root.glob(f"{PENDING_PREFIX}*.json")):
+            try:
+                out.append(str(json.loads(meta_path.read_text(encoding="utf-8")).get("file") or meta_path.name))
+            except (OSError, ValueError, AttributeError):
+                out.append(meta_path.name)
+        return out
+
+    def resume_pending_imports(self, on_document: Callable[[Document], None] | None = None) -> list[Document]:
+        """Completa le importazioni interrotte (es. programma chiuso a meta' di un PDF).
+
+        Per ogni file in sospeso si ripete ``add_file`` sulla copia salvata: le pagine gia'
+        importate non vengono duplicate, quelle mancanti sono aggiunte e notificate a
+        ``on_document`` (la stessa funzione usata dal caricamento, che le mette in coda).
+        Restituisce i documenti nuovi. Un file non recuperabile viene scartato (registro).
+        """
+        added: list[Document] = []
+
+        def collect(doc: Document) -> None:
+            added.append(doc)
+            if on_document is not None:
+                on_document(doc)
+
+        for meta_path in sorted(self.root.glob(f"{PENDING_PREFIX}*.json")):
+            sha = meta_path.name[len(PENDING_PREFIX):-len(".json")]
+            if not _SHA_RE.match(sha):
+                continue
+            data_path = self._pending_paths(sha)[0]
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                name = _display_filename(str(meta.get("file") or ""))
+                data = data_path.read_bytes()
+            except (OSError, ValueError, AttributeError):
+                log.warning("Importazione in sospeso non recuperabile: %s", meta_path.name, exc_info=True)
+                self._drop_pending_import(sha)
+                continue
+            if hashlib.sha256(data).hexdigest() != sha:
+                log.warning("Copia dell'importazione in sospeso di «%s» danneggiata: scartata", name)
+                self._drop_pending_import(sha)
+                continue
+            # tentativi contati prima di riprendere: un file che fa chiudere il programma
+            # (es. memoria esaurita) non deve bloccarne ogni avvio successivo
+            tentativi = meta.get("tentativi")
+            tentativi = tentativi if isinstance(tentativi, int) and tentativi >= 0 else 0
+            if tentativi >= MAX_RESUME_ATTEMPTS:
+                log.warning("Importazione in sospeso di «%s» abbandonata: già ripresa %d volte senza "
+                            "completarla (le pagine importate restano)", name, tentativi)
+                self._drop_pending_import(sha)
+                continue
+            try:
+                _atomic_write_bytes(meta_path, json.dumps({**meta, "tentativi": tentativi + 1},
+                                                          ensure_ascii=False).encode("utf-8"))
+            except OSError:
+                log.warning("Importazione in sospeso di «%s» non riprendibile", name, exc_info=True)
+                self._drop_pending_import(sha)
+                continue
+            before = len(added)
+            try:
+                self.add_file(name, data, collect)
+            except Exception:  # noqa: BLE001 - un file non recuperabile non blocca gli altri
+                log.warning("Ripresa dell'importazione di «%s» non riuscita", name, exc_info=True)
+            # (una chiusura del programma durante la ripresa lascia la copia: nuovo tentativo al
+            # prossimo avvio, fino a MAX_RESUME_ATTEMPTS)
+            self._drop_pending_import(sha)
+            log.info("Ripresa l'importazione interrotta di «%s»: %d pagine aggiunte", name, len(added) - before)
+        return added
+
     def _new_id(self) -> str:
         while True:
             doc_id = uuid.uuid4().hex[:12]
@@ -364,6 +474,9 @@ class DocumentStore:
             if all(p in existing for p in range(1, n_pages + 1)):
                 return [existing[p].model_copy(deep=True) for p in range(1, n_pages + 1)]
 
+            # copia per la ripresa: se il programma si chiude a meta', le pagine mancanti
+            # vengono importate al prossimo avvio (resume_pending_imports)
+            self._save_pending_import(sha, name, data)
             results: list[Document] = []
             added = 0
             try:
@@ -382,12 +495,17 @@ class DocumentStore:
                         except Exception:  # noqa: BLE001 - il chiamante non deve interrompere l'importazione
                             log.exception("Errore nella notifica del documento importato %s", doc.id)
             except ValueError as exc:
+                self._drop_pending_import(sha)   # errore segnalato all'utente: nessuna ripresa
                 if added:
                     raise PartialImportError(
                         f"{exc} Sono state importate le prime {len(results)} pagine su {n_pages}.",
                         results,
                     ) from exc
                 raise
+            except Exception:
+                self._drop_pending_import(sha)
+                raise
+            self._drop_pending_import(sha)
             if added:
                 log.info("Importato «%s»: %d pagine nuove su %d", name, added, n_pages)
             return results

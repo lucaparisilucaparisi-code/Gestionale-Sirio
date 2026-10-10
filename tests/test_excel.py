@@ -407,6 +407,15 @@ def test_cella_corretta_a_mano_in_blu_con_valore_originale(wb_formule):
     assert c.comment.text == "Corretto manualmente – valore OCR originale: 11:30"
 
 
+def test_valore_originale_delle_ore_d_intestazione_oltre_le_24():
+    # totale mensile e ore PEI originali superano le 24 ore: formattati come ore, non come testo grezzo
+    assert ex._valore_originale("totale_mensile_dichiarato", "49.5") == "49,5"
+    assert ex._valore_originale("totale_mensile_dichiarato", "52.0") == "52"
+    assert ex._valore_originale("ore_pei", "30.0") == "30"
+    assert ex._valore_originale("ore_dichiarate", "1.5") == "1,5"
+    assert ex._valore_originale("ore_dichiarate", "30.0") == "30.0"   # oltre le 24: testo invariato
+
+
 def test_weekend_e_giorni_inesistenti(wb_formule):
     ws = wb_formule["ROSSI M. 02-2026"]
     E = ex._Esportatore

@@ -12,7 +12,10 @@ di avvio subito dopo l'installazione delle dipendenze. Codice d'uscita 0 se il m
    solo una nuova finestra verso di essa e si esce;
 2. uvicorn su ``127.0.0.1:<porta libera>`` in un thread, token casuale;
 3. finestra: Microsoft Edge / Google Chrome / Chromium in modalita' applicazione
-   (profilo dedicato in ``data_dir()/finestra``), altrimenti il browser predefinito;
+   (profilo dedicato in ``data_dir()/finestra``), altrimenti il browser predefinito.
+   L'indirizzo aperto contiene il segreto dell'avvio (``/?k=<token>``): senza di esso
+   (o senza il cookie di sessione) la pagina non riceve il token, cosi' gli altri utenti
+   dello stesso computer non possono usare l'API (vedi ``sirio.server``);
 4. chiusura automatica: processo della finestra terminato e nessun heartbeat da
    75 s, oppure ``/api/bye`` senza heartbeat successivi per 75 s, oppure nessun
    heartbeat per 15 minuti (``--senza-finestra`` disattiva la chiusura automatica).
@@ -45,8 +48,10 @@ from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from sirio import __version__, config
+from sirio.fsutil import replace_with_retry
 
 log = logging.getLogger("sirio.app")
 
@@ -209,7 +214,7 @@ def write_instance(info: dict) -> None:
             os.chmod(tmp, 0o600)
         except OSError:
             pass
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)   # la seconda istanza potrebbe leggerlo proprio ora
     except BaseException:
         try:
             os.unlink(tmp)
@@ -228,8 +233,17 @@ def remove_instance(token: str) -> None:
         pass
 
 
-def instance_url(port: int) -> str:
-    return f"http://{HOST}:{port}/"
+def instance_url(port: int, token: str | None = None) -> str:
+    """Indirizzo dell'interfaccia. Con ``token`` include il segreto dell'avvio (``?k=``) che
+    consente alla pagina di ricevere il token della sessione: va usato solo per aprire la
+    finestra (la pagina lo toglie subito dalla barra degli indirizzi), mai nel registro."""
+    base = f"http://{HOST}:{port}/"
+    return f"{base}?k={quote(token, safe='')}" if token else base
+
+
+def _without_secret(url: str) -> str:
+    """Indirizzo senza il segreto dell'avvio (per il registro)."""
+    return re.sub(r"([?&]k=)[^&#]*", r"\1…", url)
 
 
 def probe_instance(port: int, timeout: float = 1.5) -> bool:
@@ -358,7 +372,8 @@ def open_window(url: str, profile_dir: Path) -> subprocess.Popen | None:
             return None
     except Exception:  # noqa: BLE001
         log.warning("Apertura del browser predefinito non riuscita", exc_info=True)
-    log.error("Nessun browser disponibile: aprire manualmente %s", url)
+    log.error("Nessun browser disponibile: aprire manualmente %s (indirizzo completo sulla console)",
+              _without_secret(url))
     if sys.stderr is not None:
         try:
             print(f"Aprire nel browser: {url}", file=sys.stderr)
@@ -670,13 +685,35 @@ def download_model_cli(model_name: str | None = None, cache_dir: Path | None = N
 
 
 def _delegate_to(info: dict, with_window: bool) -> int:
-    url = instance_url(int(info["port"]))
-    log.info("Sirio OCR è già in esecuzione (pid %s, %s)", info.get("pid"), url)
+    port = int(info["port"])
+    token = info.get("token") if isinstance(info.get("token"), str) else None
+    log.info("Sirio OCR è già in esecuzione (pid %s, %s)", info.get("pid"), instance_url(port))
     if with_window:
-        open_window(url, config.data_dir() / PROFILE_DIR)
+        # stesso utente (istanza.json è nella sua cartella dei dati): finestra con il segreto dell'avvio
+        open_window(instance_url(port, token), config.data_dir() / PROFILE_DIR)
     else:
-        _say(f"Sirio OCR è già in esecuzione: {url}")
+        _say(f"Sirio OCR è già in esecuzione: {instance_url(port, token)}")
     return 0
+
+
+def _resume_pending_imports(store: Any, processor: Any) -> threading.Thread | None:
+    """Completa in sottofondo le importazioni interrotte da una chiusura precedente (pagine
+    mancanti di un PDF), mettendo in coda le pagine aggiunte come fa il caricamento: la
+    finestra non deve attendere la conversione delle pagine."""
+    pending = store.pending_imports()
+    if not pending:
+        return None
+    log.info("Importazioni interrotte da completare: %s", ", ".join(pending))
+
+    def run() -> None:
+        try:
+            store.resume_pending_imports(on_document=lambda doc: processor.enqueue(doc.id))
+        except Exception:  # noqa: BLE001
+            log.exception("Ripresa delle importazioni interrotte non riuscita")
+
+    thread = threading.Thread(target=run, name="sirio-ripresa-importazioni", daemon=True)
+    thread.start()
+    return thread
 
 
 def _install_signal_handlers(lifecycle: Lifecycle) -> None:
@@ -781,15 +818,17 @@ def main(argv: list[str] | None = None) -> int:
         })
         server.start()
         processor.start()
+        _resume_pending_imports(store, processor)
         log.info("Server in ascolto su %s", url)
         _say(f"Sirio OCR {__version__} in esecuzione su {url}")
         if args.senza_finestra:
+            _say(f"Interfaccia: {instance_url(server.port, token)}")
             _say(f"Token per le API (header X-Sirio-Token): {token}")
             _say("Chiusura automatica disattivata: premere Ctrl+C per terminare.")
         if log_file:
             _say(f"Registro: {log_file}")
         if with_window:
-            window = open_window(url, data_dir / PROFILE_DIR)
+            window = open_window(instance_url(server.port, token), data_dir / PROFILE_DIR)
     except Exception as exc:  # noqa: BLE001
         log.critical("Avvio non riuscito", exc_info=True)
         show_error(f"Impossibile avviare Sirio OCR.\n\n{exc}\n\nDettagli nel registro: "

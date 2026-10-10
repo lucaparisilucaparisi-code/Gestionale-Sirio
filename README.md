@@ -70,9 +70,10 @@ fogli vengono inviate ad Anthropic (vedi *Privacy*).
 
 1. **Importa** — trascina nella finestra i PDF (anche multipagina), le immagini
    (JPG, PNG, TIFF) o intere cartelle. Ogni pagina diventa un foglio firma da elaborare.
-2. **Lettura automatica** — i fogli vengono letti in parallelo; per ognuno si vede
-   l'avanzamento. Con la *verifica incrociata* (attiva in modo predefinito) le righe
-   dubbie vengono rilette una seconda volta con immagini ingrandite.
+2. **Lettura automatica** — i fogli vengono letti uno dopo l'altro con il motore
+   locale (in parallelo con Claude); per ognuno si vede l'avanzamento. Con Claude, la
+   *verifica incrociata* (attiva in modo predefinito) rilegge una seconda volta le righe
+   dubbie con immagini ingrandite.
 3. **Revisione** — per ogni foglio la scansione è affiancata a una griglia stile
    Excel con i 31 giorni, modificabile cella per cella:
    - 🟥 **illeggibile**: scritto ma non leggibile, va inserito a mano guardando la scansione;
@@ -112,7 +113,11 @@ Per ogni foglio vengono verificati, tra gli altri:
 - ore settimanali oltre le **ore da PEI**;
 - assenze dell'alunno (con ore riconosciute) e dell'operatore (es. permesso *104*);
 - prestazioni programmate ma non svolte (es. *Ponte di Carnevale*);
-- intestazione incompleta, campi incerti o illeggibili.
+- intestazione incompleta, campi incerti o illeggibili;
+- **possibili fogli duplicati**: più fogli con lo stesso operatore, alunno e mese (ad
+  esempio la stessa pagina scansionata due volte in file diversi), segnalati già nella
+  revisione e nell'anteprima, prima di generare l'Excel, perché le ore non vengano
+  conteggiate due volte.
 
 ## Costi
 
@@ -137,6 +142,9 @@ particolari di dati, art. 9 GDPR).
   addestrare i modelli; valutate comunque con il vostro DPO la nomina a
   responsabile del trattamento e le condizioni contrattuali applicabili.
 - Con il **motore locale** la lettura avviene interamente sul computer.
+- L'applicazione risponde solo a questo computer e solo alla finestra aperta con il
+  collegamento **Sirio OCR** o con *Avvia Sirio OCR*: gli altri utenti dello stesso PC
+  (anche in Desktop remoto) non possono accedere ai documenti.
 - Documenti e immagini importati sono salvati nella cartella dati dell'utente
   (Windows: `%LOCALAPPDATA%\SirioOCR`, non sincronizzata con OneDrive). Dalla
   schermata Documenti si possono eliminare in qualsiasi momento.
@@ -155,6 +163,12 @@ particolari di dati, art. 9 GDPR).
   (compresi i messaggi dell'installazione) sono in `avvio.log`, nella cartella dei
   componenti: `%LOCALAPPDATA%\SirioOCR\runtime\avvio.log` su Windows,
   `.runtime/avvio.log` nella cartella del programma su macOS e Linux.
+- **«Per motivi di sicurezza apri Sirio OCR dal collegamento sul desktop…»:** la
+  pagina è stata aperta da un indirizzo salvato o da un altro browser. Chiudila e
+  avvia Sirio OCR dal collegamento sul desktop (o con *Avvia Sirio OCR*).
+- **Programma chiuso durante l'importazione di un PDF di più pagine:** al successivo
+  avvio le pagine mancanti vengono importate automaticamente, senza duplicare quelle
+  già presenti.
 - **Antivirus o proxy aziendale:** il programma di avvio usa i certificati di
   sistema, quindi funziona anche con gli antivirus che analizzano le connessioni
   HTTPS e con i proxy aziendali già configurati sul computer.

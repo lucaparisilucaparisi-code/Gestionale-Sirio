@@ -7,7 +7,9 @@ chiave API e senza scaricare modelli::
 
     python tests/dev_server.py --porta 8765 --documenti 6
 
-Stampa l'indirizzo e il token. Non chiude il server automaticamente (come
+Stampa l'indirizzo da aprire nel browser (con il segreto dell'avvio ``?k=<token>``,
+senza il quale la pagina non riceve il token) e il token per le API. Non chiude il
+server automaticamente (come
 ``--senza-finestra``): Ctrl+C per terminare. I dati vanno in una cartella
 temporanea, eliminata all'uscita (salvo ``--cartella-dati`` o ``--mantieni``).
 """
@@ -24,6 +26,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -203,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                                            access_log=False, lifespan="off", ws="none"))
 
     def preload() -> None:
+        store.resume_pending_imports(on_document=lambda d: processor.enqueue(d.id))   # come sirio.app
         for name, data in files:
             try:
                 store.add_file(name, data, on_document=lambda d: processor.enqueue(d.id))
@@ -213,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     processor.start()
     threading.Thread(target=preload, name="sirio-dev-precarica", daemon=True).start()
     url = f"http://127.0.0.1:{args.porta}/"
-    print(f"Sirio OCR (sviluppo) su {url}", flush=True)
+    print(f"Sirio OCR (sviluppo) su {url}?k={quote(token, safe='')}", flush=True)
     print(f"Token: {token}", flush=True)
     print(f"Dati: {data_dir}  (export: {config.export_dir()})", flush=True)
     print(f"Esempio: curl -H 'X-Sirio-Token: {token}' {url}api/state", flush=True)

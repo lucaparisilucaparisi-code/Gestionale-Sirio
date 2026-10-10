@@ -4,11 +4,17 @@ Sicurezza (il server ascolta solo su 127.0.0.1):
 
 * ogni richiesta deve avere un header ``Host`` locale (127.0.0.1 / localhost / [::1]):
   protezione dal *DNS rebinding*;
+* il token della sessione e' un segreto dell'avvio: la pagina principale lo contiene
+  (e imposta il cookie ``sirio_token``, HttpOnly, SameSite=Strict) solo se l'indirizzo
+  ha il parametro ``?k=<token>`` con cui l'avvio apre la finestra, oppure se la richiesta
+  ha gia' il cookie valido (ricaricamento della pagina). Altrimenti risponde una pagina
+  che invita ad aprire Sirio OCR dal collegamento: un altro utente dello stesso computer
+  (che condivide l'indirizzo 127.0.0.1) non ottiene il token. I file statici
+  dell'interfaccia restano pubblici (non contengono segreti);
 * ogni richiesta ``/api/*`` (tranne ``/api/health``) deve presentare il token della
   sessione: header ``X-Sirio-Token`` oppure parametro ``?t=<token>``. Per le sole
   richieste di lettura (GET/HEAD: immagini, download) e per ``heartbeat``/``bye``
-  (inviati anche con ``navigator.sendBeacon``) vale anche il cookie ``sirio_token``
-  (HttpOnly, SameSite=Strict) impostato quando viene servita la pagina principale;
+  (inviati anche con ``navigator.sendBeacon``) vale anche il cookie ``sirio_token``;
 * nessun CORS: le pagine di altri siti non possono leggere le risposte.
 
 Tutti gli errori hanno la forma ``{"detail": "messaggio in italiano"}``.
@@ -57,6 +63,7 @@ TOKEN_PLACEHOLDER = "__SIRIO_TOKEN__"
 TOKEN_HEADER = "x-sirio-token"
 TOKEN_COOKIE = "sirio_token"
 TOKEN_QUERY = ("t", "token")
+LAUNCH_QUERY = "k"            # segreto dell'avvio nell'indirizzo della finestra (vedi sirio.app)
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_UPLOAD_FILES = 5000
@@ -85,6 +92,22 @@ _STATUS_TEXT = {
     500: "Errore interno del server.",
     503: "Servizio momentaneamente non disponibile.",
 }
+
+LAUNCH_REQUIRED_PAGE = """<!doctype html>
+<html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>Sirio OCR</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#f3f5f9;color:#1f2937;font:15px/1.55 "Segoe UI",system-ui,-apple-system,sans-serif}
+main{max-width:30rem;margin:16px;padding:28px 32px;background:#fff;border:1px solid #e2e7ef;
+border-radius:12px;box-shadow:0 6px 24px rgba(15,23,42,.06)}
+h1{margin:0 0 10px;font-size:19px;font-weight:650}p{margin:0}
+@media (prefers-color-scheme:dark){body{background:#111827;color:#e5e7eb}main{background:#1f2937;border-color:#374151}}
+</style></head>
+<body><main><h1>Sirio OCR</h1>
+<p>Per motivi di sicurezza apri Sirio OCR dal collegamento sul desktop o con «Avvia Sirio OCR».</p>
+</main></body></html>
+"""
 
 _TIME_FIELDS = ("prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita")
 _ROW_BOOL_FIELDS = ("assenza_alunno", "assenza_operatore", "firma")
@@ -115,6 +138,11 @@ class ApiError(Exception):
 
 def _json(data: Any, status_code: int = 200) -> JSONResponse:
     return JSONResponse(data, status_code=status_code)
+
+
+def _same_secret(value: str | None, secret: str) -> bool:
+    """Confronto a tempo costante (``value`` assente o vuoto: mai uguale)."""
+    return bool(value) and secrets.compare_digest(value.encode("utf-8"), secret.encode("utf-8"))
 
 
 def _host_is_local(host_header: str | None) -> bool:
@@ -225,12 +253,37 @@ def _exportable(doc: Document) -> bool:
     return doc.status == "completato" and doc.is_foglio_firma
 
 
+def _is_possible_duplicate(doc: Document) -> bool:
+    return any(a.codice == val.W13_POSSIBILE_DUPLICATO for a in doc.anomalies)
+
+
+def with_possible_duplicates(docs: list[Document]) -> list[Document]:
+    """I documenti con l'attenzione W13 (possibile foglio duplicato) calcolata al volo.
+
+    Si confrontano i fogli firma completati (gli stessi inclusi nell'Excel): stesso operatore,
+    alunno, mese e anno su più documenti. I documenti coinvolti sono restituiti come copie con
+    anomalie, contatori e stato aggiornati; gli altri sono gli oggetti ricevuti (da usare in sola
+    lettura). La W13 non viene mai salvata nei dati del documento: sparisce da sola quando uno dei
+    fogli viene eliminato o corretto.
+    """
+    gruppi = val.gruppi_possibili_duplicati([d for d in docs if _exportable(d)])
+    if not gruppi:
+        return docs
+    copie = {
+        d.id: d.model_copy(update={"anomalies": list(d.anomalies), "totals": d.totals.model_copy()})
+        for gruppo in gruppi for d in gruppo
+    }
+    val.segnala_possibili_duplicati(list(copie.values()))
+    return [copie.get(d.id, d) for d in docs]
+
+
 def compute_kpi(docs: list[Document]) -> dict:
     """Indicatori per la dashboard.
 
     ``errori``/``attenzioni`` = numero di anomalie di quella gravita', ``illeggibili``/``incerti``
     = numero di campi, ``da_verificare`` = fogli completati con stato diverso da OK non ancora
-    confermati dall'utente, ``verificati`` = fogli confermati.
+    confermati dall'utente, ``verificati`` = fogli confermati, ``possibili_duplicati`` = fogli con
+    l'attenzione W13 (``docs`` già passati da ``with_possible_duplicates``).
     """
     done = [d for d in docs if _exportable(d)]
     return {
@@ -243,6 +296,7 @@ def compute_kpi(docs: list[Document]) -> dict:
         "incerti": sum(d.totals.campi_incerti for d in done),
         "da_verificare": sum(1 for d in done if d.totals.stato != "ok" and not d.user_verified),
         "verificati": sum(1 for d in done if d.user_verified),
+        "possibili_duplicati": sum(1 for d in done if _is_possible_duplicate(d)),
         "documenti_con_errori": sum(1 for d in done if d.totals.stato == "errori"),
         "in_coda": sum(1 for d in docs if d.status == "in_coda"),
         "in_lavorazione": sum(1 for d in docs if d.status == "in_lavorazione"),
@@ -414,15 +468,22 @@ def _bool(value: Any, what: str) -> bool:
     raise ApiError(422, f"{what}: indicare sì o no.")
 
 
-def _hours(value: Any, what: str) -> float | None:
+def _hours(value: Any, what: str, massimo: float = val.MAX_ORE_GIORNO) -> float | None:
+    """Ore da 0 a ``massimo`` (24 per un giorno, 60 per le ore PEI, 744 per il totale mensile)."""
     if value is None or (isinstance(value, str) and (not value.strip() or _DASH_RE.match(value))):
         return None
     if isinstance(value, bool):
         raise ApiError(422, f"{what}: valore delle ore non valido.")
     if isinstance(value, int):
         value = float(value)
-    parsed = val.parse_hours(value)
-    if parsed is None or parsed < 0 or parsed > 744:
+    parsed = val.parse_hours(value, massimo=massimo)
+    if parsed is None:
+        if val.parse_hours(value, massimo=math.inf) is not None:
+            raise ApiError(
+                422,
+                f"{what}: valore fuori intervallo («{_short(value)}»), "
+                f"indicare un numero di ore tra 0 e {val.format_ore(massimo)}.",
+            )
         raise ApiError(422, f"{what}: valore delle ore non valido («{_short(value)}»). Esempi validi: 3, 1,5, 2:30.")
     return round(float(parsed), 4)
 
@@ -516,7 +577,7 @@ def _normalize_header_value(campo: str, value: Any) -> Any:
     if campo == "anno":
         return _year(value)
     if campo in _HEADER_HOURS_FIELDS:
-        return _hours(value, what)
+        return _hours(value, what, val.MAX_ORE_CAMPO[campo])
     if campo == "sostituzione":
         return _sostituzione(value)
     if campo in _HEADER_BOOL_FIELDS:
@@ -768,7 +829,7 @@ class _GuardMiddleware:
         candidates += [conn.query_params.get(name) for name in TOKEN_QUERY]
         if method in ("GET", "HEAD") or (method == "POST" and path in _COOKIE_POST_PATHS):
             candidates.append(conn.cookies.get(TOKEN_COOKIE))
-        return any(c and secrets.compare_digest(c.encode(), self.token.encode()) for c in candidates)
+        return any(_same_secret(c, self.token) for c in candidates)
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         if scope["type"] != "http":
@@ -951,8 +1012,24 @@ def create_app(
             raise ApiError(404, "Documento non trovato: potrebbe essere stato eliminato.")
         return doc
 
+    def _detail(doc: Document) -> JSONResponse:
+        """Dettaglio del documento, con la W13 calcolata rispetto agli altri documenti correnti."""
+        others = [d for d in store.list(copy=False) if d.id != doc.id]
+        doc = with_possible_duplicates([doc, *others])[0]
+        grid = store.load_grid(doc.id)
+        return _json(document_payload(doc, grid.to_dict() if grid else None))
+
     # ------------------------------------------------------------ pagina
     def _index(request: Request) -> Response:
+        launched = _same_secret(request.query_params.get(LAUNCH_QUERY), token)
+        if not launched and not _same_secret(request.cookies.get(TOKEN_COOKIE), token):
+            # nessun segreto dell'avvio: niente token (un altro utente dello stesso computer
+            # puo' raggiungere 127.0.0.1 ma non deve accedere ai dati)
+            return HTMLResponse(
+                LAUNCH_REQUIRED_PAGE,
+                status_code=403,
+                headers={"Cache-Control": "no-store", "Content-Security-Policy": "frame-ancestors 'none'"},
+            )
         index = WEB_DIR / "index.html"
         try:
             html = index.read_text(encoding="utf-8")
@@ -996,7 +1073,7 @@ def create_app(
             known = None
         if known == revision:
             return _json({"revision": revision, "unchanged": True})
-        docs = store.list(copy=False)
+        docs = with_possible_duplicates(store.list(copy=False))
         return _json({
             "revision": revision,
             "documents": [doc_summary(d) for d in docs],
@@ -1079,7 +1156,7 @@ def create_app(
     # ------------------------------------------------------------ documenti
     @app.get("/api/documents")
     def list_documents() -> JSONResponse:
-        return _json([doc_summary(d) for d in store.list(copy=False)])
+        return _json([doc_summary(d) for d in with_possible_duplicates(store.list(copy=False))])
 
     @app.delete("/api/documents")
     def delete_all() -> JSONResponse:
@@ -1091,9 +1168,7 @@ def create_app(
 
     @app.get("/api/documents/{doc_id}")
     def get_document(doc_id: str) -> JSONResponse:
-        doc = _doc_or_404(doc_id)
-        grid = store.load_grid(doc_id)
-        return _json(document_payload(doc, grid.to_dict() if grid else None))
+        return _detail(_doc_or_404(doc_id))
 
     @app.put("/api/documents/{doc_id}")
     def put_document(doc_id: str, payload: dict[str, Any] = Body(...)) -> JSONResponse:  # noqa: B008
@@ -1102,8 +1177,7 @@ def create_app(
         if updated is None:
             raise ApiError(404, "Documento non trovato: potrebbe essere stato eliminato.")
         _learn(updated)
-        grid = store.load_grid(doc_id)
-        return _json(document_payload(updated, grid.to_dict() if grid else None))
+        return _detail(updated)
 
     @app.post("/api/documents/{doc_id}/reprocess")
     def reprocess(doc_id: str) -> JSONResponse:
@@ -1185,7 +1259,8 @@ def create_app(
             docs = [by_id[i.strip()] for i in wanted if i.strip() in by_id]
         else:
             docs = [d for d in docs if _exportable(d)]
-        return _json(preview_payload(docs, giorni_vuoti=giorni_vuoti))
+        # W13 tra i documenti dell'anteprima, come nel file Excel che ne risulterà
+        return _json(preview_payload(with_possible_duplicates(docs), giorni_vuoti=giorni_vuoti))
 
     # ------------------------------------------------------------ anagrafica
     def _registry_change(action: Callable[[Anagrafica], Any]) -> Any:

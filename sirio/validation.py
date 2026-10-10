@@ -44,6 +44,15 @@ from sirio.models import (
 
 TOLLERANZA = 0.01
 MAX_ORE_GIORNO = 24.0
+MAX_ORE_PEI = 60.0            # ore settimanali previste dal PEI
+MAX_ORE_MESE = 744.0          # 31 giorni x 24 ore: tetto del totale mensile dichiarato
+
+# Valore massimo ammesso per ciascun campo in ore (``parse_hours(..., massimo=...)``).
+MAX_ORE_CAMPO: dict[str, float] = {
+    "ore_dichiarate": MAX_ORE_GIORNO,
+    "ore_pei": MAX_ORE_PEI,
+    "totale_mensile_dichiarato": MAX_ORE_MESE,
+}
 
 # --- Codici anomalia ----------------------------------------------------------
 
@@ -389,34 +398,36 @@ _RE_ORE_DECIMALI = re.compile(r"^(?:\d{1,3}(?:[.,]\d+)?|[.,]\d+)$")
 _RE_SOLO_MINUTI = re.compile(r"^(\d{1,4})\s*(?:minuti|minuto|min|')$")
 
 
-def _ore_valide(v: float) -> float | None:
-    if not math.isfinite(v) or v < 0 or v > MAX_ORE_GIORNO:
+def _ore_valide(v: float, massimo: float = MAX_ORE_GIORNO) -> float | None:
+    if not math.isfinite(v) or v < 0 or v > massimo:
         return None
     return v + 0.0
 
 
-def parse_hours(s: str | float | None) -> float | None:
-    """Interpreta un numero di ore -> float, None se assente o non plausibile (< 0 o > 24).
+def parse_hours(s: str | float | None, *, massimo: float = MAX_ORE_GIORNO) -> float | None:
+    """Interpreta un numero di ore -> float, None se assente o non plausibile (< 0 o > ``massimo``).
 
     Accetta "1,5", "1.5", "3", "3h", "3 ore", "2:30" (2,5), "2h30", "1 e 30" (1,5),
     "1 e mezza", "1½", "mezz'ora", "30 min"; i numeri passano invariati.
+    ``massimo`` vale 24 (ore di un giorno); per i campi d'intestazione si usa
+    ``MAX_ORE_CAMPO`` (60 per le ore PEI settimanali, 744 per il totale mensile).
     """
     if s is None or isinstance(s, bool):
         return None
     if isinstance(s, (int, float)):
-        return _ore_valide(float(s))
+        return _ore_valide(float(s), massimo)
     t = str(s).strip().lower().replace("’", "'")
     if not t:
         return None
     m = _RE_ORE_FRAZIONE.match(t)
     if m:
-        return _ore_valide(int(m.group(1) or 0) + _FRAZIONI[m.group(2)])
+        return _ore_valide(int(m.group(1) or 0) + _FRAZIONI[m.group(2)], massimo)
     t = unicodedata.normalize("NFKC", t)
     if t in ("mezz'ora", "mezzora", "mezza ora"):
         return 0.5
     m = _RE_SOLO_MINUTI.match(t)
     if m:
-        return _ore_valide(int(m.group(1)) / 60)
+        return _ore_valide(int(m.group(1)) / 60, massimo)
     t = re.sub(r"(?<=\d)\s*h\s*(?=\d)", ":", t)  # "2h30" -> "2:30"
     t = re.sub(r"(?<=\d)\s*(?:minuti|minuto|min|m|')\s*$", "", t)  # "2:30 min", "1 e 30'"
     t = re.sub(r"(?<=\d)\s*(?:ore|ora|hrs|hr|hh|h)\b", " ", t)  # "3h", "3ore", "1 ora e 30"
@@ -427,18 +438,18 @@ def parse_hours(s: str | float | None) -> float | None:
         return None
     m = _RE_ORE_E_PAROLE.match(t)
     if m:
-        return _ore_valide(int(m.group(1)) + _FRAZIONI_PAROLE[m.group(2)])
+        return _ore_valide(int(m.group(1)) + _FRAZIONI_PAROLE[m.group(2)], massimo)
     m = _RE_ORE_E_MINUTI.match(t)
     if m:
         minuti = int(m.group(2))
-        return _ore_valide(int(m.group(1)) + minuti / 60) if minuti <= 59 else None
+        return _ore_valide(int(m.group(1)) + minuti / 60, massimo) if minuti <= 59 else None
     for candidato in (t, t.translate(_CONFUSABILI)):
         m = _RE_ORE_DUEPUNTI.match(candidato)
         if m:
             minuti = int(m.group(2))
-            return _ore_valide(int(m.group(1)) + minuti / 60) if minuti <= 59 else None
+            return _ore_valide(int(m.group(1)) + minuti / 60, massimo) if minuti <= 59 else None
         if _RE_ORE_DECIMALI.match(candidato):
-            return _ore_valide(float(candidato.replace(",", ".")))
+            return _ore_valide(float(candidato.replace(",", ".")), massimo)
     return None
 
 
@@ -1254,6 +1265,21 @@ def _origine(doc: Document) -> str:
     return f"«{doc.source_file}»" + (f" (pagina {doc.source_page})" if doc.page_count > 1 else "")
 
 
+def gruppi_possibili_duplicati(docs: Sequence[Document]) -> list[list[Document]]:
+    """Gruppi di almeno due documenti con lo stesso operatore, alunno, mese e anno (W13).
+
+    I nomi sono confrontati senza maiuscole, accenti, punteggiatura e ordine delle parole; i
+    documenti senza operatore, alunno o periodo valido non sono confrontati. Non modifica nulla.
+    """
+    gruppi: dict[tuple[str, str, int, int], list[Document]] = {}
+    for doc in docs:
+        periodo = _periodo(doc.header)
+        operatore, alunno = _chiave_nome(doc.header.operatore), _chiave_nome(doc.header.alunno)
+        if periodo is not None and operatore and alunno:
+            gruppi.setdefault((operatore, alunno, periodo.mese, periodo.anno), []).append(doc)
+    return [gruppo for gruppo in gruppi.values() if len(gruppo) > 1]
+
+
 def segnala_possibili_duplicati(docs: Sequence[Document]) -> None:
     """Controllo tra documenti (W13): fogli firma con lo stesso operatore, alunno, mese e anno.
 
@@ -1262,19 +1288,12 @@ def segnala_possibili_duplicati(docs: Sequence[Document]) -> None:
     e stato. I documenti devono essere già validati; quelli senza operatore, alunno o periodo
     valido non sono confrontati. Una W13 di una chiamata precedente viene sostituita.
     """
-    gruppi: dict[tuple[str, str, int, int], list[Document]] = {}
     for doc in docs:
         if any(a.codice == W13_POSSIBILE_DUPLICATO for a in doc.anomalies):
             doc.anomalies, doc.totals = _finalizza(
                 [a for a in doc.anomalies if a.codice != W13_POSSIBILE_DUPLICATO], doc.totals
             )
-        periodo = _periodo(doc.header)
-        operatore, alunno = _chiave_nome(doc.header.operatore), _chiave_nome(doc.header.alunno)
-        if periodo is not None and operatore and alunno:
-            gruppi.setdefault((operatore, alunno, periodo.mese, periodo.anno), []).append(doc)
-    for gruppo in gruppi.values():
-        if len(gruppo) < 2:
-            continue
+    for gruppo in gruppi_possibili_duplicati(docs):
         for doc in gruppo:
             altri = [_origine(o) for o in gruppo if o is not doc]
             w13 = _anomalia(

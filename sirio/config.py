@@ -14,6 +14,8 @@ from typing import Literal
 import platformdirs
 from pydantic import BaseModel, ValidationError
 
+from sirio.fsutil import replace_with_retry
+
 log = logging.getLogger(__name__)
 
 APP_NAME = "Sirio OCR"
@@ -101,7 +103,7 @@ def _atomic_write(path: Path, text: str, private: bool = False) -> None:
             fh.write(text)
         if private:
             os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
