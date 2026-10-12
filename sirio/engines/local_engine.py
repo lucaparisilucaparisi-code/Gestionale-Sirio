@@ -2812,13 +2812,31 @@ def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, ka, kb).ratio()
 
 
-def _text_field(reading: Reading | None, min_conf: float = 0.55, floor: float = 0.12) -> _Field:
-    """Campo di testo libero (nomi): lettura libera ripulita."""
+NOME_CONF_SICURA = 0.85      # nomi scritti a mano: sicuri solo con lettura molto convinta
+_RE_RIPETIZIONE = re.compile(r"(.{1,3}?)\1{3,}")
+
+
+def _nome_degenere(text: str) -> bool:
+    """Lettura "impazzita" del riconoscitore: un frammento ripetuto in loop
+    ("R.R.R.R.R", "ANANANAN") o un nome fatto quasi solo di lettere isolate.
+    Non e' un nome: va trattato come illeggibile, non mostrato come sicuro."""
+    compatto = text.replace(" ", "")
+    if _RE_RIPETIZIONE.search(compatto):
+        return True
+    parole = text.split()
+    singole = sum(1 for t in parole if len(re.sub(r"[^A-ZÀÈÉÌÒÙ0-9]", "", t)) <= 1)
+    return len(parole) >= 4 and singole / len(parole) > 0.5
+
+
+def _text_field(reading: Reading | None, min_conf: float = NOME_CONF_SICURA, floor: float = 0.12) -> _Field:
+    """Campo di testo libero (nomi): lettura libera ripulita. I nomi propri scritti
+    a mano sono letti spesso in modo approssimativo: restano da verificare salvo
+    lettura molto convinta (l'anagrafica li conferma dai mesi successivi)."""
     if reading is None:
         return _Field(illeggibile=True)
     text = _clean_name(reading.free_text)
     conf = reading.free_confidence
-    if not text or not re.search(r"[A-Z0-9ÀÈÉÌÒÙ]", text) or conf < floor:
+    if not text or not re.search(r"[A-Z0-9ÀÈÉÌÒÙ]", text) or conf < floor or _nome_degenere(text):
         return _Field(illeggibile=True, confidence=conf)
     return _Field(value=text, confidence=conf, incerto=conf < min_conf)
 

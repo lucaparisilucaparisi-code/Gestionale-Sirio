@@ -1646,3 +1646,28 @@ def test_programmed_duration_different_from_same_weekday_is_flagged():
     res = le.assemble(plan, readings, _grid())
     assert {"prog_entrata", "prog_uscita"} <= set(res.rows[16].incerti)
     assert not res.rows[2].incerti and not res.rows[9].incerti
+
+
+def _free_reading(testo: str, conf: float) -> "le.Reading":
+    """Lettura libera con fiducia media per token ``conf`` (free_confidence)."""
+    n = 5
+    return le.Reading([], testo, (n + 1) * math.log(conf), n)
+
+
+def test_nome_letto_in_loop_e_illeggibile_e_nomi_incerti_segnalati():
+    """Una lettura "impazzita" del nome ("MR.R.R.R.R.R.R") non deve finire nel titolo
+    del documento come nome sicuro: e' illeggibile. Un nome letto con fiducia
+    media resta da verificare; con fiducia molto alta e' sicuro."""
+    assert le._nome_degenere("MR.R.R.R.R.R.R.R.R.R.R.R.R")
+    assert le._nome_degenere("ANANANANA")
+    assert le._nome_degenere("M A R I O R")
+    assert not le._nome_degenere("ROSSI MARIO")
+    assert not le._nome_degenere("IC 9 VIA ROMA")
+    assert not le._nome_degenere("COOP. SOC. SIRIO")
+
+    loop = le._text_field(_free_reading("MR.R.R.R.R.R.R.R.R", 0.95))
+    assert loop.illeggibile and loop.value is None
+    medio = le._text_field(_free_reading("ROSSI MARIO", 0.7))
+    assert medio.value == "ROSSI MARIO" and medio.incerto
+    alto = le._text_field(_free_reading("ROSSI MARIO", 0.95))
+    assert alto.value == "ROSSI MARIO" and not alto.incerto
