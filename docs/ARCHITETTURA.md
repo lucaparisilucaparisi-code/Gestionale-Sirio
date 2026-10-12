@@ -339,7 +339,7 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    firmata con l'orario effettivo; firma o crocetta in una riga senza orari, ore, trattini e note
    (segno isolato: timbro, firma del piè di pagina, macchia); nota breve del vocabolario ("104")
    proposta da verificare invece di essere scartata; nota scritta per davvero (due righe, o
-   inchiostro proprio largo e alto come una parola) di cui nessuna lettura è accettata →
+   almeno tre segni larghi e alti come una parola breve, es. "104") di cui nessuna lettura è accettata →
    `illeggibili`, mai vuota in silenzio (lo stesso per ogni campo: inchiostro proprio presente e
    nessun valore → segnalato). Intestazione: mese/anno sicuri
    quando il nome del mese è letto (lettura vincolata e libera concordi) e il calendario dei

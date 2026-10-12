@@ -1519,6 +1519,25 @@ def test_two_line_note_written_but_not_read_is_flagged():
     assert not _wrong_unflagged(truth, res)
 
 
+def test_short_note_written_but_not_read_is_flagged():
+    """Nota breve di tre segni ("104", larga circa una riga): se la lettura non viene
+    accettata e' illeggibile, non vuota in silenzio (prima serviva una larghezza di 1,5
+    righe: un "104" vero ne misura 1-1,5)."""
+    for seed in (0, 5):
+        page, truth = _degraded_page(seed=seed)
+        junk = le.Reading([], "RE 9", -3.0, 3)
+        fake = FakeRecognizer(truth, {"rows.10.note": junk})
+        res = le.LocalEngine(recognizer=fake).extract(page, lambda *_: None)
+        assert "rows.10.note" in fake.keys
+        r = res.rows[9]
+        assert r.note is None and "note" in r.illeggibili, (seed, r)
+        assert not _wrong_unflagged(truth, res)
+    # un tratto solo (coda di firma) largo una riga resta ignorato
+    canvas = np.full((40, 120), 255, np.uint8)
+    canvas[20:23, 10:70] = 0
+    assert not le._substantial_note(canvas, 50.0, le.NOTA_BREVE_LARGHEZZA)
+
+
 def test_unread_note_flagged_only_when_really_written():
     """Lettura breve fuori vocabolario: scrittura vera (``note_scritta``) -> illeggibile;
     segno piccolo (coda di firma, tratto) -> ignorato come prima."""

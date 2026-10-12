@@ -63,8 +63,8 @@ Pipeline di una pagina
    parole note (vocabolario generico della scuola, abbreviazioni puntate
    comprese) senza numeri; le letture brevi fuori vocabolario (code di firme,
    timbri, tratti) non diventano note. Una nota scritta per davvero (due righe,
-   o inchiostro largo e alto come una parola) che non viene letta e' illeggibile,
-   mai vuota in silenzio.
+   o almeno tre segni larghi e alti come una parola breve, es. "104") che non
+   viene letta e' illeggibile, mai vuota in silenzio.
 
 Precisione misurata (CPU a 4 core)
 ----------------------------------
@@ -2131,16 +2131,19 @@ NOTE_MIN_HEIGHT = 0.3
 NOTA_SCRITTA_LARGHEZZA = 1.5   # inchiostro largo almeno cosi' (righe)...
 NOTA_SCRITTA_ALTEZZA = 0.3     # ... e alto almeno cosi' (righe), in piu' tratti: e' scrittura
 NOTA_SCRITTA_TRATTI = 3
+NOTA_BREVE_LARGHEZZA = 0.8     # nota breve di tre segni ("104": circa 1-1,5 righe): scritta per davvero
+                               # (nel resto lasciato da un timbro si chiede la larghezza piena)
 
 
-def _substantial_note(crop: np.ndarray, unit: float) -> bool:
-    """Il ritaglio pulito della nota contiene scrittura vera: inchiostro largo e alto
-    come una parola, fatto di piu' tratti (non una coda di firma o un trattino)."""
+def _substantial_note(crop: np.ndarray, unit: float, min_width: float = NOTA_SCRITTA_LARGHEZZA) -> bool:
+    """Il ritaglio pulito della nota contiene scrittura vera: inchiostro largo (almeno
+    ``min_width`` righe) e alto come una parola, fatto di piu' tratti (non una coda di
+    firma o un trattino)."""
     m = crop < 160
     if not m.any():
         return False
     ys, xs = np.nonzero(m)
-    if xs.max() - xs.min() + 1 < NOTA_SCRITTA_LARGHEZZA * unit or ys.max() - ys.min() + 1 < NOTA_SCRITTA_ALTEZZA * unit:
+    if xs.max() - xs.min() + 1 < min_width * unit or ys.max() - ys.min() + 1 < NOTA_SCRITTA_ALTEZZA * unit:
         return False
     n, _lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
     big = int((stats[1:, cv2.CC_STAT_AREA] >= max(6.0, (0.06 * unit) ** 2)).sum()) if n > 1 else 0
@@ -2168,6 +2171,7 @@ class PageMarks:
         except Exception:  # noqa: BLE001 - analisi aggiuntiva
             log.warning("Ricerca delle pieghe del foglio non riuscita", exc_info=True)
         self.crease_mask = crease_mask
+        self._dark: np.ndarray | None = None
         self.strikes = find_strikes(gray, grid, ignore=crease_mask)
         if crease_mask is not None and crease_mask.shape[:2] == gray.shape[:2]:
             self.strikes.mask = crease_mask if self.strikes.mask is None else (self.strikes.mask | crease_mask)
@@ -2240,7 +2244,9 @@ class PageMarks:
         if not self.creases:
             return False
         try:
-            return ink.ink_under_crease(self.img, self.grid.cell(g, f), self.creases, self.grid.row_height,
+            if self._dark is None:      # grigio "canale piu' scuro" calcolato una volta per pagina
+                self._dark = ink._darkness_gray(self.img)
+            return ink.ink_under_crease(self._dark, self.grid.cell(g, f), self.creases, self.grid.row_height,
                                         self.crease_mask)
         except Exception:  # noqa: BLE001
             log.debug("Controllo della scrittura sotto la piega non riuscito", exc_info=True)
@@ -2452,9 +2458,10 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 key = f"rows.{g}.note"
                 plan.aspect[key] = crop.shape[1] / max(1.0, float(crop.shape[0]))
                 lines = split_text_lines(crop, rh)
-                if len(lines) > 1 or _substantial_note(crop, rh):
-                    # scrittura vera (due righe, o larga e alta come una parola): se nessuna
-                    # lettura viene accettata la nota va segnalata, non lasciata vuota
+                if len(lines) > 1 or _substantial_note(crop, rh, NOTA_BREVE_LARGHEZZA):
+                    # scrittura vera (due righe, o almeno tre segni larghi e alti come una
+                    # parola breve, es. "104"): se nessuna lettura viene accettata la nota
+                    # va segnalata, non lasciata vuota
                     plan.note_scritta.add(g)
                 if len(lines) == 1:
                     plan.requests.append(_text_request(key, crop, n_lex, beams=4, free_beams=3,
