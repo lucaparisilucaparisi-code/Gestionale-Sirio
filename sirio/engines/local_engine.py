@@ -3618,6 +3618,8 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
                 row.incerti.append("note")
         if fld.confidence is not None:
             row.confidenza["note"] = round(fld.confidence, 3)
+    # orario fuori dall'intervallo di tutti gli altri orari sicuri del foglio: sospetto
+    _flag_time_outliers(rows)
     for row in rows:
         st = plan.cells.get(row.giorno, {})
         # firma o crocetta in una riga senza orari, ore e note: segno isolato (timbro,
@@ -3669,14 +3671,58 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
 
 def _lonely_marks(row: DayRow, states: dict[str, str]) -> list[str]:
     """Firme e crocette di una riga senza orari, ore, trattini e note (nessuna
-    scrittura nelle celle di testo): un segno isolato e' sospetto."""
-    if row.note or row.trattino_effettivo:
+    scrittura nelle celle di testo): un segno isolato e' sospetto.
+
+    Una nota letta con incertezza non conta come contenuto della riga: spesso e'
+    proprio un pezzo del timbro o della firma del pie' di pagina che ha prodotto
+    anche il falso segno."""
+    nota_sicura = bool(row.note) and "note" not in row.incerti and "note" not in row.illeggibili
+    if nota_sicura or row.trattino_effettivo:
         return []
-    if any(states.get(f) in (TESTO, TRATTINO, NULLO) for f in (*TEXT_FIELDS, "note")):
+    if any(states.get(f) in (TESTO, TRATTINO, NULLO) for f in TEXT_FIELDS):
         return []
     if any(getattr(row, f) is not None for f in TEXT_FIELDS):
         return []
     return [f for f in ("firma", "assenza_alunno", "assenza_operatore") if getattr(row, f)]
+
+
+FUORI_INTERVALLO_MIN = 90      # minuti oltre il minimo/massimo degli altri orari sicuri
+FUORI_INTERVALLO_RIFERIMENTI = 6
+
+
+def _flag_time_outliers(rows: list[DayRow]) -> list[tuple[int, str]]:
+    """Segnala (senza cambiarlo) un orario letto con sicurezza che cade ben fuori
+    dall'intervallo di tutti gli altri orari sicuri del foglio, di righe diverse:
+    es. un'uscita "16:00" su un foglio in cui nessun altro orario supera le 14:00
+    e' quasi sempre una cifra fraintesa ("14" letto "16"). Serve un numero minimo
+    di riferimenti, per non segnalare i fogli con pochi orari."""
+    sicuri: list[tuple[int, int]] = []
+    for r in rows:
+        for f in TIME_FIELDS:
+            v = getattr(r, f)
+            if v and f not in r.incerti and f not in r.illeggibili:
+                t = parse_time(v)
+                if t is not None:
+                    sicuri.append((r.giorno, t[0] * 60 + t[1]))
+    segnalati: list[tuple[int, str]] = []
+    for r in rows:
+        altri = [m for g, m in sicuri if g != r.giorno]
+        if len(altri) < FUORI_INTERVALLO_RIFERIMENTI:
+            continue
+        lo, hi = min(altri), max(altri)
+        for f in TIME_FIELDS:
+            v = getattr(r, f)
+            if not v or f in r.incerti or f in r.illeggibili:
+                continue
+            t = parse_time(v)
+            if t is None:
+                continue
+            m = t[0] * 60 + t[1]
+            if m > hi + FUORI_INTERVALLO_MIN or m < lo - FUORI_INTERVALLO_MIN:
+                r.incerti.append(f)
+                r.confidenza[f] = min(r.confidenza.get(f, 0.5), 0.5)
+                segnalati.append((r.giorno, f))
+    return segnalati
 
 
 def _flag_unreliable_grid(grid: TableGrid, rows: list[DayRow], header: Header) -> list[int]:

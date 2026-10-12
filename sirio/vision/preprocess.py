@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -989,13 +990,22 @@ def _track(peaks: list[np.ndarray], seed: int, spacing: float, max_miss: int) ->
     return np.array(rows) if rows else np.zeros((0, k_n))
 
 
+MAX_TRACCE = 300   # pezzi di linea: le pagine reali ne hanno fino a ~100; oltre, non e' la tabella del modulo
+TEMPO_MAX_UNIONE = 4.0   # secondi: sulle pagine anomale ci si ferma all'unione fatta finora
+
+
 def _join_fragments(tracks: list[np.ndarray], spacing: float) -> list[np.ndarray]:
     """Unisce i pezzi della stessa linea interrotta (firme che la attraversano,
     tratti sbiaditi): il pezzo B prosegue il pezzo A se, nel buco fra i due, le
     linee vicine misurate su entrambi i lati si spostano quanto serve per
     passare dalla fine di A all'inizio di B."""
     tracks = [t for t in tracks if int((~np.isnan(t)).sum()) >= 2]
-    while True:
+    if len(tracks) > MAX_TRACCE:
+        # troppe "linee" (pagina a righe fitte, retino, rumore): non e' il modulo e
+        # l'unione costerebbe O(n^3) per passo; si rinuncia a unire i pezzi
+        return tracks
+    scadenza = time.monotonic() + TEMPO_MAX_UNIONE
+    while time.monotonic() < scadenza:
         spans = []
         for t in tracks:
             idx = np.nonzero(~np.isnan(t))[0]
@@ -1023,6 +1033,8 @@ def _join_fragments(tracks: list[np.ndarray], spacing: float) -> list[np.ndarray
         _, a, b = best
         merged = np.where(np.isnan(tracks[a]), tracks[b], tracks[a])
         tracks = [t for i, t in enumerate(tracks) if i not in (a, b)] + [merged]
+    log.warning("Unione dei tratti di linea interrotta per tempo (%d tratti): pagina anomala", len(tracks))
+    return tracks
 
 
 def _clean_tracks(pos: np.ndarray, spacing: float, min_count: int) -> np.ndarray:

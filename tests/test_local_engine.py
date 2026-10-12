@@ -1503,6 +1503,40 @@ def test_isolated_signature_or_absence_mark_is_never_sure():
     assert res.rows[9].assenza_operatore and not ({"firma", "assenza_operatore"} & set(res.rows[9].incerti))
 
 
+def test_signature_on_row_with_only_an_uncertain_note_is_flagged():
+    """Firma del pie' di pagina che sconfina in una riga vuota, insieme a un pezzo di
+    timbro letto come nota incerta: la nota incerta non rende la riga "compilata",
+    quindi la firma resta da verificare. Con una nota letta con sicurezza no."""
+    from sirio.models import DayRow
+
+    st = {"note": le.TESTO, "firma": le.FIRMA}
+    dubbia = DayRow(giorno=30, firma=True, note="11 ALL MUN.", incerti=["note"])
+    assert le._lonely_marks(dubbia, st) == ["firma"]
+    sicura = DayRow(giorno=30, firma=True, note="SCIOPERO")
+    assert le._lonely_marks(sicura, st) == []
+    compilata = DayRow(giorno=30, firma=True, prog_entrata="08:00", note="X", incerti=["note"])
+    assert le._lonely_marks(compilata, {**st, "prog_entrata": le.TESTO}) == []
+
+
+def test_time_far_outside_the_sheet_range_is_flagged_not_changed():
+    """Un orario sicuro molto fuori dall'intervallo di tutti gli altri orari sicuri del
+    foglio (es. "16:00" dove nessun altro supera le 14:00) e' segnalato, mai cambiato;
+    entro l'intervallo, o con pochi riferimenti, nessun segnale."""
+    from sirio.models import DayRow
+
+    rows = [DayRow(giorno=g, prog_entrata="11:00", prog_uscita="14:00", eff_entrata="11:00", eff_uscita="14:00")
+            for g in (2, 3, 4)]
+    rows.append(DayRow(giorno=9, prog_entrata="11:00", prog_uscita="16:00", assenza_alunno=True))
+    rows.append(DayRow(giorno=10, prog_entrata="10:00", prog_uscita="13:00"))
+    flagged = le._flag_time_outliers(rows)
+    assert flagged == [(9, "prog_uscita")]
+    assert rows[3].prog_uscita == "16:00" and "prog_uscita" in rows[3].incerti
+    assert not rows[4].incerti and not rows[0].incerti
+    pochi = [DayRow(giorno=2, prog_entrata="08:00", prog_uscita="10:00"),
+             DayRow(giorno=3, prog_entrata="14:00", prog_uscita="17:00")]
+    assert le._flag_time_outliers(pochi) == []
+
+
 def test_two_line_note_written_but_not_read_is_flagged():
     """Nota scritta piccola su due righe (es. un recupero): se nessuna lettura viene
     accettata la nota e' illeggibile, mai vuota in silenzio (prima: note=None, nessun avviso)."""

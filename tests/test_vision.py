@@ -831,3 +831,17 @@ def test_no_creases_on_regular_sheets():
     for seed in (0, 3, 5):
         page, grid = _processed(seed)
         assert ink.find_creases(page, grid) == ([], None)
+
+
+def test_pagina_a_righe_fitte_non_blocca_il_raddrizzamento():
+    """Una pagina piena di righe verticali fitte (retino, foglio a righe, rumore)
+    produce centinaia di "linee": il raddrizzamento deve comunque terminare in
+    pochi secondi invece di bloccare la coda di lettura (prima: oltre 11 minuti)."""
+    import time
+
+    img, _ = make_synthetic_sheet(seed=0, dpi=150)
+    img[:, ::7] = 0
+    t = time.monotonic()
+    out = normalize_page(img)
+    assert out.ndim == 3
+    assert time.monotonic() - t < 60
