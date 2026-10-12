@@ -1684,6 +1684,18 @@ def test_hours_with_only_doubtful_times_are_flagged():
     assert row.ore_dichiarate == 2.0 and "ore_dichiarate" in row.incerti
 
 
+def test_halftone_dots_do_not_join_writing():
+    """Fondino retinato delle fotocopie: i puntini isolati si tolgono prima di ricucire i
+    tratti (altrimenti firma, nota e piè di pagina diventano un'unica struttura); i
+    tratti veri restano."""
+    m = np.zeros((200, 400), bool)
+    m[::6, ::6] = True                                   # retino
+    m[100:104, 50:350] = True                            # tratto
+    out = le._drop_specks(m, 60.0)
+    assert out[100:104, 50:350].all()
+    assert out.sum() == m[100:104, 50:350].sum()
+
+
 def test_time_far_outside_the_sheet_range_is_flagged_not_changed():
     """Un orario sicuro molto fuori dall'intervallo di tutti gli altri orari sicuri del
     foglio (es. "16:00" dove nessun altro supera le 14:00) e' segnalato, mai cambiato;

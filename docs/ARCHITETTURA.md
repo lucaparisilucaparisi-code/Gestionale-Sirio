@@ -319,10 +319,14 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    verificare (le crocette e le firme vere misurate sono tutte oltre 130). Anche la forma conta:
    una "firma" o una "crocetta" che è un tratto solo (scarto dalla retta sotto 0,12 o 0,08
    righe: la barra di una riga annullata) è da verificare; le firme vere misurate stanno oltre
-   0,18. I "timbri" alti più di 8 righe (fondino retinato delle fotocopie) o lontani dal fondo
+   0,18. Nelle fotocopie con il fondino retinato i puntini non si ricuciono (né nella ricerca di
+   timbri e firme del piè di pagina né nella rimozione delle firme che sconfinano nelle Note):
+   altrimenti il retino unisce firma, nota e piè di pagina in un'unica "struttura" e le note
+   spariscono. I "timbri" alti più di 8 righe (fondino retinato) o lontani dal fondo
    della tabella (oltre 3 righe) non sono timbri: questi ultimi sono blocchi di note scritte
    su più righe, non timbri: si leggono. Una nota su due righe attaccata alla firma non sparisce
-   togliendo la firma che sconfina: si legge e si segnala. Una cella di orari con
+   togliendo la firma che sconfina, né una nota lunga (oltre 2,5 righe) che comincia attaccata
+   alla firma: si legge e si segnala. Una cella di orari con
    **due fasce scritte una sopra l'altra** ("9:00" sopra "13:00") si legge riga per riga: entrata
    = la prima, uscita = l'ultima, sempre segnalata (motivo `due_orari`). Se il ritaglio pulito non trova scrittura ma `PageInk` sì, si legge
    il ritaglio di `PageInk` e il valore resta segnalato.
@@ -376,7 +380,8 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    `illeggibili`, mai vuota in silenzio (lo stesso per ogni campo: inchiostro proprio presente e
    nessun valore → segnalato). Firma del coordinatore: contano solo i segni per lo più dentro la
    sua riga; i tratti che vengono da fuori (firma del referente che sale nella riga, timbro che
-   la copre) la rendono da verificare. Intestazione: mese/anno sicuri
+   la copre) la rendono da verificare; una firma messa subito sopra la casella (nella riga del
+   giorno 31) conta come presente, da verificare. Intestazione: mese/anno sicuri
    quando il nome del mese è letto (lettura vincolata e libera concordi) e il calendario dei
    giorni compilati esclude ogni altro anno non futuro; totale mensile segnalato se diverso dalla
    somma delle ore lette (salvo ore illeggibili che spieghino la differenza).

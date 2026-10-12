@@ -1915,6 +1915,8 @@ def _inside_stamp(gray: np.ndarray, box: Box, stamps: Sequence[Box]) -> bool:
 STRUTTURA_SOTTO = 0.3      # quota minima dell'inchiostro di una struttura sotto la tabella (pie' di pagina)...
 STRUTTURA_SOTTO_RIGHE = 1.0   # ... oppure estensione sotto la tabella (righe)
 QUOTA_ESTRANEA = 0.5       # quota dell'inchiostro della cella che appartiene a una struttura: non e' della riga
+STRUTTURA_PUNTINO = 0.07   # lato (righe) sotto cui un frammento e' un puntino del retino
+STRUTTURA_MAX_RIGHE = 10.0 # righe: oltre, la "struttura" che sale nella tabella non e' timbro o firma
 QUOTA_DUBBIA = 0.15        # ... quota oltre la quale il segno della riga e' da verificare
 
 
@@ -1956,6 +1958,16 @@ class ForeignInk:
         return out
 
 
+def _drop_specks(m: np.ndarray, unit: float) -> np.ndarray:
+    """Maschera senza i puntini isolati (retino grigio delle fotocopie, grana della carta)."""
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return m
+    specks = st[:, cv2.CC_STAT_AREA] < max(4.0, (STRUTTURA_PUNTINO * unit) ** 2)
+    specks[0] = False
+    return m & ~specks[lab]
+
+
 def foreign_ink(gray: np.ndarray, grid: TableGrid) -> ForeignInk | None:
     """Strutture d'inchiostro che non appartengono a una riga (vedi ``ForeignInk``).
 
@@ -1977,6 +1989,9 @@ def foreign_ink(gray: np.ndarray, grid: TableGrid) -> ForeignInk | None:
     m = region < _ink_threshold(_paper_level(region))
     rows = [y - zy0 for y in grid.row_y] + ([grid.total_row[1] - zy0] if grid.total_row else [])
     m &= ~_line_mask(m, rh, rows, [x - zx0 for x in grid.col_x[6:]])
+    # puntini (retino grigio delle fotocopie, grana): non si ricuciono, altrimenti il
+    # retino unisce tutta la pagina in una sola "struttura" che scende sotto la tabella
+    m = _drop_specks(m, rh)
     r = max(1, int(round(0.08 * rh)))
     link = cv2.dilate(m.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
     n, lab, stats, _ = cv2.connectedComponentsWithStats(link, connectivity=8)
@@ -1991,6 +2006,8 @@ def foreign_ink(gray: np.ndarray, grid: TableGrid) -> ForeignInk | None:
         x, y, w, h, _a = (int(v) for v in stats[k])
         if y >= bottom - 0.1 * rh or total[k] == 0:
             continue                    # tutta sotto la tabella: non tocca le righe
+        if bottom - y > STRUTTURA_MAX_RIGHE * rh:
+            continue                    # sale per mezza tabella: fondino o scrittura fusa, non un timbro
         keep[k] = (under[k] >= STRUTTURA_SOTTO * total[k]
                    or y + h - bottom >= STRUTTURA_SOTTO_RIGHE * rh)
     if not keep.any():
@@ -2113,6 +2130,7 @@ def _remove_overflow(gray: np.ndarray, grid: TableGrid, g: int) -> int:
     m = region < _ink_threshold(_paper_level(region))
     rows = [grid.row_y[i] - y0 for i in range(max(0, g - 2), min(len(grid.row_y), g + 2))]
     m &= ~_line_mask(m, rh, rows, [grid.col_x[8] - x0, xb - x0, grid.col_x[10] - x0])
+    m = _drop_specks(m, rh)      # il retino delle fotocopie unirebbe firma e nota
     lx = xb - x0
     # pezzi della stessa scrittura separati da piccoli vuoti (o dalla linea tolta) restano uniti
     r = max(1, int(round(0.08 * rh)))
@@ -2214,6 +2232,15 @@ NOTA_SCRITTA_ALTEZZA = 0.3     # ... e alto almeno cosi' (righe), in piu' tratti
 NOTA_SCRITTA_TRATTI = 3
 NOTA_BREVE_LARGHEZZA = 0.8     # nota breve di tre segni ("104": circa 1-1,5 righe): scritta per davvero
                                # (nel resto lasciato da un timbro si chiede la larghezza piena)
+
+
+NOTA_OLTRE_FIRMA = 2.5      # righe: scrittura nelle Note piu' lunga di qualsiasi coda di firma
+
+
+def _ink_width(crop: np.ndarray) -> int:
+    """Larghezza (pixel) dell'inchiostro di un ritaglio pulito."""
+    cols = np.nonzero((crop < 160).any(axis=0))[0]
+    return int(cols[-1] - cols[0] + 1) if cols.size else 0
 
 
 def _substantial_note(crop: np.ndarray, unit: float, min_width: float = NOTA_SCRITTA_LARGHEZZA) -> bool:
@@ -2624,8 +2651,8 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                     c = grid.col_index("note")
                     whole = clean_crop(gray, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]),
                                        extend=(0.3, 0.5))
-                    if whole is not None and _substantial_note(whole, rh) and len(
-                            split_text_lines(whole, rh)) > 1:
+                    if whole is not None and _substantial_note(whole, rh) and (
+                            len(split_text_lines(whole, rh)) > 1 or _ink_width(whole) >= NOTA_OLTRE_FIRMA * rh):
                         source = gray
                         flags["note"] = "attribuzione"
                     else:
@@ -2720,6 +2747,15 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
         # timbro che la copre): non sono la firma del coordinatore ma la rendono dubbia
         plan.firma_coordinatore_incerta = _signature_like(foreign, rh) or any(
             _overlap(cbox, sb) > 0.15 for sb in stamps)
+        if not plan.firma_coordinatore:
+            # firma del coordinatore messa sopra la sua casella, nella riga del giorno 31:
+            # presente, da verificare (puo' essere anche la firma della riga 31)
+            above = _clip_box((cbox[0], ty0 - 1.0 * th, cbox[2], ty0 + 0.2 * th), W, H)
+            up_own, up_foreign = _owned_components(gray, above, rh, 0.6 * th, rows=(ty0 - th, ty0),
+                                                   cols=(grid.col_x[-1],))
+            if _signature_like(up_own + up_foreign, rh):
+                plan.firma_coordinatore = True
+                plan.firma_coordinatore_incerta = True
         # timbro e firma del referente: riquadro sotto la riga dei totali (o timbro che la sovrasta)
         rbox_full = _clip_box((grid.col_x[6], ty1 + 0.08 * th, grid.col_x[-1], ty1 + 1.05 * th), W, H)
         end = min(_label_end(gray, rbox_full, rh), int(grid.col_x[0] + (REFERENT_LABEL_END + 0.08) * tw))
