@@ -100,6 +100,36 @@ def test_document_processed_to_completion(make_env, png: bytes) -> None:
     assert env.processor.status()["completati"] == 1
 
 
+def test_page_corrections_and_grid_doubts_are_explained(make_env, png: bytes) -> None:
+    """Pagina capovolta: avviso informativo "pagina raddrizzata"; griglia incerta segnalata
+    dal motore: avviso di attenzione e messaggio di stato."""
+    from sirio import validation
+    from sirio.models import ExtractionResult
+
+    img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    flipped = cv2.imencode(".png", cv2.rotate(img, cv2.ROTATE_180))[1].tobytes()
+
+    class DoubtfulGrid(FakeEngine):
+        def extract(self, page, progress):
+            res: ExtractionResult = super().extract(page, progress)
+            res.avvisi = [validation.avviso_griglia_incerta()]
+            return res
+
+    env = make_env(DoubtfulGrid())
+    (doc_id,) = env.add(flipped, "capovolto.png")
+    wait_for(lambda: env.status(doc_id) == "completato")
+    doc = env.store.get(doc_id)
+    codici = [a.codice for a in doc.anomalies]
+    assert "I06_PAGINA_RADDRIZZATA" in codici and "W14_GRIGLIA_INCERTA" in codici
+    i06 = next(a for a in doc.anomalies if a.codice == "I06_PAGINA_RADDRIZZATA")
+    assert "capovolta" in i06.messaggio and i06.gravita == "info"
+    assert "Pagina raddrizzata automaticamente" in (doc.ocr_notes or "")
+    assert doc.status_message.startswith("Lettura completata: griglia incerta")
+    # gli avvisi restano dopo una nuova validazione (es. correzione dell'utente)
+    validation.validate_document(doc)
+    assert {"I06_PAGINA_RADDRIZZATA", "W14_GRIGLIA_INCERTA"} <= {a.codice for a in doc.anomalies}
+
+
 def test_waits_without_api_key_then_kick(make_env, png: bytes) -> None:
     engine = FakeEngine(available=False, message="Chiave API mancante.")
     env = make_env(engine)

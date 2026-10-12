@@ -10,6 +10,7 @@ durante i test); quello di accuratezza richiede anche ``SIRIO_SAMPLE_PDF`` e
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import functools
 import json
@@ -134,12 +135,28 @@ def test_time_lexicon_forms_and_tolerances():
     assert lex.signature("8.00") == lex.signature("8:00") == lex.signature("8:OO")
 
 
+def test_time_lexicon_real_world_surface_forms():
+    """Scritture viste sui fogli di operatori diversi: virgola, nessun separatore,
+    "h" come separatore o in coda."""
+    lex = le.time_lexicon()
+    for text, value in (("10,30", "10:30"), ("9,00", "09:00"), ("800", "08:00"), ("1100", "11:00"),
+                        ("1300", "13:00"), ("1000", "10:00"), ("830", "08:30"), ("8:30h", "08:30"),
+                        ("8h30", "08:30"), ("8h", "08:00"), ("13:30", "13:30"), ("12,30", "12:30")):
+        assert lex.value(text) == value, text
+
+
 def test_hours_and_other_lexicons():
     ore = le.hours_lexicon()
     assert ore.value("3") == 3.0
     assert ore.value("1,5") == 1.5 and ore.value("1.5") == 1.5 and ore.value("I,5") == 1.5
     assert ore.value("3h") == 3.0
     assert ore.value("8,5") is None and ore.value("9") is None
+    # ore e minuti, quarti d'ora, zero
+    for text, value in (("2h30'", 2.5), ("1h15'", 1.25), ("1h45'", 1.75), ("4h30'", 4.5), ("2h", 2.0),
+                        ("2,5", 2.5), ("2:30", 2.5), ("2,30", 2.5), ("30'", 0.5), ("0", 0.0), ("1:15", 1.25)):
+        assert ore.value(text) == value, text
+    # quarti in forma decimale esclusi: "2,5" letto "2.25" non deve diventare un valore ammesso
+    assert ore.value("2.25") is None and ore.value("1,75") is None
     assert le.total_lexicon().value("49,5") == 49.5
     assert le.pei_lexicon().value("15") == 15.0
     assert le.small_int_lexicon(10, roman=True).value("II") == "2"
@@ -150,6 +167,8 @@ def test_hours_and_other_lexicons():
     assert my.value("febbraio 2026") == (2, 2026)
     assert le.notes_lexicon().value("Ponte di carnevale") == "PONTE DI CARNEVALE"
     assert le.notes_lexicon().value("L. 104") == "104"
+    # la nota resta come e' scritta (nessuna frase "canonica" diversa)
+    assert le.notes_lexicon().value("scuola chiusa") == "SCUOLA CHIUSA"
 
 
 def test_free_value():
@@ -199,9 +218,95 @@ def test_reconcile_row_uses_hours_to_disambiguate():
     assert le.reconcile_row({}) == {}
 
 
+def test_unreliable_grid_flags_every_value():
+    full = {f: le.TESTO for f in le.TEXT_FIELDS} | {"firma": le.FIRMA}
+    plan = _plan_with({2: full})
+    readings = _row_readings(2)
+    res = le.assemble(plan, readings, _grid(reliable=False))
+    r = res.rows[1]
+    assert r.eff_uscita == "11:00"
+    assert set(le.TEXT_FIELDS) | {"firma"} <= set(r.incerti)
+    res = le.assemble(plan, readings, _grid())
+    assert not res.rows[1].incerti
+
+
+def test_time_prior_is_soft_and_plausibility_based():
+    # minuti: preferenza debole (una lettura chiara di 10:30 non diventa 10:00)
+    assert le._time_prior("10:00") - le._time_prior("10:30") < 1.0
+    # fuori dall'orario scolastico: penalita' forte (12,30 letto 19,30)
+    assert le._time_prior("12:30") - le._time_prior("19:30") >= 2.0
+    assert le._time_prior("06:00") < le._time_prior("07:00") < le._time_prior("08:00")
+
+
+def test_row_doubts_flag_inconsistency_without_changing_values():
+    v = {"prog_entrata": "09:00", "prog_uscita": "13:30", "eff_entrata": "09:00", "eff_uscita": "13:30",
+         "ore_dichiarate": 2.0}
+    d = le.row_doubts(dict(v))
+    # ore diverse dall'orario effettivo: tutta la riga e' da verificare
+    assert set(d) == set(v) and all("incoerente" in why for why in d.values())
+    ok = dict(v, ore_dichiarate=4.5)
+    assert le.row_doubts(ok) == {}
+    # alunno assente: ore inferiori all'orario ammesse
+    assert le.row_doubts(dict(v, ore_dichiarate=1.0), assenza_alunno=True) == {}
+    # orari fuori dalla fascia scolastica e ore giornaliere eccessive
+    late = le.row_doubts({"prog_entrata": "11:30", "prog_uscita": "19:30"})
+    assert "fuori_orario" in late["prog_uscita"]
+    assert "incoerente" in le.row_doubts({"eff_entrata": "08:00", "eff_uscita": "16:00"})["eff_uscita"]
+    # senza orari effettivi: ore oltre l'orario programmato
+    d = le.row_doubts({"prog_entrata": "08:00", "prog_uscita": "10:00", "ore_dichiarate": 3.0})
+    assert "incoerente" in d["ore_dichiarate"]
+    # un solo orario effettivo
+    assert "incompleto" in le.row_doubts({"eff_entrata": "08:00"})["eff_entrata"]
+
+
+def test_free_reading_digits_and_short_forms():
+    r = le.Reading([("10:00", -4.8), ("10:30", -8.2)], "10/3", -1.3, 3, {"10:00": "10,"})
+    assert le._free_digits_conflict("eff_entrata", "10:00", r)          # 1 0 3 -> 10:30
+    assert not le._free_digits_conflict("eff_entrata", "10:30", r)
+    assert not le._free_digits_conflict("eff_entrata", "16:00",
+                                        le.Reading([], "16.60", -1.0, 3))   # 16:60 non e' un orario
+    short = le.Reading([("10:00", -0.8), ("10:30", -5.5)], "10.", -0.8, 2, {"10:00": "10."})
+    assert le._short_form("eff_uscita", "10:00", short, aspect=1.6)
+    assert not le._short_form("eff_uscita", "10:00", short, aspect=1.0)     # ritaglio stretto: "10" e' plausibile
+    assert not le._short_form("eff_uscita", "10:00", r, aspect=1.6)         # cifre in piu': ci pensa il confronto
+    assert le._hour_conflict("eff_uscita", "11:00", le.Reading([], "13 w.", -0.3, 3))
+    assert not le._hour_conflict("eff_entrata", "09:00", le.Reading([], "933", -1.0, 2))
+
+
+def test_notes_are_conservative():
+    def note(text, lp=-0.5, n=4, cands=()):
+        return le._note_field(le.Reading(list(cands), text, lp, n), aspect=2.0)
+
+    # code di firme, tratti, timbri: letture brevi fuori vocabolario non sono note
+    for garbage in ("DE", "49", "WE", "R", "no"):
+        fld = note(garbage, -0.2, 1)
+        assert fld.value is None and not fld.illeggibile, garbage
+    assert note("104", -0.1, 1).value == "104"
+    # testo in parole note e letto con fiducia: sicuro
+    fld = note("Scuola chiusa", -1.0, 4)
+    assert fld.value == "SCUOLA CHIUSA" and not fld.incerto
+    # parole sconosciute (allucinazioni del modello): riportate ma da verificare
+    fld = note("The bodies so", -1.0, 4)
+    assert fld.value and fld.incerto
+    # abbreviazioni di parole note
+    fld = note("Ponte carn.", -1.0, 4)
+    assert fld.value == "PONTE CARN." and not fld.incerto
+    # frase del lessico confermata dalla lettura libera
+    fld = note("Ponte di Carnevale", -0.9, 6, [("PONTE DI CARNEVALE", -1.0)])
+    assert fld.value == "PONTE DI CARNEVALE" and not fld.incerto
+    # frase del lessico NON confermata: si riporta la lettura, da verificare
+    fld = note("Cent of", -1.5, 2, [("CARNEVALE", -37.0)])
+    assert fld.value != "CARNEVALE" and fld.incerto
+
+
 # --------------------------------------------------------------------------
 # Assemblaggio: incerti, illeggibili, valori dedotti
 # --------------------------------------------------------------------------
+
+def _grid(reliable: bool = True) -> TableGrid:
+    """Griglia del modulo standard considerata rilevata dalle linee reali (o no)."""
+    return dataclasses.replace(template_grid(1654, 2339), detected=reliable, score=0.9 if reliable else 0.05)
+
 
 def _plan_with(cells: dict[int, dict[str, str]]) -> le.PagePlan:
     plan = le.PagePlan()
@@ -234,7 +339,7 @@ def test_assemble_flags_uncertain_and_illegible_cells():
         # riga 4: scrittura presente ma senza alcun contesto -> illeggibile
         "rows.4.prog_entrata": le.Reading([("19:30", -18.0)], "xiss .", -1.0, 3),
     }
-    grid = template_grid(1654, 2339)
+    grid = _grid()
     res = le.assemble(plan, readings, grid)
     r2, r3, r4 = res.rows[1], res.rows[2], res.rows[3]
     assert (r2.prog_entrata, r2.prog_uscita, r2.eff_entrata, r2.ore_dichiarate) == ("08:00", "11:00", "08:00", 3.0)
@@ -257,7 +362,7 @@ def test_assemble_column_pattern_flags_unusual_values():
                      f"rows.{g}.eff_entrata": _time("08:00"), f"rows.{g}.eff_uscita": _time("11:00")}
     # il giorno 7 sembra 09:00 ma l'08:00 e' fra le alternative: va segnalato
     readings["rows.7.prog_entrata"] = le.Reading([("09:00", -0.3), ("08:00", -1.8)], "9:00", -0.3, 3)
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     assert "prog_entrata" in res.rows[6].incerti
     assert all(not res.rows[g - 1].incerti for g in range(2, 7))
 
@@ -292,7 +397,7 @@ def test_assemble_confirms_faint_reading_implied_by_solid_cells():
     readings["rows.4.eff_uscita"] = _faint("11:00", "11:30")
     readings["rows.4.prog_entrata"] = _faint("08:00", "09:00")
     readings["rows.4.prog_uscita"] = _faint("11:00", "12:00")
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     r2, r3, r4 = res.rows[1], res.rows[2], res.rows[3]
     assert r2.eff_uscita == "11:00" and "eff_uscita" not in r2.incerti
     assert r2.confidenza["eff_uscita"] >= le.CONF_CONFERMA
@@ -309,7 +414,7 @@ def test_assemble_confirmation_respects_hours_inconsistency():
     # uscita poco leggibile letta come 11:00 = uscita programmata, ma entrata 8:00 + 2,5 ore
     # (celle sicure) darebbero 10:30: la relazione orari/ore e' violata -> resta incerta
     readings["rows.2.eff_uscita"] = _faint("11:00", "10:30")
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     assert "eff_uscita" in res.rows[1].incerti
 
 
@@ -324,7 +429,7 @@ def test_assemble_flags_programmed_effective_mismatch_with_plausible_misreading(
     readings["rows.3.eff_entrata"] = le.Reading([("08:30", -0.05), ("08:00", -3.5)], "8:30", -0.06, 4)
     readings["rows.3.ore_dichiarate"] = le.Reading([(2.5, -0.05)], "2,5", -0.06, 3)
     readings["rows.3.prog_entrata"] = le.Reading([("08:00", -0.05), ("08:30", -6.0)], "8:00", -0.06, 4)
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     r2, r3 = res.rows[1], res.rows[2]
     assert r2.prog_uscita == "13:30" and "prog_uscita" in r2.incerti
     assert r2.eff_uscita == "13:00" and "eff_uscita" not in r2.incerti
@@ -343,11 +448,11 @@ def test_programmed_time_confirmed_by_weekly_schedule():
     # lettura incerta (copertura ~0,27: "8.80"), ma fra gli orari ammessi preferisce 08:00
     readings["rows.16.prog_entrata"] = le.Reading([("08:00", -1.6), ("09:00", -3.8)], "8.80", -0.6, 4)
     plan = _plan_with({g: prog_only for g in days})
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     assert res.rows[15].prog_entrata == "08:00" and "prog_entrata" not in res.rows[15].incerti
     # un giorno della stessa settimana con un orario diverso: nessuna conferma
     readings["rows.9.prog_entrata"] = _time("09:00")
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     assert "prog_entrata" in res.rows[15].incerti
 
 
@@ -358,7 +463,7 @@ def test_free_reading_outside_form_rules_does_not_block_confirmation():
     readings["rows.2.eff_uscita"] = le.Reading([("11:00", -0.2), ("11:30", -2.5)], "11.10", -0.15, 4)
     # lettura libera "11.30" (orario ammesso diverso) -> resta da verificare
     readings["rows.3.eff_uscita"] = le.Reading([("11:00", -0.2), ("11:30", -2.5)], "11.30", -0.15, 4)
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     assert res.rows[1].eff_uscita == "11:00" and "eff_uscita" not in res.rows[1].incerti
     assert res.rows[2].eff_uscita == "11:00" and "eff_uscita" in res.rows[2].incerti
 
@@ -370,7 +475,7 @@ def test_notes_snap_to_recurring_phrases_and_neighbours():
         "rows.17.note": le.Reading([], "Ponte di Casarevali", -2.5, 7),       # simile a una formula
         "rows.18.note": le.Reading([], "Barrie in Glenlevale", -6.0, 7),      # simile alla nota vicina
     }
-    res = le.assemble(plan, readings, template_grid(1654, 2339))
+    res = le.assemble(plan, readings, _grid())
     assert res.rows[15].note == "PONTE DI CARNEVALE" and "note" not in res.rows[15].incerti
     assert res.rows[16].note == "PONTE DI CARNEVALE" and "note" in res.rows[16].incerti
     assert res.rows[17].note == "PONTE DI CARNEVALE" and "note" in res.rows[17].incerti
@@ -385,6 +490,22 @@ def test_month_year_uses_calendar_consistency():
     assert le.calendar_penalty((2, 2026), worked) == 0.0
     assert le.calendar_penalty((2, 2025), worked) < 0
     assert le.calendar_penalty((2, 2026), [30]) < 0          # 30 febbraio inesistente
+
+
+def test_month_name_read_clearly_and_year_fixed_by_calendar_is_not_flagged():
+    """"Febbrano '96": il mese si legge, l'anno no; i 20 giorni feriali compilati cadono
+    di domenica in ogni altro anno passato (il 2027 e' futuro): mese/anno sicuri."""
+    worked = [d for d in range(1, 29) if date(2026, 2, d).weekday() < 5]
+    today = date(2026, 10, 9)
+    reading = le.Reading([((2, 2024), -0.5), ((2, 2025), -1.5), ((2, 2026), -3.0)], "Febbrano '96", -2.0, 6)
+    fld = le._choose_month(le.evidence(reading, None, "month"), worked, today=today, free_text=reading.free_text)
+    assert fld.value == (2, 2026) and not fld.incerto
+    # pochi giorni compilati, nome del mese non riconoscibile o anno scritto diverso: resta da verificare
+    for days, text in ((worked[:4], "Febbrano '96"), (worked, "fessario"), (worked, "Marzo 2026"),
+                       (worked, "Febbraio 2025")):
+        r = le.Reading(reading.candidates, text, -2.0, 6)
+        fld = le._choose_month(le.evidence(r, None, "month"), days, today=today, free_text=text)
+        assert fld.incerto, text
 
 
 # --------------------------------------------------------------------------
@@ -454,6 +575,51 @@ def test_extract_on_synthetic_sheet_with_fake_recognizer():
     fracs = [f for f, _ in steps]
     assert fracs == sorted(fracs) and fracs[-1] == 1.0 and all(0.0 <= f <= 1.0 for f in fracs)
     assert any("Lettura della scrittura a mano" in m for _, m in steps)
+
+
+def _degraded_page(**kw) -> tuple[PageInput, dict]:
+    img, truth = make_synthetic_sheet(**kw)
+    page = normalize_page(img)
+    return PageInput(image=page, grid=detect_grid(page), source_file="sintetico.pdf", page=1), truth
+
+
+def test_extract_ignores_crossed_out_rows_and_signature_overflow():
+    """Righe non usate barrate con lunghe diagonali, firme che sconfinano nelle
+    note, linea a penna sugli orari effettivi, orari con la virgola: nessun valore
+    inventato, nessuna nota dalle code delle firme, "non svolta" riconosciuta."""
+    data = {"rows": [{"giorno": 18, "prog_entrata": "08:00", "prog_uscita": "11:00", "linea_effettivo": True,
+                      "trattino_effettivo": True, "note": "SCIOPERO"}]}
+    page, truth = _degraded_page(data=data, seed=5, time_style="comma", crossed_rows=((29, 31),),
+                                 long_signatures=True)
+    fake = FakeRecognizer(truth)
+    res = le.LocalEngine(recognizer=fake).extract(page, lambda *_: None)
+    read_rows = {int(k.split(".")[1]) for k in fake.keys if k.startswith("rows.")}
+    assert not read_rows & {29, 30, 31}, sorted(read_rows)
+    for r in res.rows[28:31]:
+        assert not r.has_content() or set(r.incerti) | set(r.illeggibili), r
+    # nessuna nota letta dove non c'e' (le firme lunghe finiscono nella colonna Note)
+    noted = {int(k.split(".")[1]) for k in fake.keys if k.endswith(".note")}
+    assert noted == {t["giorno"] for t in truth["rows"] if t["note"]}, sorted(noted)
+    r18 = res.rows[17]
+    assert r18.trattino_effettivo and r18.eff_entrata is None and r18.eff_uscita is None
+    assert not r18.assenza_alunno and not r18.assenza_operatore and not r18.firma
+    for t, r in zip(truth["rows"], res.rows):
+        for f in (*le.TEXT_FIELDS, "assenza_alunno", "assenza_operatore", "firma"):
+            if getattr(r, f) != t[f]:
+                assert f in r.incerti or f in r.illeggibili, (t["giorno"], f, getattr(r, f), t[f])
+
+
+def test_slash_in_unworked_row_is_not_a_value():
+    page, truth = _page(0)
+    img = page.image.copy()
+    g = 7            # sabato: riga vuota
+    x0, y0, x1, y1 = page.grid.cell(g, "prog_entrata")
+    import cv2
+    cv2.line(img, (x0 + (x1 - x0) // 3, y1 - (y1 - y0) // 4), (x0 + 2 * (x1 - x0) // 3, y0 + (y1 - y0) // 4),
+             (40, 40, 40), 3, cv2.LINE_AA)
+    plan = le.plan_page(img, page.grid)
+    assert plan.cells[g]["prog_entrata"] == le.NULLO
+    assert not any(r.key.startswith(f"rows.{g}.") for r in plan.requests)
 
 
 def test_extract_rejects_pages_without_table():
@@ -922,10 +1088,13 @@ def test_readings_do_not_depend_on_batch_composition():
 
 # Soglie minime sul foglio reale (misurate: vedi docstring del modulo del motore;
 # un errore in piu' di quelli misurati e' tollerato per le differenze di arrotondamento
-# fra CPU diverse).
+# fra CPU diverse). Il motore non e' piu' tarato su questo solo foglio (preferenze
+# "effettivo = programmato" e "orari tondi" ridotte a spareggi, controlli che segnalano
+# invece di correggere): qui legge 2 orari e un'ora in meno di prima, ma su fogli di
+# altri operatori sbaglia molto meno, e ogni errore resta segnalato.
 MIN_ACCURACY = {
-    "orari": 0.94,           # misurato 69/72
-    "ore": 0.94,             # misurato 17/17
+    "orari": 0.91,           # misurato 67/72
+    "ore": 0.88,             # misurato 16/17
     "assenze": 1.0,
     "firme": 1.0,
     "trattini": 1.0,
@@ -933,8 +1102,8 @@ MIN_ACCURACY = {
     "intestazione": 0.85,    # misurato 10/10
 }
 # Orari corretti ma segnalati come incerti (lavoro di verifica inutile per l'utente):
-# misurati 16 su 69 (prima della conferma per coerenza erano 21).
-MAX_FALSI_INCERTI_ORARI = 18
+# misurati 14 su 67.
+MAX_FALSI_INCERTI_ORARI = 16
 
 
 @needs_model
@@ -983,3 +1152,237 @@ def test_accuracy_on_real_sample():
     # ogni errore residuo su orari e ore deve essere segnalato (incerto o illeggibile)
     assert not unflagged, unflagged
     assert false_doubts <= MAX_FALSI_INCERTI_ORARI, false_doubts
+
+
+# --------------------------------------------------------------------------
+# Segni a mano (due rilevatori), avvisi sulla griglia, secondo parere
+# --------------------------------------------------------------------------
+
+def test_cross_inside_crossed_out_row_is_flagged_not_trusted():
+    """Una crocetta (o un pezzo di barratura che le somiglia) in una riga barrata non
+    diventa mai un'assenza sicura: resta segnalata."""
+    import cv2
+    page, _truth = _degraded_page(seed=6, crossed_rows=((28, 31),))
+    img = page.image.copy()
+    x0, y0, x1, y1 = page.grid.cell(29, "assenza_alunno")
+    m = (x1 - x0) // 4
+    cv2.line(img, (x0 + m, y0 + m // 2), (x1 - m, y1 - m // 2), (30, 30, 30), 3, cv2.LINE_AA)
+    cv2.line(img, (x0 + m, y1 - m // 2), (x1 - m, y0 + m // 2), (30, 30, 30), 3, cv2.LINE_AA)
+    plan = le.plan_page(img, page.grid)
+    marks = le.PageMarks(le.to_gray(img), img, page.grid)
+    assert {29, 30, 31} <= marks.struck_rows
+    assert plan.cells[29]["assenza_alunno"] != le.CROCETTA
+    assert any("Righe barrate" in n for n in plan.notes)
+
+
+def test_unreliable_grid_produces_page_warning():
+    full = {f: le.TESTO for f in le.TEXT_FIELDS} | {"firma": le.FIRMA}
+    plan = _plan_with({2: full})
+    res = le.assemble(plan, _row_readings(2), _grid(reliable=False))
+    assert [a.codice for a in res.avvisi] == ["W14_GRIGLIA_INCERTA"]
+    assert all(set(DAY_FIELDS) <= set(r.incerti) for r in res.rows)
+    assert "tutti i valori della pagina" in res.avvisi[0].messaggio
+    assert (res.ocr_notes or "").startswith("Griglia incerta")
+    # griglia affidabile ma una riga non allineata: avviso per quella riga soltanto
+    g = dataclasses.replace(_grid(), alignment=0.95, row_quality=[1.0] + [0.2] + [1.0] * 29)
+    res = le.assemble(plan, _row_readings(2), g)
+    assert [(a.codice, a.giorno) for a in res.avvisi] == [("W14_GRIGLIA_INCERTA", 2)]
+    # tutti i campi della riga, anche quelli vuoti (assenze, nota)
+    assert set(DAY_FIELDS) <= set(res.rows[1].incerti)
+    assert not res.rows[0].incerti and not res.header.incerti
+    res = le.assemble(plan, _row_readings(2), _grid())
+    assert not res.avvisi
+
+
+class FakeSecondOpinion:
+    """Secondo parere finto: legge in ogni ritaglio il valore indicato per il tipo di cella."""
+
+    def __init__(self, values: dict[str, object], conf: float = 0.95):
+        from sirio.engines.secondo_parere import Parere
+
+        self.parere = Parere
+        self.values = values
+        self.conf = conf
+        self.kinds: list[str] = []
+
+    def read_many(self, requests, progress=None):
+        out = []
+        for crop, kind in requests:
+            assert crop.ndim == 3 and crop.size > 0
+            self.kinds.append(kind)
+            v = self.values.get(kind)
+            out.append(self.parere(testo=str(v), valore=v, stato="valore" if v is not None else "vuota",
+                                   confidenza=self.conf))
+        return out
+
+
+def test_second_opinion_confirms_only_with_agreement_and_exact_relation():
+    page, truth = _page(0)
+    # giorno 2 (8:00-11:00, 3 ore): uscita effettiva letta 11:00, ma la lettura libera dice 11:30
+    overrides = {"rows.2.eff_uscita": le.Reading([("11:00", -0.5), ("11:30", -1.2)], "11:30", -0.45, 4)}
+    res0 = le.LocalEngine(recognizer=FakeRecognizer(truth, overrides)).extract(page, lambda *_: None)
+    assert res0.rows[1].eff_uscita == "11:00" and "eff_uscita" in res0.rows[1].incerti
+    # il secondo parere legge 11:00 come il motore e l'uscita programmata (sicura) lo conferma
+    sp = FakeSecondOpinion({"orario": "11:00"})
+    res = le.LocalEngine(recognizer=FakeRecognizer(truth, overrides), second_opinion_reader=sp).extract(
+        page, lambda *_: None)
+    r = res.rows[1]
+    assert r.eff_uscita == "11:00" and "eff_uscita" not in r.incerti
+    assert r.confidenza["eff_uscita"] >= le.CONF_SECONDO_PARERE
+    assert sp.kinds == ["orario"]                     # solo le celle dubbie vengono rilette
+    assert "Secondo parere" in (res.ocr_notes or "")
+    # se il secondo parere legge un altro valore la cella resta segnalata
+    sp2 = FakeSecondOpinion({"orario": "11:30"})
+    res2 = le.LocalEngine(recognizer=FakeRecognizer(truth, overrides), second_opinion_reader=sp2).extract(
+        page, lambda *_: None)
+    assert "eff_uscita" in res2.rows[1].incerti
+
+
+def test_second_opinion_never_clears_structural_doubts():
+    page, truth = _page(0)
+    overrides = {"rows.2.eff_uscita": _faint("14:00", "11:00")}
+    # riga 2 non allineata alla griglia: nessuna rilettura, nessuna conferma
+    grid = dataclasses.replace(page.grid, alignment=0.95, row_quality=[1.0] + [0.2] + [1.0] * 29)
+    page2 = PageInput(image=page.image, grid=grid, source_file="x.pdf", page=1)
+    sp = FakeSecondOpinion({"orario": "11:00", "ore": 3.0})
+    res = le.LocalEngine(recognizer=FakeRecognizer(truth, overrides), second_opinion_reader=sp).extract(
+        page2, lambda *_: None)
+    assert "eff_uscita" in res.rows[1].incerti and not sp.kinds
+    assert any(a.codice == "W14_GRIGLIA_INCERTA" for a in res.avvisi)
+
+
+def test_second_opinion_unavailable_keeps_flags_and_explains(monkeypatch, tmp_path):
+    from sirio.engines import secondo_parere
+
+    monkeypatch.setattr(le, "_SP_FAILED", {})
+    monkeypatch.setattr(secondo_parere.SecondoParere, "is_available",
+                        lambda self: (False, "Secondo parere offline non attivo: servono almeno 12 GB di RAM."))
+    page, truth = _page(0)
+    overrides = {"rows.2.eff_uscita": _faint("14:00", "11:00")}
+    eng = le.LocalEngine(recognizer=FakeRecognizer(truth, overrides), second_opinion=True, cache_dir=tmp_path)
+    res = eng.extract(page, lambda *_: None)
+    assert "eff_uscita" in res.rows[1].incerti
+    assert "Secondo parere non usato" in (res.ocr_notes or "") and "12 GB" in (res.ocr_notes or "")
+    # disattivato: nessun tentativo
+    calls = []
+    monkeypatch.setattr(secondo_parere.SecondoParere, "is_available", lambda self: calls.append(1) or (True, ""))
+    le.LocalEngine(recognizer=FakeRecognizer(truth, overrides), cache_dir=tmp_path).extract(page, lambda *_: None)
+    assert not calls
+
+
+def test_second_opinion_failure_while_reading_keeps_the_result():
+    page, truth = _page(0)
+
+    class Broken:
+        def read_many(self, requests, progress=None):
+            raise RuntimeError("guasto")
+
+    overrides = {"rows.2.eff_uscita": _faint("14:00", "11:00")}
+    res = le.LocalEngine(recognizer=FakeRecognizer(truth, overrides), second_opinion_reader=Broken()).extract(
+        page, lambda *_: None)
+    assert res.rows[1].eff_uscita == "11:00" and "eff_uscita" in res.rows[1].incerti
+    assert "Secondo parere non riuscito" in (res.ocr_notes or "")
+
+
+def test_get_engine_passes_second_opinion_setting():
+    from sirio.config import Settings
+    from sirio.engines.base import get_engine
+
+    assert Settings().secondo_parere is False
+    assert get_engine(Settings()).second_opinion is False
+    assert get_engine(Settings(secondo_parere=True)).second_opinion is True
+
+
+# --------------------------------------------------------------------------
+# Regole di prudenza (nessun valore sbagliato mostrato come sicuro)
+# --------------------------------------------------------------------------
+
+def test_strong_rival_reading_keeps_value_flagged():
+    """"14:00" scritto in modo da sembrare "16:00": la lettura preferisce 16:00 ma 14:00
+    resta molto probabile e nessuna relazione esatta decide: va verificato."""
+    plan = _plan_with({2: {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO, "ore_dichiarate": le.TESTO}})
+    readings = {"rows.2.prog_entrata": _time("12:00"),
+                "rows.2.prog_uscita": le.Reading([("16:00", -1.0), ("14:00", -1.9)], "16:00", -1.0, 4),
+                "rows.2.ore_dichiarate": le.Reading([(1.0, -0.05)], "1", -0.06, 1)}
+    res = le.assemble(plan, readings, _grid())
+    assert res.rows[1].prog_uscita == "16:00" and "prog_uscita" in res.rows[1].incerti
+
+
+def test_twin_overridden_reading_flags_the_other_cell():
+    """Effettivo poco leggibile riportato al programmato (9:30-13:30) mentre la sua lettura
+    dice 9:00-13:00: il programmato non e' confermato da quell'uguaglianza."""
+    plan = _plan_with({3: FULL_ROW})
+    readings = {"rows.3.prog_entrata": le.Reading([("09:30", -0.7), ("09:00", -2.6)], "9,30", -0.7, 4),
+                "rows.3.prog_uscita": le.Reading([("13:30", -0.9), ("13:00", -4.0)], "13.30", -0.9, 4),
+                "rows.3.eff_entrata": le.Reading([("09:00", -9.0), ("08:00", -12.0)], "3,os .", -1.0, 4),
+                "rows.3.eff_uscita": le.Reading([("13:00", -8.0), ("13:30", -10.5)], "13 w.", -1.0, 4),
+                "rows.3.ore_dichiarate": le.Reading([(4.0, -0.9)], "4", -0.9, 1)}
+    res = le.assemble(plan, readings, _grid())
+    r = res.rows[2]
+    for f in ("prog_entrata", "prog_uscita"):
+        if getattr(r, f) not in ("09:00", "13:00"):
+            assert f in r.incerti, (f, getattr(r, f), r.incerti)
+
+
+def test_programmed_time_differing_from_same_weekday_is_flagged():
+    """Orario programmato settimanale: 9:00 in un solo martedi' contro 8:00 negli altri."""
+    days = (3, 10, 17, 24)
+    plan = _plan_with({g: {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO} for g in days})
+    readings = {}
+    for g in days:
+        readings |= {f"rows.{g}.prog_entrata": _time("08:00"), f"rows.{g}.prog_uscita": _time("11:00")}
+    readings["rows.10.prog_entrata"] = _time("09:00", -0.01)
+    res = le.assemble(plan, readings, _grid())
+    assert res.rows[9].prog_entrata == "09:00" and "prog_entrata" in res.rows[9].incerti
+    assert all("prog_entrata" not in res.rows[g - 1].incerti for g in (3, 17, 24))
+
+
+def test_programmed_time_without_its_pair_is_flagged():
+    plan = _plan_with({17: {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO}})
+    readings = {"rows.17.prog_entrata": _time("13:30", -0.02),
+                "rows.17.prog_uscita": le.Reading([("10:30", -20.0)], "103.00", -1.0, 4)}   # illeggibile
+    res = le.assemble(plan, readings, _grid())
+    r = res.rows[16]
+    assert r.prog_uscita is None and "prog_uscita" in r.illeggibili
+    assert r.prog_entrata == "13:30" and "prog_entrata" in r.incerti
+
+
+def test_monthly_total_different_from_sum_is_flagged():
+    ev = le.evidence(le.Reading([(45.0, -0.01)], "45", -0.01, 2), le.total_lexicon(), "hours")
+    assert le._choose_total(ev, 43.0).incerto
+    assert not le._choose_total(ev, 45.0).incerto
+    # la differenza sta tutta in ore giornaliere illeggibili: nessun dubbio aggiunto
+    assert not le._choose_total(ev, 43.5, (43.5, 51.5)).incerto
+
+
+def test_short_note_close_to_vocabulary_is_proposed_flagged():
+    r = le.Reading([("104", math.log(0.25))], "1oh .", -3.0, 3)
+    fld = le._note_field(r, 2.0)
+    assert fld.value == "104" and fld.incerto
+    for junk in ("DE", "49", "R"):
+        fld = le._note_field(le.Reading([("104", math.log(0.25))], junk, -3.0, 3), 2.0)
+        assert fld.value is None
+
+
+def test_operator_absence_contradicted_by_worked_row_is_flagged():
+    """Crocetta nella colonna "assenza operatore" ma riga con orari effettivi e firma
+    (es. l'inizio di una firma che sconfina): non e' un'assenza sicura."""
+    import cv2
+    page, _truth = _page(0)
+    img = page.image.copy()
+    g = 2            # riga lavorata e firmata
+    x0, y0, x1, y1 = page.grid.cell(g, "assenza_operatore")
+    m = (x1 - x0) // 4
+    cv2.line(img, (x0 + m, y0 + m // 2), (x1 - m, y1 - m // 2), (30, 30, 30), 3, cv2.LINE_AA)
+    cv2.line(img, (x0 + m, y1 - m // 2), (x1 - m, y0 + m // 2), (30, 30, 30), 3, cv2.LINE_AA)
+    plan = le.plan_page(img, page.grid)
+    assert plan.cells[g]["assenza_operatore"] == le.SEGNO
+
+
+def test_page_marks_own_crop_for_fallback_reading():
+    page, truth = _page(0)
+    marks = le.PageMarks(le.to_gray(page.image), page.image, page.grid)
+    crop = marks.own_crop(2, "eff_entrata")            # "8:00" scritto
+    assert crop is not None and crop.ndim == 2 and crop.dtype == np.uint8 and (crop < 128).any()
+    assert marks.own_crop(7, "eff_entrata") is None    # sabato: cella vuota
+    assert not marks.struck_rows

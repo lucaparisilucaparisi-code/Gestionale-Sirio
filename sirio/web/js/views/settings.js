@@ -92,6 +92,11 @@ function render(view) {
             })}
           </div>
           ${privacyNote(claude)}
+          ${claude ? '' : html`<div class="set-row">
+            <div class="set-row-text"><div class="set-row-title">Secondo parere offline sulle celle dubbie</div>
+              <div class="set-row-sub">Un secondo modello (GLM-OCR, circa 2,7 GB scaricati una volta, richiede almeno 12 GB di RAM) rilegge orari e ore incerti e toglie parte delle segnalazioni superflue; 10-50 secondi in più per pagina. Sempre offline.</div></div>
+            <label class="switch"><input type="checkbox" data-set="secondo_parere" ${s.secondo_parere ? raw('checked') : ''} aria-label="Secondo parere offline"><span class="switch-track"></span></label>
+          </div>`}
         </div>
       </div>
 

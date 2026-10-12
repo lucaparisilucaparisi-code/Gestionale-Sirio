@@ -285,9 +285,17 @@ def test_grid_serialization_and_scaling():
     _, grid = _processed(0, 0.0)
     d = grid.to_dict()
     assert json.loads(json.dumps(d)) == d
-    assert set(d) == {"width", "height", "col_x", "row_y", "header_top", "total_row", "detected", "score"}
+    assert set(d) == {"width", "height", "col_x", "row_y", "header_top", "total_row", "detected", "score",
+                      "alignment", "row_quality"}
     back = TableGrid.from_dict(json.loads(json.dumps(d)))
     assert back == grid
+    assert grid.alignment is not None and grid.alignment > 0.9 and grid.reliable
+    assert len(grid.row_quality) == 31 and all(grid.row_reliable(g) for g in range(1, 32))
+    # griglie salvate dalle versioni precedenti (senza autoverifica): restano valide
+    old = {k: v for k, v in d.items() if k not in ("alignment", "row_quality")}
+    legacy = TableGrid.from_dict(old)
+    assert legacy.alignment is None and legacy.row_quality is None and legacy.reliable
+    assert legacy.scaled(0.5, 0.5).alignment is None
     half = grid.scaled(0.5, 0.5)
     assert half.width == round(grid.width * 0.5) and half.col_x[3] == round(grid.col_x[3] * 0.5)
     assert half.row_y[10] == round(grid.row_y[10] * 0.5)
@@ -492,3 +500,275 @@ def test_real_sample_ink_classification():
     # Nelle note dei giorni 29-31 c'e' il timbro del referente che deborda
     # dal pie' di pagina: e' inchiostro reale, quindi quelle celle non sono vuote.
     assert classification_errors(page, grid, truth, note_days=range(1, 29)) == []
+
+
+# --------------------------------------------------------------------------
+# Fogli reali "difficili" simulati: orientamento, fogli incurvati, autoverifica
+# --------------------------------------------------------------------------
+
+from sirio.vision.grid import GRID_ALIGNMENT_MIN, check_alignment  # noqa: E402
+from sirio.vision.preprocess import measure_mesh, rotate_small_angle  # noqa: E402
+from tests.synthetic import curl, degrade  # noqa: E402
+
+_DEGRADED = {
+    "curvo": lambda i: curl(i, sag=0.02),
+    "piegato": lambda i: curl(i, sag=0.012, fold=0.012, fold_x=0.35),
+    "foto-curva": lambda i: photograph(curl(i, sag=0.015, fold=0.01), keystone=0.06),
+    "foto-ombra": lambda i: photograph(curl(i, sag=0.02), keystone=0.05, shadow=True, background=(40, 40, 40)),
+    "stampa-chiara": lambda i: degrade(i, contrast=0.3),
+    "sfocata": lambda i: degrade(i, contrast=0.6, shadow=0.6, blur=1.5, jpeg_quality=50),
+    "storta-9": lambda i: rotate_small_angle(i, 9.0),
+}
+
+
+@functools.cache
+def _light_sheet() -> tuple[np.ndarray, dict]:
+    """Modulo stampato a colori chiari, orari con la virgola o senza separatore."""
+    return make_synthetic_sheet(seed=6, form_color=(175, 160, 150), time_style="mixed")
+
+
+@pytest.mark.parametrize("case", sorted(_DEGRADED))
+def test_orientation_on_degraded_photos_and_scans(case):
+    """Il verso giusto anche su foto incurvate, stampe chiare, pagine storte
+    oltre il raddrizzamento automatico; una pagina diritta non si gira mai."""
+    for img in (_sheet(3)[0], _light_sheet()[0]):
+        base = _DEGRADED[case](img)
+        for rot in (0, 90, 180, 270):
+            assert detect_orientation(rotate_right_angle(base, rot)) == (360 - rot) % 360, rot
+
+
+@pytest.mark.parametrize("case", ["curvo", "piegato", "foto-curva"])
+def test_curled_and_folded_sheets_are_flattened(case):
+    """Foglio incurvato o piegato: dopo il raddrizzamento a maglia ogni cella e'
+    letta nel giorno giusto (prima: griglia sfalsata di una riga data per buona)."""
+    img, truth = _sheet(3)
+    page = normalize_page(_DEGRADED[case](img))
+    grid = detect_grid(page)
+    assert grid.detected and grid.reliable and grid.alignment > 0.9
+    mesh = measure_mesh(page)
+    assert mesh is not None and mesh.deviation < 0.1          # linee ormai dritte
+    assert classification_errors(page, grid, truth) == []
+
+
+def test_upside_down_curled_photo_is_normalized():
+    img, truth = _sheet(3)
+    photo = rotate_right_angle(_DEGRADED["foto-ombra"](img), 180)
+    page = normalize_page(photo)
+    grid = detect_grid(page)
+    assert grid.reliable
+    assert classification_errors(page, grid, truth) == []
+
+
+def test_light_colour_form_with_comma_times():
+    img, truth = _light_sheet()
+    page = normalize_page(img)
+    grid = detect_grid(page)
+    assert grid.reliable and grid.score > 0.9
+    assert classification_errors(page, grid, truth) == []
+
+
+def test_straight_scan_has_no_curvature():
+    img, _ = _sheet(0)
+    mesh = measure_mesh(img)
+    assert mesh is not None and mesh.deviation < 0.05
+    assert np.array_equal(normalize_page(img), img)           # nessun ricampionamento
+
+
+def test_grid_self_check_catches_shifted_rows():
+    """Griglia sfalsata di righe intere (le righe del modulo sono periodiche):
+    i numeri stampati nella colonna "Giorno" la smascherano."""
+    page, grid = _processed(0, 0.0)
+    ok = check_alignment(page, grid)
+    assert ok["alignment"] >= 0.95 and ok["sfalsamento"] == 0
+    for shift in (-2, -1, 1, 2):
+        d = grid.to_dict()
+        dy = shift * grid.row_height
+        d["row_y"] = [int(round(y + dy)) for y in grid.row_y]
+        d["header_top"] = int(round(grid.header_top + dy))
+        d["total_row"] = [int(round(v + dy)) for v in grid.total_row]
+        bad = TableGrid.from_dict(d)
+        chk = check_alignment(page, bad)
+        assert chk["alignment"] < GRID_ALIGNMENT_MIN, shift
+        if abs(shift) == 1:
+            assert chk["sfalsamento"] == shift
+
+
+def test_grid_on_curled_page_is_never_confidently_wrong():
+    """Senza il raddrizzamento a maglia la griglia di un foglio piegato o e'
+    giusta o e' dichiarata inaffidabile (mai valori nei giorni sbagliati come certi)."""
+    for case in ("piegato", "curvo"):
+        img, truth = _sheet(3)
+        bent = _DEGRADED[case](img)
+        grid = detect_grid(bent)
+        if grid.reliable:
+            assert classification_errors(bent, grid, truth) == [], case
+
+
+def test_grid_self_check_on_blank_and_misaligned_grids():
+    page, grid = _processed(0, 0.0)
+    blank = np.full_like(page, 255)
+    chk = check_alignment(blank, grid)
+    assert chk["alignment"] < GRID_ALIGNMENT_MIN
+    d = grid.to_dict()                                  # mezza riga di scarto: righe fuori dalle linee
+    half = 0.5 * grid.row_height
+    d["row_y"] = [int(round(y + half)) for y in grid.row_y]
+    assert check_alignment(page, TableGrid.from_dict(d))["alignment"] < GRID_ALIGNMENT_MIN
+    d = grid.to_dict()                                  # colonne spostate di mezza colonna
+    d["col_x"] = [int(round(x + 0.5 * (grid.col_x[1] - grid.col_x[0]))) for x in grid.col_x]
+    assert check_alignment(page, TableGrid.from_dict(d))["alignment"] < GRID_ALIGNMENT_MIN
+
+
+# --------------------------------------------------------------------------
+# Inchiostro proprio: barrature, linee attraverso, debordamenti, "/"
+# --------------------------------------------------------------------------
+
+@functools.cache
+def _struck_sheet() -> tuple[np.ndarray, TableGrid, dict]:
+    from tests.synthetic import default_data
+
+    data = default_data()
+    for r in data["rows"]:
+        if r["giorno"] in (16, 17):
+            r.update(eff_entrata=None, eff_uscita=None, ore_dichiarate=None, trattino_effettivo=False,
+                     linea_effettivo=True, note="SCUOLA CHIUSA")
+    img, truth = make_synthetic_sheet(data=data, seed=2, crossed_rows=((28, 31),), long_signatures=True)
+    page = normalize_page(img)
+    return page, detect_grid(page), truth
+
+
+def test_strike_through_and_lines_across_are_found():
+    page, grid, truth = _struck_sheet()
+    p = ink.PageInk(page, grid)
+    assert {28, 29, 30, 31} <= p.struck_days
+    assert p.line_days == {16, 17}
+    for d in (16, 17):
+        for col in ("eff_entrata", "eff_uscita"):
+            res = p.own_ink(d, col)
+            assert res.line_across and res.empty, (d, col)
+    for d in (28, 29, 30, 31):
+        assert p.own_ink(d, "prog_uscita").row_struck
+    # le righe compilate non sono barrate e conservano la scrittura
+    for t in truth["rows"]:
+        d = t["giorno"]
+        if d in (16, 17) or d >= 28:
+            continue
+        for col in TIME_FIELDS:
+            res = p.own_ink(d, col)
+            assert not res.struck and not res.line_across and not res.row_struck, (d, col)
+            if t[col]:
+                assert not res.empty and res.overflow_removed < 0.3, (d, col)
+                assert res.crop.shape[:2] == (res.box[3] - res.box[1], res.box[2] - res.box[0])
+        if t["note"]:
+            assert not p.own_ink(d, "note").empty, d            # le note restano
+
+
+def test_real_pages_have_no_false_strikes():
+    for seed in (0, 4):
+        page, grid = _processed(seed, 0.0)
+        assert ink.PageInk(page, grid).strokes == []
+
+
+def _note_canvas() -> tuple[np.ndarray, TableGrid]:
+    img, grid = _cell_canvas()
+    return img, grid
+
+
+def test_signature_overflowing_into_note_is_removed():
+    img, grid = _note_canvas()
+    pen = (40, 40, 40)
+    x0, y0, x1, y1 = grid.cell(2, "firma")
+    nx0 = grid.cell(2, "note")[0]
+    # firma corsiva che parte nella colonna Firma e finisce nelle Note
+    xs = np.linspace(x0 + 5, nx0 + 30, 60)
+    ys = (y0 + y1) / 2 + 12 * np.sin((xs - x0) / 6.0)
+    cv2.polylines(img, [np.column_stack([xs, ys]).astype(np.int32).reshape(-1, 1, 2)], False, pen, 2)
+    # riga 3: una nota vera, staccata dalla firma
+    x0, y0, x1, y1 = grid.cell(3, "note")
+    cv2.putText(img, "104", (x0 + 30, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.9, pen, 2, cv2.LINE_AA)
+    xf0, yf0, xf1, yf1 = grid.cell(3, "firma")
+    xs = np.linspace(xf0 + 5, xf1 - 20, 40)
+    ys = (yf0 + yf1) / 2 + 12 * np.sin((xs - xf0) / 6.0)
+    cv2.polylines(img, [np.column_stack([xs, ys]).astype(np.int32).reshape(-1, 1, 2)], False, pen, 2)
+    p = ink.PageInk(img, grid)
+    note2 = p.own_ink(2, "note")
+    assert note2.empty and note2.overflow_removed > 0.5
+    assert not p.own_ink(2, "firma").empty
+    note3 = p.own_ink(3, "note")
+    assert not note3.empty and note3.overflow_removed < 0.1
+
+
+def test_descender_from_row_above_is_not_own_ink():
+    img, grid = _cell_canvas()
+    pen = (40, 40, 40)
+    x0, y0, x1, y1 = grid.cell(1, "prog_entrata")
+    cv2.putText(img, "10", (x0 + 10, y1 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.9, pen, 2, cv2.LINE_AA)
+    # virgola la cui coda scende nella riga sotto
+    cx = x0 + 55
+    cv2.line(img, (cx, y1 - 14), (cx - 3, y1 + 12), pen, 3)
+    p = ink.PageInk(img, grid)
+    assert p.own_ink(2, "prog_entrata").empty
+    assert not p.own_ink(1, "prog_entrata").empty
+
+
+def test_slash_is_recognized():
+    img, grid = _cell_canvas()
+    pen = (40, 40, 40)
+    x0, y0, x1, y1 = grid.cell(1, "prog_entrata")
+    cv2.line(img, (x0 + 20, y1 - 12), (x0 + 60, y0 + 14), pen, 3)          # "/"
+    x0, y0, x1, y1 = grid.cell(2, "prog_entrata")
+    cv2.putText(img, "8:00", (x0 + 8, y1 - 15), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 0.9, pen, 2, cv2.LINE_AA)
+    x0, y0, x1, y1 = grid.cell(3, "ore_dichiarate")
+    cv2.line(img, (x0 + 45, y1 - 10), (x0 + 49, y0 + 10), pen, 3)          # "1" quasi verticale
+    p = ink.PageInk(img, grid)
+    assert p.own_ink(1, "prog_entrata").slash
+    assert not p.own_ink(2, "prog_entrata").slash
+    one = p.own_ink(3, "ore_dichiarate")
+    assert not one.slash and one.stroke_angle > 75
+    assert p.own_ink(1, "eff_entrata").stroke_angle is None
+
+
+def test_faint_dark_photo_is_never_confidently_wrong():
+    """Modulo stampato chiaro, foto in penombra, prospettiva e foglio
+    ondulato: se la griglia non e' sicura deve dirlo (``reliable`` False);
+    se si dichiara affidabile, ogni cella e' nel giorno giusto."""
+    img, truth = make_synthetic_sheet(seed=93, dpi=150, form_color=(195, 177, 167), time_style="mixed")
+    img = curl(img, sag=0.012, wave=0.005, fold_x=0.66, seed=93)
+    img = photograph(img, keystone=0.04, jitter=0.02, seed=93, shadow=True)
+    img = degrade(img, contrast=0.4, shadow=0.33, blur=0.6, jpeg_quality=68, seed=93)
+    page = normalize_page(img)
+    grid = detect_grid(page)
+    if grid.reliable:
+        assert classification_errors(page, grid, truth) == []
+    else:
+        assert grid.alignment is None or grid.alignment < GRID_ALIGNMENT_MIN
+
+
+def test_normalize_page_info_reports_the_corrections():
+    from sirio.vision.preprocess import correzioni_testo, normalize_page_info
+
+    img, _ = _sheet(0)
+    page, info = normalize_page_info(img)
+    assert np.array_equal(page, normalize_page(img))
+    assert info["rotazione"] == 0 and not info["maglia"] and not info["prospettiva"]
+    assert correzioni_testo(info) == []
+    page, info = normalize_page_info(rotate_right_angle(img, 180))
+    assert info["rotazione"] == 180 and detect_grid(page).reliable
+    assert correzioni_testo(info) == ["era capovolta"]
+    assert correzioni_testo({"rotazione": 90, "inclinazione": -2.26, "prospettiva": True, "maglia": True}) == [
+        "era ruotata di 90 gradi", "inclinazione di 2,3 gradi corretta", "foto di sbieco riportata in piano",
+        "foglio incurvato o piegato raddrizzato"]
+    assert correzioni_testo({"inclinazione": 0.4}) == [] and correzioni_testo(None) == []
+
+
+def test_curled_photo_with_strong_keystone_and_background_is_found():
+    """Foto di un foglio incurvato e piegato, di sbieco, con lo sfondo attorno al foglio:
+    la tabella deve essere trovata e affidabile (raddrizzamento a maglia)."""
+    from sirio.vision.preprocess import normalize_page_info
+    from tests.synthetic import curl
+
+    img, truth = make_synthetic_sheet(seed=42)
+    photo = photograph(curl(img, sag=0.02, fold=0.012, seed=42), keystone=0.06, seed=42, shadow=True)
+    page, info = normalize_page_info(photo)
+    grid = detect_grid(page)
+    assert grid.detected and grid.reliable
+    assert info["maglia"]

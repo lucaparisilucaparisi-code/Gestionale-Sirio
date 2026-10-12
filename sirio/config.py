@@ -86,6 +86,11 @@ class Settings(BaseModel):
     verifica_incrociata: bool = True
     concorrenza: int = 3
     local_model: str = "microsoft/trocr-base-handwritten"
+    # Secondo parere offline (GLM-OCR, ~2,65 GB scaricati una volta, ~4,5 GB di RAM, 12 GB
+    # di RAM totale richiesti) sulle celle dubbie del motore locale: toglie una parte dei
+    # falsi allarmi senza mai rendere sicuro un valore sbagliato (misurato), ma costa
+    # 10-50 s per pagina. Disattivato in modo predefinito (guadagno modesto).
+    secondo_parere: bool = False
     export_fogli_per_documento: bool = True
     export_giorni_vuoti: bool = False
     tema: Literal["auto", "chiaro", "scuro"] = "auto"

@@ -8,6 +8,8 @@ API stabile, usata dai test di piu' moduli::
     img, truth = make_synthetic_sheet(skew_deg=1.5, seed=3)  # pagina inclinata
     pdf_bytes = sheet_to_pdf([img])                          # PDF "scansionato" (una pagina per immagine)
     photo = photograph(img, keystone=0.06)                   # foto di sbieco su un tavolo
+    curled = curl(img, sag=0.012, fold=0.012)                # foglio incurvato e piegato
+    poor = degrade(img, contrast=0.45, shadow=0.4)           # stampa chiara e ombra
 
 ``make_synthetic_sheet(data=None, seed=0, skew_deg=0.0, dpi=200, noise=True)``
 restituisce ``(immagine BGR uint8, verita)``. ``verita`` ha la stessa forma del
@@ -178,9 +180,13 @@ def _fit(text: str, height: float, max_width: float, bold: bool = False) -> floa
     return height if w <= max_width else height * max_width / w
 
 
+_FORM_COLOR: list[tuple[int, int, int]] = [(25, 25, 25)]     # colore della stampa del modulo
+
+
 def _print(canvas: np.ndarray, text: str, x: float, y: float, height: float, bold: bool = False,
-           center: bool = False, color: tuple[int, int, int] = (25, 25, 25)) -> None:
+           center: bool = False, color: tuple[int, int, int] | None = None) -> None:
     """Testo stampato (baseline in y). ``center`` centra orizzontalmente su x."""
+    color = _FORM_COLOR[0] if color is None else color
     font = _font(bold)
     scale = height / 22.0
     th = max(1, int(round(height / (9 if bold else 14))))
@@ -307,11 +313,14 @@ def _stamp(canvas: np.ndarray, center: tuple[float, float], radius: float, rng: 
     _blend(canvas, layer, 0, 0, color)
 
 
-def _fmt_time(t: str | None) -> str:
+def _fmt_time(t: str | None, style: str = "colon") -> str:
+    """Orario come lo scrive l'operatore: ``colon`` "8:00", ``comma`` "8,00",
+    ``none`` "800" (senza separatore)."""
     if not t:
         return ""
     hh, mm = t.split(":")
-    return f"{int(hh)}:{mm}"
+    sep = {"colon": ":", "comma": ",", "none": ""}.get(style, ":")
+    return f"{int(hh)}{sep}{mm}"
 
 
 def _fmt_hours(v: float | None) -> str:
@@ -327,8 +336,38 @@ def _fmt_hours(v: float | None) -> str:
 # --------------------------------------------------------------------------
 
 def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: float = 0.0, dpi: int = 200,
-                         noise: bool = True) -> tuple[np.ndarray, dict]:
-    """Disegna un foglio firma sintetico. Vedi la documentazione del modulo."""
+                         noise: bool = True, form_color: tuple[int, int, int] | None = None,
+                         time_style: str = "colon", crossed_rows: tuple = (),
+                         long_signatures: bool = False) -> tuple[np.ndarray, dict]:
+    """Disegna un foglio firma sintetico. Vedi la documentazione del modulo.
+
+    Varianti realistiche (tutte facoltative):
+
+    * ``form_color``: colore BGR della stampa del modulo (linee e testi), es.
+      ``(170, 170, 170)`` per una fotocopia chiara o ``(190, 140, 90)`` per un
+      modulo stampato a colori; i fondini grigi si schiariscono di conseguenza;
+    * ``time_style``: come sono scritti gli orari: ``"colon"`` (8:00),
+      ``"comma"`` (8,00), ``"none"`` (800) o ``"mixed"`` (a caso riga per riga);
+    * ``crossed_rows``: intervalli ``(dal_giorno, al_giorno)`` di righe non
+      usate barrate con un lungo tratto diagonale che attraversa piu' celle e
+      righe (la verita' delle righe resta vuota);
+    * ``long_signatures``: firme lunghe che debordano nella colonna "Note"
+      (nelle righe senza nota);
+    * nelle righe dei dati la chiave ``"linea_effettivo": True`` disegna una
+      linea orizzontale a penna attraverso le celle dell'orario effettivo
+      (prestazione non svolta: nella verita' ``trattino_effettivo`` = True).
+    """
+    _FORM_COLOR[0] = tuple(int(v) for v in form_color) if form_color is not None else (25, 25, 25)
+    try:
+        return _make_sheet(data, seed, skew_deg, dpi, noise, form_color, time_style, crossed_rows,
+                           long_signatures)
+    finally:
+        _FORM_COLOR[0] = (25, 25, 25)
+
+
+def _make_sheet(data: dict | None, seed: int, skew_deg: float, dpi: int, noise: bool,
+                form_color: tuple[int, int, int] | None, time_style: str, crossed_rows: tuple,
+                long_signatures: bool) -> tuple[np.ndarray, dict]:
     rng = np.random.default_rng(seed)
     d = _merge_data(data)
     hdr = d["header"]
@@ -337,7 +376,7 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
     paper = int(rng.integers(238, 252)) if noise else 255
     img = np.full((H, W, 3), paper, np.uint8)
     pen = (120, 45, 25) if rng.random() < 0.6 else (40, 40, 40)   # biro blu o nera
-    line_c = (30, 30, 30)
+    line_c = tuple(int(v) for v in form_color) if form_color is not None else (30, 30, 30)
     lt = max(2, int(round(dpi / 75)))       # spessore delle linee della tabella
     pt = max(2, int(round(dpi / 90)))       # spessore della penna
     u = H / 100.0                           # unita' verticale (1% della pagina)
@@ -355,6 +394,8 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
 
     # fondini grigi (retino) come nel modulo stampato
     gray = (222, 222, 222)
+    if form_color is not None:          # fondino proporzionato alla stampa (piu' chiara = piu' tenue)
+        gray = tuple(int(255 - 0.25 * (255 - c)) for c in form_color)
     cv2.rectangle(img, (int(tx0), int(htop)), (int(tx1), int(r0)), gray, -1)
     cv2.rectangle(img, (int(col_x[0]), int(r0)), (int(col_x[1]), int(r31)), gray, -1)
     cv2.rectangle(img, (int(col_x[0]), int(r31)), (int(col_x[5]), int(tbot)), gray, -1)
@@ -499,13 +540,24 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
         def cell(j: int, ya: float = ya, yb: float = yb) -> tuple[float, float, float, float]:
             return col_x[j], ya, col_x[j + 1], yb
 
+        style = time_style if time_style != "mixed" else str(rng.choice(["colon", "comma", "none"]))
         for j, key in ((1, "prog_entrata"), (2, "prog_uscita"), (3, "eff_entrata"), (4, "eff_uscita")):
-            s = _fmt_time(r.get(key))
+            s = _fmt_time(r.get(key), style)
             if s:
                 x0, _, x1, _ = cell(j)
                 _hand(img, s, x0 + (x1 - x0) * rng.uniform(0.06, 0.14), yb - rh * rng.uniform(0.2, 0.3),
                       text_h, rng, pen, max_width=(x1 - x0) * 0.8)
-        if r.get("trattino_effettivo"):
+        if r.get("linea_effettivo"):
+            # linea a penna attraverso le celle dell'orario effettivo (e oltre)
+            xa = col_x[3] + (col_x[4] - col_x[3]) * rng.uniform(0.05, 0.2)
+            xb = col_x[rng.choice([5, 6, 8])] - (col_x[1] - col_x[0]) * rng.uniform(0.0, 0.3)
+            yy = ya + rh * rng.uniform(0.4, 0.6)
+            tilt = rh * rng.uniform(-0.12, 0.12)
+            n = 24
+            xs = np.linspace(xa, xb, n)
+            ys = yy + np.linspace(-tilt, tilt, n) + rng.normal(0, rh * 0.02, n)
+            _poly(img, np.column_stack([xs, ys]), pen, pt)
+        elif r.get("trattino_effettivo"):
             for j, key in ((3, "eff_entrata"), (4, "eff_uscita")):
                 if not r.get(key):
                     _dash(img, cell(j), rng, pen, pt)
@@ -518,12 +570,31 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
         if r.get("assenza_operatore"):
             _cross(img, cell(7), rng, pen, pt)
         if r.get("firma"):
-            _signature(img, cell(8), rng, pen, pt)
+            if long_signatures and not r.get("note"):
+                # firma lunga: parte nella colonna Firma e finisce in quella delle Note
+                x0, _, x1, _ = cell(8)
+                _signature(img, (x0, ya, x1 + (col_x[10] - col_x[9]) * rng.uniform(0.35, 0.6), yb), rng, pen, pt)
+            else:
+                _signature(img, cell(8), rng, pen, pt)
         if r.get("note"):
             x0, _, x1, _ = cell(9)
             _hand(img, str(r["note"]), x0 + (x1 - x0) * 0.06, yb - rh * 0.28, text_h * 0.9, rng, pen,
                   max_width=(x1 - x0) * 0.88)
-        rows_truth.append({k: r.get(k) for k in ROW_FIELDS})
+        t = {k: r.get(k) for k in ROW_FIELDS}
+        if r.get("linea_effettivo"):
+            t["trattino_effettivo"] = True
+        rows_truth.append(t)
+
+    # --- righe non usate barrate con lunghi tratti diagonali
+    for g_from, g_to in crossed_rows:
+        a, b = sorted((int(g_from), int(g_to)))
+        y_a, y_b = row_y[a - 1] + 0.2 * rh, row_y[b] - 0.2 * rh
+        xa = col_x[1] + rng.uniform(0.0, 0.5) * (col_x[2] - col_x[1])
+        xb = col_x[9] - rng.uniform(0.0, 0.5) * (col_x[9] - col_x[8])
+        n = 40
+        xs = np.linspace(xa, xb, n)
+        ys = np.linspace(y_b, y_a, n) + rng.normal(0, rh * 0.03, n)
+        _poly(img, np.column_stack([xs, ys]), pen, pt)
 
     # --- totali, firme e timbro
     if hdr.get("totale_mensile_dichiarato") is not None:
@@ -623,4 +694,61 @@ def photograph(img: np.ndarray, keystone: float = 0.0, jitter: float = 0.0, seed
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-__all__ = ["default_data", "make_synthetic_sheet", "photograph", "sheet_to_pdf"]
+def curl(img: np.ndarray, sag: float = 0.01, fold: float = 0.0, fold_x: float = 0.4, wave: float = 0.0,
+         seed: int = 0) -> np.ndarray:
+    """Foglio incurvato o piegato fotografato dall'alto (stesso formato).
+
+    * ``sag``: incurvatura del foglio (frazione dell'altezza): le righe si
+      inarcano, al centro scendono di ``sag * H`` rispetto ai bordi; le
+      colonne si incurvano di un terzo di questo valore;
+    * ``fold``: piega verticale alla posizione ``fold_x`` (frazione della
+      larghezza): a destra della piega il foglio e' piu' basso di
+      ``fold * H`` (salto ripido ma continuo, largo il 3% della pagina);
+    * ``wave``: ondulazione casuale a bassa frequenza (frazione dell'altezza).
+    Il riempimento ai bordi ripete la carta."""
+    rng = np.random.default_rng(seed)
+    h, w = img.shape[:2]
+    xs = np.arange(w, dtype=np.float32)
+    ys = np.arange(h, dtype=np.float32)
+    X, Y = np.meshgrid(xs, ys)
+    u, v = X / w, Y / h
+    dy = sag * h * np.sin(np.pi * u) * (0.6 + 0.4 * v)
+    dx = (sag / 3.0) * w * np.sin(np.pi * v) * (u - 0.5) * 2.0
+    if fold:
+        t = np.clip((u - fold_x) / 0.03 + 0.5, 0.0, 1.0)
+        dy = dy + fold * h * (t * t * (3 - 2 * t))
+    if wave:
+        ph = rng.uniform(0, 2 * np.pi, 3)
+        dy = dy + wave * h * (np.sin(2 * np.pi * u * 1.3 + ph[0]) * np.cos(2 * np.pi * v * 0.7 + ph[1]))
+        dx = dx + 0.5 * wave * w * np.sin(2 * np.pi * v * 1.1 + ph[2])
+    map_x = (X - dx).astype(np.float32)
+    map_y = (Y - dy).astype(np.float32)
+    return cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def degrade(img: np.ndarray, contrast: float = 1.0, shadow: float = 0.0, blur: float = 0.0,
+            jpeg_quality: int | None = None, seed: int = 0) -> np.ndarray:
+    """Scansione/foto di qualita' scadente: ``contrast`` < 1 schiarisce tutto
+    l'inchiostro (toner scarico), ``shadow`` (0..1) ombra graduale da un
+    angolo, ``blur`` sigma della sfocatura, ``jpeg_quality`` compressione."""
+    rng = np.random.default_rng(seed)
+    out = img.astype(np.float32)
+    if contrast != 1.0:
+        out = 255.0 - (255.0 - out) * float(contrast)
+    if shadow:
+        h, w = out.shape[:2]
+        gx = np.linspace(0, 1, w, dtype=np.float32)[None, :]
+        gy = np.linspace(0, 1, h, dtype=np.float32)[:, None]
+        light = 1.0 - shadow * np.clip(1.2 - (gx + gy), 0, 1)
+        out = out * light[..., None]
+    if blur:
+        out = cv2.GaussianBlur(out, (0, 0), float(blur))
+    out = out + rng.normal(0, 2.0, out.shape).astype(np.float32)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    if jpeg_quality:
+        ok, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+        out = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    return out
+
+
+__all__ = ["curl", "default_data", "degrade", "make_synthetic_sheet", "photograph", "sheet_to_pdf"]

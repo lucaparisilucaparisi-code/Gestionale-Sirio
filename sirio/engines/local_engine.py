@@ -2,52 +2,68 @@
 
 Funziona senza Internet (dopo il primo download del modello) e senza chiave API.
 
+Principio guida: su fogli di operatori diversi (scansioni, foto, grafie e
+abitudini di compilazione diverse) un valore sbagliato mostrato come sicuro e'
+l'errore peggiore. Ogni regola che *sceglie* un valore diverso dalla lettura
+migliore lo segnala; i controlli di coerenza e plausibilita' *segnalano*, non
+riscrivono le letture chiare.
+
 Pipeline di una pagina
 ----------------------
-1. **Inchiostro** (``sirio.vision.ink``): ogni cella dei 31 giorni viene
-   classificata come vuota, trattino, crocetta (assenze), firma o scrittura.
-2. **Ritagli puliti**: le celle con scrittura vengono ritagliate togliendo le
-   linee della griglia e i tratti che sconfinano dalle celle vicine; i campi
+1. **Barrature e segni** (``sirio.engines.strokes``): le lunghe linee a mano
+   (righe non usate annullate in diagonale, linea orizzontale sugli orari
+   effettivi = "non svolta") vengono trovate e cancellate prima di ogni analisi;
+   una "/" isolata in una riga senza orari non e' un valore.
+2. **Inchiostro** (``sirio.vision.ink``): ogni cella dei 31 giorni viene
+   classificata come vuota, trattino, crocetta (assenze: X, x, A, spunte),
+   firma o scrittura. Timbri sulle colonne Firma/Note, inizio di una firma che
+   sconfina nella colonna delle assenze e celle attraversate da barrature sono
+   segnalati; le code delle firme che sconfinano nella colonna "Note" vengono
+   tolte prima di decidere se c'e' una nota.
+3. **Ritagli puliti**: le celle con scrittura vengono ritagliate togliendo le
+   linee della griglia e i tratti delle celle vicine; per orari e ore si
+   aggiunge bianco sopra e sotto (TrOCR riduce ogni ritaglio a un quadrato); le
+   note scritte su due righe nella cella sono lette una riga alla volta. I campi
    dell'intestazione vengono cercati sulle righe di risposta a destra delle
-   etichette stampate (posizioni misurate sul modulo reale, affinate con le
-   linee trovate nella scansione).
-3. **TrOCR** (``VisionEncoderDecoderModel``, pesi in float32): ogni ritaglio e'
-   codificato una sola volta; la decodifica e' *vincolata* al lessico dei valori
-   ammessi (orari HH:MM, ore 0,5-8, mese/anno, numeri, note frequenti...) e
-   affiancata da una lettura libera che misura quanto la scrittura si discosti
-   dal lessico. I ritagli sono letti a lotti di lunghezza simile e il decoder fa
-   avanzare insieme tutte le ricerche del lotto (una chiamata per passo), con le
-   chiavi/valori della cross-attention calcolati una volta per ritaglio.
-4. **Riconciliazione**: per ogni riga si sceglie la combinazione di orari e ore
-   piu' probabile *e* coerente (programmato ~ effettivo, uscita - entrata =
-   ore); i campi scelti contro la lettura migliore o con bassa probabilita'
-   finiscono in ``incerti``; scrittura presente ma non interpretabile ->
-   ``illeggibili`` (valore ``None``). Una cella poco leggibile il cui valore e'
-   determinato dal resto della riga (es. uscita = entrata + ore) viene
-   compilata ma resta "incerta" ed e' elencata in ``ocr_notes``.
-5. **Conferma per coerenza**: una cella incerta *solo* perche' poco leggibile
-   torna sicura se la lettura preferisce comunque quel valore (>= 80% fra i
-   valori ammessi) e una relazione esatta con celle sicure della stessa riga lo
-   impone (uscita = entrata + ore, effettivo = programmato) oppure, per l'orario
-   programmato, lo stesso valore e' letto con sicurezza negli stessi giorni della
-   settimana. Non cambia mai un valore; una differenza programmato/effettivo con
-   l'altro valore fra le letture e senza giustificazione dalle ore viene invece
-   segnalata (scambio di lettura probabile).
+   etichette stampate.
+4. **TrOCR** (``VisionEncoderDecoderModel``, pesi in float32): decodifica
+   *vincolata* al lessico delle scritture reali (orari "8:00", "8.00", "10,30",
+   "800", "1100", "8h30", "8:30h"; ore "3", "2,5", "2h", "2h30'", "1h15'", "0";
+   mese/anno, numeri, frasi frequenti delle note) affiancata da una lettura
+   libera; ritagli letti a lotti con il decoder che fa avanzare insieme tutte le
+   ricerche del lotto.
+5. **Scelta dei valori** per riga: probabilita' delle letture con preferenze
+   *deboli* (minuti tondi adattati alla grafia della pagina, orario scolastico,
+   valori ricorrenti in colonna, programmato = effettivo, uscita - entrata = ore)
+   e alternative per le cifre che TrOCR confonde (1/4/7, 2/9, 0/6). Le
+   preferenze decidono solo fra letture quasi equivalenti; un valore diverso
+   dalla lettura migliore e' sempre segnalato.
+6. **Segnalazioni** (``incerti``): lettura poco probabile o poco leggibile,
+   lettura libera con cifre o forma diverse ("10/3" contro 10:00, sola ora
+   "13" in un ritaglio largo), orario fuori dalla fascia scolastica, riga
+   incoerente (ore diverse da uscita - entrata, uscita prima dell'entrata, un
+   solo orario effettivo, ore oltre l'orario programmato), celle barrate, riga o
+   pagina non allineata alla griglia (``TableGrid.reliable`` /
+   ``row_reliable``). Se per rendere coerente una riga si scarta una lettura
+   chiara, si segnala l'intera riga. Una cella incerta *solo* perche' poco
+   leggibile torna sicura se una relazione esatta con celle sicure della stessa
+   riga (o lo stesso orario programmato negli stessi giorni della settimana)
+   conferma proprio il valore preferito dalla lettura. Scrittura presente ma non
+   interpretabile -> ``illeggibili`` (valore ``None``).
+7. **Note**: riportate come sicure solo se lette con buona fiducia e fatte di
+   parole note (vocabolario generico della scuola, abbreviazioni puntate
+   comprese) senza numeri; le letture brevi fuori vocabolario (code di firme,
+   timbri, tratti) non diventano note.
 
-Precisione misurata (foglio reale d'esempio, CPU a 4 core)
----------------------------------------------------------
-Modello predefinito ``microsoft/trocr-base-handwritten``: orari 69/72 (tutti
-gli errori segnalati), 16 orari corretti ma segnalati come incerti (erano 21
-prima della conferma per coerenza), ore 17/17, assenze 62/62, firme 31/31,
-trattini 31/31, note 31/31, intestazione (lotto, municipalita', mese/anno, ore
-PEI, totale, firma coordinatore, timbro) 10/10; i nomi in stampatello sono letti
-solo in parte e vanno sempre verificati. Circa 60-70 secondi per pagina (~100
-campi scritti; erano circa 85-90 con la decodifica un ritaglio alla volta e il
-decoder quantizzato int8): l'encoder in float32 da solo richiede circa 35 s,
-gia' vicino al picco di calcolo della CPU. A confronto, con la stessa pipeline
-precedente: ``trocr-small`` 33 s/pagina ma orari 63/72 e note 28/31 (richiede
-anche ``sentencepiece`` e ``protobuf``); ``trocr-large`` 177 s/pagina, orari
-64/72, note 28/31.
+Precisione misurata (CPU a 4 core)
+----------------------------------
+Pagine reali di sviluppo di quattro operatori diversi (scansioni e una foto;
+orari, ore, crocette/firme, note, intestazione): 89% dei campi giusti, nessun
+errore non segnalato (prima: 83%, 27 errori mostrati come sicuri). Fogli
+sintetici con orari con la virgola o senza separatore, righe barrate, firme
+lunghe, foto: 98,8% (prima 96,4%, 10 errori non segnalati). I nomi in stampatello
+sono letti solo in parte e vanno sempre verificati. Circa 60-90 secondi per
+pagina: l'encoder in float32 da solo richiede circa 35 s per ~100 campi.
 """
 
 from __future__ import annotations
@@ -79,8 +95,9 @@ import cv2
 import numpy as np
 
 from sirio.engines.base import EngineError, PageInput, ProgressFn, no_progress
-from sirio.models import DayRow, ExtractionResult, Header, Usage
-from sirio.validation import hours_between, normalize_time, parse_hours, parse_time
+from sirio.engines.strokes import erase, find_strikes, is_slash
+from sirio.models import DAY_FIELDS, HEADER_FIELDS, DayRow, ExtractionResult, Header, Usage
+from sirio.validation import avviso_griglia_incerta, hours_between, normalize_time, parse_hours, parse_time
 from sirio.vision import ink
 from sirio.vision.preprocess import to_gray
 
@@ -154,37 +171,42 @@ MESI_NOMI = (
 )
 _ROMANI = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")
 
-# Note ricorrenti sui fogli firma: (valore canonico, varianti scritte).
+# Note ricorrenti sui fogli firma: (valore, varianti scritte). Il valore e' la
+# frase stessa (la nota si riporta come scritta); solo le varianti del permesso
+# L. 104 si riportano a "104". Vocabolario generico della scuola, usato in modo
+# "morbido": aiuta a leggere ma non trasforma una nota in un'altra.
 NOTE_FREQUENTI: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("104", ("104", "L104", "L.104", "LEGGE 104", "PERMESSO 104", "PERM. 104")),
-    ("PONTE DI CARNEVALE", ("PONTE DI CARNEVALE", "PONTE CARNEVALE")),
-    ("CARNEVALE", ("CARNEVALE",)),
-    ("PONTE", ("PONTE",)),
-    ("FESTIVO", ("FESTIVO",)),
-    ("FESTA", ("FESTA",)),
-    ("SCIOPERO", ("SCIOPERO",)),
-    ("ASSEMBLEA SINDACALE", ("ASSEMBLEA SINDACALE",)),
-    ("ASSEMBLEA", ("ASSEMBLEA",)),
-    ("MALATTIA", ("MALATTIA",)),
-    ("FERIE", ("FERIE",)),
-    ("PERMESSO", ("PERMESSO",)),
-    ("CHIUSURA SCUOLA", ("CHIUSURA SCUOLA", "SCUOLA CHIUSA")),
-    ("USCITA DIDATTICA", ("USCITA DIDATTICA",)),
-    ("GITA SCOLASTICA", ("GITA SCOLASTICA", "GITA")),
-    ("ELEZIONI", ("ELEZIONI",)),
-    ("VACANZE", ("VACANZE",)),
-    ("VACANZE NATALIZIE", ("VACANZE NATALIZIE", "VACANZE DI NATALE")),
-    ("VACANZE PASQUALI", ("VACANZE PASQUALI", "VACANZE DI PASQUA")),
-    ("ALUNNO ASSENTE", ("ALUNNO ASSENTE",)),
-    ("ASSENTE", ("ASSENTE",)),
-    ("RECUPERO", ("RECUPERO",)),
-    ("SOSTITUZIONE", ("SOSTITUZIONE",)),
-    ("FORMAZIONE", ("FORMAZIONE", "CORSO DI FORMAZIONE")),
-    ("GLO", ("GLO", "GLHO", "INCONTRO GLO", "RIUNIONE GLO")),
-    ("RIUNIONE", ("RIUNIONE",)),
+    *((p, (p,)) for p in (
+        "PONTE DI CARNEVALE", "PONTE CARNEVALE", "CARNEVALE", "PONTE", "FESTIVO", "FESTA", "SCIOPERO",
+        "ASSEMBLEA SINDACALE", "ASSEMBLEA DI ISTITUTO", "ASSEMBLEA", "MALATTIA", "FERIE", "PERMESSO",
+        "PERMESSO RETRIBUITO", "CHIUSURA SCUOLA", "SCUOLA CHIUSA", "USCITA DIDATTICA", "USCITA ANTICIPATA",
+        "ENTRATA POSTICIPATA", "GITA SCOLASTICA", "GITA", "ELEZIONI", "VACANZE", "VACANZE NATALIZIE",
+        "VACANZE DI NATALE", "VACANZE PASQUALI", "VACANZE DI PASQUA", "ALUNNO ASSENTE", "ALUNNA ASSENTE",
+        "ASSENTE", "RECUPERO", "SOSTITUZIONE", "FORMAZIONE", "CORSO DI FORMAZIONE", "GLO", "GLHO",
+        "INCONTRO GLO", "RIUNIONE GLO", "RIUNIONE", "CERTIFICATO MEDICO", "VISITA MEDICA", "COLLEGIO DOCENTI",
+        "CONSIGLIO DI CLASSE", "SCRUTINI", "DISINFESTAZIONE", "ALLERTA METEO", "LUTTO",
+        "SOSPENSIONE ATTIVITA DIDATTICA",
+    )),
 )
 
-_NOTE_CANONICHE = frozenset(canon for canon, _forms in NOTE_FREQUENTI)
+_NOTE_FRASI = frozenset(v for v, _forms in NOTE_FREQUENTI)
+
+# Parole delle note (generiche, per riconoscere una nota "in italiano" e
+# correggere lievi errori di lettura); le abbreviazioni ("CARN.", "ASSEM.")
+# valgono come la parola intera.
+NOTE_PAROLE: frozenset[str] = frozenset(
+    w for _v, forms in NOTE_FREQUENTI for f in forms for w in re.findall(r"[A-Z]+", f) if len(w) >= 2
+) | frozenset((
+    "ALUNNO", "ALUNNA", "NON", "ERA", "PRESENTE", "ASSENZA", "ORE", "ORA", "ORARIO", "ENTRATA", "USCITA",
+    "ANTICIPO", "ANTICIPATA", "RITARDO", "POSTICIPATA", "ISTITUTO", "SCUOLA", "CLASSE", "DOCENTI", "MEDICO",
+    "CERTIFICATO", "CERTIFICAZIONE", "PROTOCOLLO", "RICHIESTA", "SERVIZIO", "SOSPENSIONE",
+    "ATTIVITA", "DIDATTICA", "DIDATTICHE", "MANIFESTAZIONE", "INCONTRO", "GENITORI", "COLLOQUIO", "SUL",
+    "SULLA", "DEL", "DELLA", "DELL", "DI", "DA", "AL", "ALLA", "IL", "LA", "LO", "PER", "CON", "SU", "NEL",
+    "MATTINA", "POMERIGGIO", "GIORNO", "GIORNATA", "FESTIVITA", "SANTO", "PATRONO", "COMUNE", "CHIUSO",
+    "CHIUSA", "RETRIBUITO", "RETRIBUITA", "MALATO", "MALATA", "LEGGE", "EVENTO", "TEATRO",
+))
+
 
 NAME_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -296,12 +318,13 @@ def _num_forms(x: float) -> list[str]:
     return forms
 
 
-_TIME_SEPARATORS = (":", ".", ",", ";", "'", "")
+_TIME_SEPARATORS = (":", ".", ",", ";", "'", "H", "")
 
 
 @functools.cache
 def time_lexicon() -> Lexicon:
-    """Orari 06:00-20:00 a passi di 15 minuti ("8:00", "08.30", "1100", "8"...)."""
+    """Orari 06:00-20:00 a passi di 15 minuti nelle scritture reali: "8:00",
+    "08.30", "8,30", "10,30", "800", "1100", "830", "8h30", "8:30h", "8"..."""
     pairs: list[tuple[str, str]] = []
     for minutes in range(TIME_MIN, TIME_MAX + 1, TIME_STEP):
         h, m = divmod(minutes, 60)
@@ -315,21 +338,50 @@ def time_lexicon() -> Lexicon:
                     for mm in mins:
                         if sep or len(mm) == 2:
                             pairs.append((f"{hh}{sep}{mm}", value))
+                            pairs.append((f"{hh}{sep}{mm}H", value))    # "8:30h"
                 if m == 0:
                     pairs.append((hh, value))
+                    pairs.append((f"{hh}H", value))
     return Lexicon.build("orari", pairs, numeric=True)
+
+
+HOURS_STEP = 0.25          # ore a quarti d'ora
+
+
+def _hours_forms(v: float) -> list[str]:
+    """Scritture di un numero di ore: "3", "3h", "2,5", "2h30'", "2:30", "1h15'"...
+
+    I quarti d'ora si scrivono di norma con le ore e i minuti ("1h15'", "1:45"):
+    le forme decimali "1,25"/"2,75" non sono ammesse perche' TrOCR legge spesso
+    "2,5" come "2.25" e la lettura sbagliata diventerebbe un valore ammesso."""
+    whole = int(math.floor(v + 1e-9))
+    minutes = int(round((v - whole) * 60))
+    w = str(whole)
+    if minutes == 0:
+        forms = [w, f"{w}H", f"{w},0", f"{w}.0", f"{w}:00", f"{w}H00", f"{w}H00'"]
+    elif minutes == 30:
+        forms = [*_num_forms(v), f"{w},50", f"{w}.50", f"{w},30", f"{w}.30"]
+    else:
+        forms = []
+    if minutes:
+        for sep in ("H", ":"):
+            forms += [f"{w}{sep}{minutes:02d}", f"{w}{sep}{minutes:02d}'"]
+        forms += [f"{w}H{minutes:02d}MIN", f"{w}H{minutes:02d}M"]
+        if whole == 0:
+            forms += [f"{minutes}'", f"{minutes}MIN"]
+    return list(dict.fromkeys(forms))
 
 
 @functools.cache
 def hours_lexicon() -> Lexicon:
-    """Ore giornaliere 0-8 a passi di mezz'ora ("3", "1,5", "1.5", "3h")."""
+    """Ore giornaliere 0-8 a passi di un quarto d'ora ("3", "3h", "2,5",
+    "1,25", "2h30'", "1h15", "0")."""
     pairs: list[tuple[str, float]] = []
-    for half in range(int(HOURS_MAX_DAY * 2) + 1):
-        v = half / 2
-        for f in _num_forms(v):
+    for q in range(int(HOURS_MAX_DAY / HOURS_STEP) + 1):
+        v = q * HOURS_STEP
+        for f in _hours_forms(v):
             for variant in _digit_variants(f):
                 pairs.append((variant, v))
-                pairs.append((variant + "h", v))
     return Lexicon.build("ore", pairs, numeric=True)
 
 
@@ -438,6 +490,7 @@ class Reading:
     free_text: str = ""
     free_logprob: float = -math.inf
     free_tokens: int = 0
+    forms: dict[Any, str] = field(default_factory=dict)   # valore -> scrittura vincolata piu' probabile
 
     @property
     def free_confidence(self) -> float:
@@ -907,13 +960,17 @@ class TrOCRRecognizer:
         lex = req.lexicon
         if lex is not None:
             by_value: dict[Any, list[float]] = {}
+            best_form: dict[Any, tuple[str, float]] = {}
             for key, _ids, score in constrained:
                 value = lex.complete(key)
                 if value is not None:
                     by_value.setdefault(value, []).append(score)
+                    if score > best_form.get(value, ("", -math.inf))[1]:
+                        best_form[value] = (key, score)
             cands = [(v, _logsumexp(s)) for v, s in by_value.items()]
             cands.sort(key=lambda c: c[1], reverse=True)
             reading.candidates = cands
+            reading.forms = {v: k for v, (k, _s) in best_form.items()}
             if free is None and req.free:
                 best = max(constrained, key=lambda f: f[2])
                 reading.free_text = self._decode_ids(best[1])
@@ -1660,8 +1717,9 @@ TIME_FIELDS = ("prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita")
 TEXT_FIELDS = (*TIME_FIELDS, "ore_dichiarate")
 
 # Stati delle celle dopo l'analisi dell'inchiostro.
-VUOTA, TESTO, TRATTINO, CROCETTA, FIRMA, SEGNO, TIMBRO = (
-    "vuota", "testo", "trattino", "crocetta", "firma", "segno", "timbro")
+VUOTA, TESTO, TRATTINO, CROCETTA, FIRMA, SEGNO, TIMBRO, NULLO = (
+    "vuota", "testo", "trattino", "crocetta", "firma", "segno", "timbro", "nullo")
+# NULLO: barretta "/" isolata (riga non lavorata): nessun valore
 
 
 @dataclass
@@ -1678,6 +1736,8 @@ class PagePlan:
     totale_ink: bool = False
     data_ink: bool = False
     notes: list[str] = field(default_factory=list)
+    aspect: dict[str, float] = field(default_factory=dict)              # chiave -> larghezza/altezza del ritaglio
+    flags: dict[int, dict[str, str]] = field(default_factory=dict)      # giorno -> campo -> motivo di dubbio
 
 
 def _cell_state_text(img: np.ndarray, box: Box, allow_dash: bool) -> str:
@@ -1700,8 +1760,21 @@ def _cell_state_signature(img: np.ndarray, box: Box) -> str:
     return VUOTA if ink.is_blank(img, box) else SEGNO
 
 
+# Bianco aggiunto sopra e sotto i ritagli di orari e ore (frazione dell'altezza): TrOCR
+# ridimensiona ogni ritaglio a un quadrato e le cifre di un ritaglio basso e largo
+# risultano molto stirate in verticale. Misurato su 297 celle di quattro fogli reali di
+# operatori diversi: lettura migliore corretta 240 -> 243, probabilita' media del valore
+# vero 0,77 -> 0,80, a costo nullo.
+VPAD_NUMERI = 0.3
+
+
 def _text_request(key: str, crop: np.ndarray, lexicon: Lexicon | None, **kw: Any) -> ReadRequest:
-    return ReadRequest(key=key, image=model_image(crop, kw.pop("min_aspect", 1.0)), lexicon=lexicon, **kw)
+    vpad = kw.pop("vpad", 0.0)
+    img = model_image(crop, kw.pop("min_aspect", 1.0))
+    if vpad > 0:
+        p = int(round(vpad * img.shape[0]))
+        img = cv2.copyMakeBorder(img, p, p, 0, 0, cv2.BORDER_CONSTANT, value=255)
+    return ReadRequest(key=key, image=img, lexicon=lexicon, **kw)
 
 
 def _sostituzione(gray: np.ndarray, grid: TableGrid) -> tuple[str | None, bool]:
@@ -1751,10 +1824,11 @@ def _sostituzione(gray: np.ndarray, grid: TableGrid) -> tuple[str | None, bool]:
 
 def stamp_boxes(gray: np.ndarray, grid: TableGrid) -> list[Box]:
     """Timbri (grandi macchie tondeggianti) nella parte bassa a destra del foglio:
-    colonna "Note", margine destro e pie' di pagina."""
+    colonne "Firma operatore" e "Note", margine destro e pie' di pagina (il
+    timbro del referente scolastico copre spesso le ultime righe)."""
     H, W = gray.shape[:2]
     rh = grid.row_height
-    zx0 = max(0, int(grid.col_x[9] - 0.3 * rh))
+    zx0 = max(0, int(grid.col_x[8] - 0.3 * rh))
     zy0 = max(0, int(grid.row_y[15]))
     region = gray[zy0:H, zx0:W]
     if region.size == 0:
@@ -1768,8 +1842,14 @@ def stamp_boxes(gray: np.ndarray, grid: TableGrid) -> list[Box]:
     out: list[Box] = []
     for i in range(1, n):
         x, y, w, h, area = (int(v) for v in stats[i])
-        if w >= 1.5 * rh and h >= 1.5 * rh and 0.5 <= w / float(h) <= 2.0 and area >= 0.3 * w * h:
-            out.append((x + zx0, y + zy0, x + w + zx0, y + h + zy0))
+        if not (w >= 1.5 * rh and h >= 1.5 * rh and 0.5 <= w / float(h) <= 2.0 and area >= 0.3 * w * h):
+            continue
+        if x + zx0 + w / 2.0 < grid.col_x[9]:
+            # nella colonna delle firme: firme di righe vicine fuse insieme somigliano a
+            # una macchia; un timbro vero e' piu' grande e scende fino al fondo della tabella
+            if w < 2.2 * rh or h < 2.2 * rh or y + h + zy0 < grid.row_y[-1] - 0.3 * rh:
+                continue
+        out.append((x + zx0, y + zy0, x + w + zx0, y + h + zy0))
     return out
 
 
@@ -1823,50 +1903,364 @@ def _label_end(gray: np.ndarray, box: Box, unit: float) -> int:
     return x0 + last + 1
 
 
+def _touches_signature(gray: np.ndarray, box: Box, firma_box: Box) -> bool:
+    """Il segno nella cella (colonna di assenza a sinistra della firma) arriva al
+    bordo destro e la firma comincia sul bordo sinistro della sua cella: e'
+    probabilmente l'inizio della firma che sconfina, non una crocetta."""
+    info = ink.analyze_cell(gray, box)
+    if info.bbox is None:
+        return False
+    w = box[2] - box[0]
+    if info.bbox[2] < box[2] - 0.08 * w:
+        return False
+    finfo = ink.analyze_cell(gray, firma_box)
+    return finfo.bbox is not None and finfo.bbox[0] <= firma_box[0] + 0.06 * (firma_box[2] - firma_box[0])
+
+
+def _remove_overflow(gray: np.ndarray, grid: TableGrid, g: int) -> int:
+    """Cancella (in ``gray``, modificata sul posto) i tratti che entrano nella
+    colonna "Note" dalla firma della stessa riga: code di firme lunghe che
+    sconfinano oltre il bordo. Un tratto e' considerato uno sconfinamento se
+    attraversa il bordo fra firma e note oppure se comincia sul bordo e
+    dall'altra parte del bordo, alla stessa altezza, c'e' inchiostro della firma.
+    Restituisce i pixel cancellati."""
+    H, W = gray.shape[:2]
+    rh = grid.row_height
+    xb = grid.col_x[9]
+    y0 = max(0, int(grid.row_y[g - 1] - 0.6 * rh))
+    y1 = min(H, int(grid.row_y[g] + 0.6 * rh))
+    x0 = max(0, int(grid.col_x[8]))
+    x1 = min(W, int(grid.col_x[10] + 0.5 * rh))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return 0
+    region = gray[y0:y1, x0:x1]
+    m = region < _ink_threshold(_paper_level(region))
+    rows = [grid.row_y[i] - y0 for i in range(max(0, g - 2), min(len(grid.row_y), g + 2))]
+    m &= ~_line_mask(m, rh, rows, [grid.col_x[8] - x0, xb - x0, grid.col_x[10] - x0])
+    lx = xb - x0
+    # pezzi della stessa scrittura separati da piccoli vuoti (o dalla linea tolta) restano uniti
+    r = max(1, int(round(0.08 * rh)))
+    link = cv2.dilate(m.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(link, connectivity=8)
+    gap = max(3, int(round(0.2 * rh)))
+    erased = 0
+    for k in range(1, n):
+        bx, by, bw, bh, _a = (int(v) for v in stats[k])
+        if bx + bw <= lx:           # tutto nella firma
+            continue
+        comp = (lab == k) & m
+        crosses = bx < lx - 0.12 * rh and bx + bw > lx + 0.05 * rh
+        if not crosses:
+            if bx > lx + gap:
+                continue
+            # comincia sul bordo: inchiostro della firma subito a sinistra, alla stessa altezza?
+            ys = np.nonzero(comp[:, max(0, lx):min(comp.shape[1], lx + gap)].any(axis=1))[0]
+            if ys.size == 0:
+                continue
+            left = m[max(0, ys.min() - r):ys.max() + r + 1, max(0, lx - gap):max(0, lx - 1)]
+            if not left.any():
+                continue
+            if bx + bw > lx + 3.0 * rh:
+                # tratto lungo che continua nella cella: probabile scrittura vera
+                continue
+        sel = cv2.dilate(comp.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        region[sel] = 255
+        erased += int(comp.sum())
+    return erased
+
+
+def split_text_lines(crop: np.ndarray, unit: float) -> list[np.ndarray]:
+    """Divide un ritaglio (inchiostro scuro su bianco) in due righe di testo se la
+    scrittura e' disposta su due righe separate da una valle netta del profilo
+    orizzontale; altrimenti restituisce il ritaglio intero."""
+    ink = crop < 160
+    prof = ink.sum(axis=1).astype(np.float64)
+    rows = np.nonzero(prof > 0)[0]
+    if rows.size == 0:
+        return [crop]
+    top, bot = int(rows[0]), int(rows[-1]) + 1
+    min_line = max(3, int(round(LINEA_MIN_ALTEZZA * unit)))
+    if bot - top < 2 * min_line + 1:
+        return [crop]
+    smooth = np.convolve(prof, np.ones(3) / 3.0, mode="same")
+    inner = smooth[top + min_line:bot - min_line]
+    if inner.size == 0:
+        return [crop]
+    cut = top + min_line + int(np.argmin(inner))
+    upper, lower = smooth[top:cut].max(), smooth[cut:bot].max()
+    if smooth[cut] > LINEA_VALLE * min(upper, lower):
+        return [crop]
+    pad = max(2, int(round(0.15 * unit)))
+    a = crop[max(0, top - pad):cut]
+    b = crop[cut:min(crop.shape[0], bot + pad)]
+    out = []
+    widths = []
+    for part in (a, b):
+        cols = np.nonzero((part < 160).any(axis=0))[0]
+        if cols.size == 0:
+            return [crop]
+        widths.append(int(cols[-1]) - int(cols[0]) + 1)
+        x0, x1 = max(0, int(cols[0]) - pad), min(part.shape[1], int(cols[-1]) + 1 + pad)
+        out.append(cv2.copyMakeBorder(part[:, x0:x1], pad // 2, pad // 2, 0, 0, cv2.BORDER_CONSTANT, value=255))
+    # due righe vere: entrambe larghe (un frammento della riga vicina non e' una riga)
+    if min(widths) < max(LINEA_MIN_LARGHEZZA * unit, 0.3 * max(widths)):
+        return [crop]
+    return out
+
+
+LINEA_MIN_ALTEZZA = 0.22    # altezza minima (altezze di riga) di ognuna delle due righe di una nota
+LINEA_MIN_LARGHEZZA = 1.0   # larghezza minima (altezze di riga) di ognuna delle due righe
+LINEA_VALLE = 0.15          # profilo nella valle fra le righe rispetto al picco della riga piu' debole
+
+
+def _note_reading(readings: dict[str, Reading], g: int) -> Reading | None:
+    """Lettura della nota del giorno ``g`` (le note su due righe sono lette riga per riga e riunite)."""
+    key = f"rows.{g}.note"
+    if key in readings:
+        return readings[key]
+    parts = [readings[k] for k in (f"{key}#1", f"{key}#2") if k in readings]
+    if not parts:
+        return None
+    texts = [r.free_text for r in parts if r.free_text]
+    if not texts:
+        return Reading()
+    return Reading([], " ".join(texts), float(sum(r.free_logprob for r in parts if r.free_text)),
+                   sum(r.free_tokens for r in parts if r.free_text))
+
+
+NOTE_MIN_WIDTH = 0.6        # larghezza minima (altezze di riga) di una nota vera
+NOTE_MIN_HEIGHT = 0.3
+
+
+class PageMarks:
+    """Segni a mano che non sono valori (barrature, linee, barrette "/"), dall'unione
+    di due rilevatori indipendenti: ``strokes.find_strikes`` (tratti lunghi e sottili,
+    cancellati dall'immagine prima dell'analisi delle celle) e ``ink.PageInk``
+    (inchiostro "proprio" di ogni cella, righe barrate per intero, linee orizzontali,
+    barrette). Unire i due serve alla sicurezza: un segno visto da uno solo dei due
+    basta a *segnalare* la cella; solo i segni visti dal primo (o da entrambi)
+    possono togliere un valore senza segnalarlo, come prima."""
+
+    def __init__(self, gray: np.ndarray, img: np.ndarray, grid: TableGrid):
+        self.grid = grid
+        self.strikes = find_strikes(gray, grid)
+        self.page: Any = None
+        try:
+            self.page = ink.PageInk(img, grid)
+        except Exception:  # noqa: BLE001 - analisi aggiuntiva: senza, restano i segni del primo rilevatore
+            log.warning("Analisi dell'inchiostro delle celle non riuscita", exc_info=True)
+        self._own: dict[tuple[int, str], Any] = {}
+        rows: dict[int, int] = {}
+        for (g, _c), (_len, horizontal) in self.strikes.cells.items():
+            if not horizontal:
+                rows[g] = rows.get(g, 0) + 1
+        # riga barrata: un tratto diagonale attraversa almeno due celle della riga
+        self.struck_rows = {g for g, n in rows.items() if n >= 2}
+        if self.page is not None:
+            try:
+                self.struck_rows |= set(self.page.struck_days)
+            except Exception:  # noqa: BLE001
+                log.debug("Righe barrate non disponibili", exc_info=True)
+
+    @property
+    def n_strokes(self) -> int:
+        n = len(self.strikes.strokes)
+        if self.page is not None and not n:
+            n = len(getattr(self.page, "strokes", []) or [])
+        return n
+
+    def own(self, g: int, f: str) -> Any:
+        """``ink.CellInkResult`` della cella (None se l'analisi non e' disponibile)."""
+        if self.page is None:
+            return None
+        key = (g, f)
+        if key not in self._own:
+            try:
+                self._own[key] = self.page.own_ink(g, f)
+            except Exception:  # noqa: BLE001
+                log.debug("Inchiostro proprio della cella %s non disponibile", key, exc_info=True)
+                self._own[key] = None
+        return self._own[key]
+
+    def struck(self, g: int, f: str) -> bool:
+        """Cella attraversata da una barratura (o in una riga barrata)."""
+        if g in self.struck_rows or self.strikes.struck(g, self.grid.col_index(f)):
+            return True
+        r = self.own(g, f)
+        return bool(r is not None and (r.struck or r.row_struck))
+
+    def line_across(self, g: int, f: str) -> bool:
+        if self.strikes.horizontal(g, self.grid.col_index(f)):
+            return True
+        r = self.own(g, f)
+        return bool(r is not None and r.line_across)
+
+    def line_only(self, g: int, f: str) -> bool:
+        """Nella cella c'e' solo una linea tirata a mano (secondo ``PageInk``)."""
+        r = self.own(g, f)
+        return bool(r is not None and r.line_across and r.empty)
+
+    def own_crop(self, g: int, f: str) -> np.ndarray | None:
+        """Ritaglio (inchiostro scuro su bianco, con margine) dell'inchiostro proprio della
+        cella secondo ``PageInk``; None se la cella e' vuota o contiene solo segni
+        (linea attraverso, barratura, "/")."""
+        r = self.own(g, f)
+        if r is None or r.empty or r.line_across or r.struck or r.slash:
+            return None
+        mask = np.asarray(r.mask, dtype=bool)
+        if mask.sum() < max(12.0, (0.06 * self.grid.row_height) ** 2):
+            return None
+        ys, xs = np.nonzero(mask)
+        crop = np.where(mask, np.asarray(r.crop), 255).astype(np.uint8)[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        unit = self.grid.row_height
+        px, py = max(2, int(round(0.22 * unit))), max(2, int(round(0.15 * unit)))
+        return cv2.copyMakeBorder(crop, py, py, px, px, cv2.BORDER_CONSTANT, value=255)
+
+    def slash(self, g: int, f: str) -> bool:
+        """Barretta "/" isolata secondo ``PageInk`` (il primo rilevatore la cerca sul ritaglio)."""
+        r = self.own(g, f)
+        return bool(r is not None and r.slash)
+
+    def empty(self, g: int, f: str) -> bool:
+        """``PageInk`` non trova inchiostro proprio nella cella (tolte linee, barrature e
+        tratti di celle vicine)."""
+        r = self.own(g, f)
+        return bool(r is not None and r.empty)
+
+
 def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
     """Analizza l'inchiostro della pagina e prepara i ritagli da leggere."""
-    gray = to_gray(img)
-    H, W = gray.shape[:2]
+    gray0 = to_gray(img)
+    H, W = gray0.shape[:2]
     rh = grid.row_height
     plan = PagePlan()
     t_lex, h_lex, n_lex = time_lexicon(), hours_lexicon(), notes_lexicon()
+    # barrature a mano (righe annullate, linee sugli orari effettivi): si cancellano
+    # prima di ogni analisi delle celle e si ricorda quali celle attraversano
+    marks = PageMarks(gray0, img, grid)
+    gray = erase(gray0, marks.strikes.mask)
+    if marks.n_strokes:
+        plan.notes.append(f"Linee di barratura riconosciute e ignorate: {marks.n_strokes}.")
+    if marks.struck_rows:
+        plan.notes.append("Righe barrate (non usate) nei giorni "
+                          + ", ".join(str(g) for g in sorted(marks.struck_rows))
+                          + ": l'eventuale scrittura rimasta e' da verificare.")
+    notes_gray: np.ndarray | None = None
     stamps = stamp_boxes(gray, grid)
     for g in range(1, 32):
         states: dict[str, str] = {}
+        flags: dict[str, str] = {}
+        slashes: list[str] = []
         y0, y1 = grid.row_y[g - 1], grid.row_y[g]
         for f in TEXT_FIELDS:
             box = grid.cell(g, f)
-            st = _cell_state_text(img, box, allow_dash=True)
-            states[f] = st
-            if st != TESTO:
-                continue
             c = grid.col_index(f)
-            crop = clean_crop(gray, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]))
-            if crop is None:
-                states[f] = VUOTA
+            st = _cell_state_text(gray, box, allow_dash=True)
+            crop = None
+            if st == TESTO and f in ("eff_entrata", "eff_uscita") and marks.line_only(g, f):
+                st = VUOTA          # solo la linea "non svolta" (vedi sotto)
+            if st == TESTO:
+                crop = clean_crop(gray, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]))
+                if crop is None:
+                    # il ritaglio pulito non trova scrittura propria, l'analisi dell'inchiostro
+                    # della cella si': si legge il suo ritaglio e il valore resta da verificare
+                    crop = marks.own_crop(g, f)
+                    if crop is not None:
+                        flags[f] = "ritaglio"
+                if crop is None:
+                    st = VUOTA
+                elif is_slash(crop, rh):
+                    slashes.append(f)
+                elif marks.slash(g, f):
+                    # barretta vista solo dall'analisi dell'inchiostro: si legge e si segnala
+                    flags[f] = "barretta"
+            if st == TESTO and marks.struck(g, f):
+                flags[f] = "barrato"
+            states[f] = st
+            if st != TESTO or crop is None:
                 continue
+            key = f"rows.{g}.{f}"
+            plan.aspect[key] = crop.shape[1] / max(1.0, float(crop.shape[0]))
             if f == "ore_dichiarate":
-                plan.requests.append(_text_request(f"rows.{g}.{f}", crop, h_lex, beams=5, max_tokens=6))
+                plan.requests.append(_text_request(key, crop, h_lex, beams=5, max_tokens=6, vpad=VPAD_NUMERI))
             else:
-                plan.requests.append(_text_request(f"rows.{g}.{f}", crop, t_lex, beams=6, max_tokens=8))
+                plan.requests.append(_text_request(key, crop, t_lex, beams=6, max_tokens=8, vpad=VPAD_NUMERI))
+        # "/" isolata in una riga senza altri orari (riga non lavorata): nessun valore;
+        # altrimenti (o nella colonna delle ore, dove un "1" puo' somigliarle) si legge e si segnala
+        others = [f for f in TIME_FIELDS if states[f] == TESTO and f not in slashes]
+        for f in slashes:
+            if f in TIME_FIELDS and not others:
+                states[f] = NULLO
+                plan.requests = [r for r in plan.requests if r.key != f"rows.{g}.{f}"]
+                plan.aspect.pop(f"rows.{g}.{f}", None)
+            else:
+                flags[f] = "barretta"
+        # linea orizzontale tirata sugli orari effettivi = prestazione non svolta
+        if any(marks.line_across(g, f) for f in ("eff_entrata", "eff_uscita")):
+            if all(states[f] in (VUOTA, NULLO, TRATTINO) for f in ("eff_entrata", "eff_uscita")):
+                states["eff_entrata"] = states["eff_uscita"] = TRATTINO
         for f in ("assenza_alunno", "assenza_operatore"):
-            states[f] = _cell_state_cross(img, grid.cell(g, f))
-        states["firma"] = _cell_state_signature(img, grid.cell(g, "firma"))
+            box = grid.cell(g, f)
+            st = _cell_state_cross(gray, box)
+            if st == CROCETTA and (marks.struck(g, f) or marks.slash(g, f) or marks.empty(g, f)):
+                # pezzo di barratura, "/" isolata o inchiostro che secondo l'analisi delle
+                # celle appartiene a una cella vicina (es. l'inizio di una firma): forse
+                # non e' una crocetta
+                st = SEGNO
+            states[f] = st
+        fbox = grid.cell(g, "firma")
+        st = _cell_state_signature(gray, fbox)
+        if st != VUOTA and _inside_stamp(gray, fbox, stamps):
+            st = TIMBRO
+        elif st == FIRMA and marks.struck(g, "firma"):
+            st = SEGNO
+        states["firma"] = st
+        if st in (FIRMA, SEGNO) and states["assenza_operatore"] == CROCETTA:
+            worked = any(states[f] == TESTO for f in ("eff_entrata", "eff_uscita"))
+            if worked or _touches_signature(gray, grid.cell(g, "assenza_operatore"), fbox):
+                # operatore assente ma riga firmata con l'orario effettivo (contraddizione),
+                # oppure inizio della firma che sconfina: la "crocetta" va verificata
+                states["assenza_operatore"] = SEGNO
         box = grid.cell(g, "note")
-        st = _cell_state_text(img, box, allow_dash=True)
+        st = _cell_state_text(gray, box, allow_dash=True)
         if st == TESTO and _inside_stamp(gray, box, stamps):
             st = TIMBRO
+        elif st == TESTO and marks.empty(g, "note"):
+            st = VUOTA          # solo code di firme, linee o tratti delle righe vicine
+        source = gray
+        if st == TESTO and states["firma"] != VUOTA:
+            if notes_gray is None:
+                notes_gray = gray.copy()
+            if _remove_overflow(notes_gray, grid, g):
+                source = notes_gray
+                if ink.is_blank(source, box):
+                    st = VUOTA
         if st == TESTO:
             c = grid.col_index("note")
-            crop = clean_crop(gray, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]),
+            crop = clean_crop(source, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]),
                               extend=(0.3, 0.5))
-            if crop is None:
+            pad_x, pad_y = max(2, int(round(0.22 * rh))), max(2, int(round(0.15 * rh)))
+            if crop is None or (crop.shape[1] - 2 * pad_x < NOTE_MIN_WIDTH * rh
+                                and crop.shape[0] - 2 * pad_y < NOTE_MIN_HEIGHT * rh):
                 st = VUOTA
             else:
-                plan.requests.append(_text_request(f"rows.{g}.note", crop, n_lex, beams=4, free_beams=3,
-                                                   charset=NOTE_CHARS, max_tokens=16, min_aspect=2.0))
+                key = f"rows.{g}.note"
+                plan.aspect[key] = crop.shape[1] / max(1.0, float(crop.shape[0]))
+                lines = split_text_lines(crop, rh)
+                if len(lines) == 1:
+                    plan.requests.append(_text_request(key, crop, n_lex, beams=4, free_beams=3,
+                                                       charset=NOTE_CHARS, max_tokens=20, min_aspect=2.0))
+                else:
+                    # nota scritta piccola su due righe nella cella: TrOCR legge una riga alla volta
+                    for i, line in enumerate(lines):
+                        plan.requests.append(_text_request(f"{key}#{i + 1}", line, None, free_beams=3,
+                                                           charset=NOTE_CHARS, max_tokens=16, min_aspect=2.0))
+        if st == TESTO and marks.struck(g, "note"):
+            flags["note"] = "barrato"
         states["note"] = st
         plan.cells[g] = states
+        if flags:
+            plan.flags[g] = flags
 
     # --- intestazione
     spots = header_spots(gray, grid)
@@ -1936,19 +2330,32 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
 # Post-elaborazione: evidenze, riconciliazione, incertezze
 # ==========================================================================
 
-P_INCERTO = 0.6          # probabilita' minima del valore scelto per non segnalarlo come incerto
+P_INCERTO = 0.7          # probabilita' minima del valore scelto per non segnalarlo come incerto
 P_LEGGIBILE = 0.05       # copertura minima: sotto, la scrittura non somiglia a nessun valore ammesso
-SUPPORTO_CONTESTO = 1.0  # coerenza minima perche' un valore poco leggibile sia dedotto dalla riga
+SUPPORTO_CONTESTO = 0.5  # coerenza minima perche' un valore poco leggibile sia dedotto dalla riga (resta segnalato)
 COPERTURA_DEBOLE = 0.3   # sotto questa copertura la lettura conta poco e si considerano i valori del contesto
 P_CONTESTO = 0.02        # probabilita' iniziale di un valore suggerito dal contesto
 TAU_MIN = 0.25           # attenuazione massima delle preferenze di una lettura debole
 TOP_K = 4                # alternative per cella considerate nella riconciliazione
-W_COLONNA = 1.0          # preferenza per i valori ricorrenti nella stessa colonna (orario scolastico)
+W_COLONNA = 0.5          # preferenza per i valori ricorrenti nella stessa colonna (solo fra letture incerte)
+W_COLONNA_PROG = 1.0     # ... piu' forte per l'orario programmato (settimanale, si ripete nel mese)
 QUOTA_COLONNA = 0.6      # quota oltre la quale un valore "domina" la colonna
 SIMILE_NOTA = 0.8        # somiglianza per agganciare una nota a una formula ricorrente
 SIMILE_NOTA_VICINA = 0.45   # ... o alla nota (sicura) del giorno precedente/successivo
 P_CONFERMA = 0.8         # probabilita' (fra i valori ammessi) minima perche' la coerenza confermi una lettura
 P_ALTERNATIVA = 0.02     # probabilita' oltre la quale un'alternativa letta conta come possibile scambio
+P_RIVALE = 0.25          # probabilita' dell'alternativa che rende dubbio un valore
+P_CHIARA = 0.8           # lettura "chiara": la riconciliazione che la scarta rende dubbia tutta la riga
+COPERTURA_CONTRARIA = 0.1   # ... come quella che sostituisce una lettura leggibile con un valore che non suggeriva
+
+
+# Orario scolastico plausibile: entrate e uscite fuori da questa fascia sono rare
+# (una cifra letta male, es. "12,30" letto "19,30").
+ORARIO_PIENO = (7 * 60 + 30, 17 * 60)     # nessuna penalita'
+ORARIO_LIMITE = (7 * 60, 18 * 60)         # oltre: valore sempre segnalato
+W_ORARIO_BORDO = -1.0                     # fra la fascia piena e il limite
+W_ORARIO_FUORI = -2.5                     # fuori dal limite
+ORE_PLAUSIBILI = 6.0                      # ore giornaliere oltre le quali il valore e' segnalato
 
 
 def _time_minutes(v: str | None) -> int | None:
@@ -1956,16 +2363,58 @@ def _time_minutes(v: str | None) -> int | None:
     return None if p is None else p[0] * 60 + p[1]
 
 
+def _time_plausible(m: int | None) -> bool:
+    return m is not None and ORARIO_LIMITE[0] <= m <= ORARIO_LIMITE[1]
+
+
+# Distribuzione dei minuti della pagina (00/30/15-45): pseudo-conteggi della
+# preferenza generica, aggiornati con i minuti letti con sicurezza sulla pagina
+# (chi scrive solo orari tondi rende piu' sospetto un "8:30"; chi usa le mezz'ore no).
+MINUTI_PSEUDO = {0: 3.0, 30: 2.0, 15: 0.5, 45: 0.5}
+MINUTI_MIN_LOG = -2.5
+
+
+def page_minute_prior(minutes: Iterable[int]) -> Callable[[str], float]:
+    """Preferenza (log, 0 per i minuti piu' probabili) per i minuti degli orari,
+    adattata ai minuti letti con sicurezza sulla pagina."""
+    counts = dict(MINUTI_PSEUDO)
+    for m in minutes:
+        if m in counts:
+            counts[m] += 1.0
+    # l'ora piena non e' mai penalizzata (e' la scrittura piu' comune in generale): sulle
+    # pagine con molte mezz'ore le mezz'ore smettono di esserlo, su quelle senza lo diventano di piu'
+    table = {m: 0.0 if m == 0 else max(MINUTI_MIN_LOG, min(0.0, math.log(c / counts[0])))
+             for m, c in counts.items()}
+
+    def prior(value: str) -> float:
+        m = _time_minutes(value)
+        if m is None:
+            return 0.0
+        s = table.get(m % 60, MINUTI_MIN_LOG)
+        if not ORARIO_PIENO[0] <= m <= ORARIO_PIENO[1]:
+            s += W_ORARIO_BORDO if _time_plausible(m) else W_ORARIO_FUORI
+        return s
+
+    return prior
+
+
+_GENERIC_TIME_PRIOR = page_minute_prior(())
+
+
 def _time_prior(value: str) -> float:
-    """Preferenza per gli orari "tondi" (8:00 molto piu' frequente di 8:30, 8:15)."""
-    m = _time_minutes(value)
-    if m is None:
-        return 0.0
-    return {0: 0.0, 30: -1.0}.get(m % 60, -2.0)
+    """Preferenza generica (senza dati della pagina) per minuti e orario scolastico.
+
+    Serve solo a scegliere fra letture quasi equivalenti: una lettura chiara di
+    10:30 non diventa 10:00; 19:30 contro 12:30 invece pesa (fuori orario)."""
+    return _GENERIC_TIME_PRIOR(value)
 
 
 def _hours_prior(value: float) -> float:
-    return 0.0 if abs(value - round(value)) < 1e-9 else -0.5
+    frac = abs(value - round(value))
+    s = 0.0 if frac < 1e-9 else (-0.4 if abs(frac - 0.5) < 1e-9 else -0.9)
+    if value <= 0 or value > ORE_PLAUSIBILI:
+        s -= 1.0
+    return s
 
 
 def free_value(text: str, lexicon: Lexicon | None, kind: str = "") -> Any:
@@ -2042,7 +2491,7 @@ def _with_bonus(options: list[tuple[Any, float]], bonus: Callable[[Any], float])
 # pesi (log) della riconciliazione di riga
 W_ORDER = -8.0           # uscita non successiva all'entrata
 W_DURATION = -3.0        # durata < 30 min o > 8 h
-W_SAME_PROG_EFF = 1.0    # effettivo uguale al programmato (caso piu' frequente)
+W_SAME_PROG_EFF = 1.0    # effettivo uguale al programmato (frequente: decide solo fra letture quasi equivalenti)
 W_HOURS_OK = 2.5         # ore dichiarate = uscita - entrata effettive
 W_HOURS_BAD = -2.0
 W_HOURS_PROG_MATCH = 0.5  # ore dichiarate = durata dell'orario programmato
@@ -2122,13 +2571,15 @@ class _Field:
     illeggibile: bool = False
 
 
-def _choose(ev: Evidence) -> _Field:
-    """Valore piu' probabile di un campo senza contesto."""
+def _choose(ev: Evidence, rival: float = 1.0) -> _Field:
+    """Valore piu' probabile di un campo senza contesto; con ``rival`` < 1 il campo
+    e' segnalato anche se la seconda lettura ha almeno quella probabilita'."""
     if not ev.options or ev.coverage < P_LEGGIBILE:
         return _Field(illeggibile=True, confidence=0.0)
     v = ev.top
     p = ev.p(v) * ev.coverage
-    incerto = p < P_INCERTO or (ev.free_value is not None and ev.free_value != v)
+    second = math.exp(ev.options[1][1]) if len(ev.options) > 1 else 0.0
+    incerto = p < P_INCERTO or (ev.free_value is not None and ev.free_value != v) or second >= rival
     return _Field(value=v, confidence=p, incerto=incerto)
 
 
@@ -2152,28 +2603,106 @@ def _text_field(reading: Reading | None, min_conf: float = 0.55, floor: float = 
     return _Field(value=text, confidence=conf, incerto=conf < min_conf)
 
 
-def _note_field(reading: Reading | None) -> _Field:
-    """Nota: formula ricorrente (lessico o somiglianza) oppure testo letto."""
+NOTA_CONF = 0.6          # fiducia minima (per token) di una nota riportata come sicura
+NOTA_SIMILE_FRASE = 0.85    # somiglianza della lettura libera con la frase del lessico per riportarla sicura
+NOTA_SIMILE_LESSICO = 0.7   # ... per preferire la frase del lessico alla lettura libera (da verificare)
+NOTA_SIMILE_PAROLA = 0.8    # somiglianza per correggere una parola letta male
+NOTA_MIN_CARATTERI = 4      # note piu' corte: solo se nel vocabolario (es. "104", "GLO")
+_COME_CIFRE = str.maketrans("OQDILSB", "0001158")   # lettere che nelle note brevi sono spesso cifre
+NOTA_CONF_BREVE = 0.2      # fiducia minima della nota breve del lessico proposta (da verificare)
+NOTA_SIMILE_BREVE = 0.5    # ... e somiglianza minima con la lettura libera
+NOTA_LARGA = 3.0            # ritaglio (larghezza/altezza) oltre il quale una nota corta illeggibile si segnala
+
+
+def _note_words(text: str) -> tuple[str, int, int, int]:
+    """Parole della nota confrontate con il vocabolario: (testo con le parole
+    corrette, parole note, parole corrette, parole totali). Numeri e
+    abbreviazioni puntate di parole note ("CARN.") contano come note."""
+    out: list[str] = []
+    known = fixed = total = 0
+    for tok in text.split():
+        core = re.sub(r"[^A-Z0-9ÀÈÉÌÒÙ]", "", tok)
+        if not core:
+            out.append(tok)
+            continue
+        total += 1
+        plain = unicodedata.normalize("NFKD", core).encode("ascii", "ignore").decode()
+        if plain.isdigit() or plain in NOTE_PAROLE:
+            known += 1
+            out.append(tok)
+            continue
+        if tok.endswith(".") and len(plain) >= 3 and any(w.startswith(plain) for w in NOTE_PAROLE):
+            known += 1
+            out.append(tok)
+            continue
+        if len(plain) >= 4:
+            best = max(NOTE_PAROLE, key=lambda w: _similarity(plain, w))
+            if _similarity(plain, best) >= NOTA_SIMILE_PAROLA and abs(len(best) - len(plain)) <= 2:
+                fixed += 1
+                out.append(tok.replace(core, best))
+                continue
+        out.append(tok)
+    return " ".join(out), known, fixed, total
+
+
+def _note_field(reading: Reading | None, aspect: float | None = None) -> _Field:
+    """Nota: frase del lessico se la lettura libera la conferma, altrimenti il
+    testo letto (parole lievemente corrette con il vocabolario).
+
+    E' riportata come sicura solo se letta con buona fiducia e composta di parole
+    note; le letture brevi fuori vocabolario ("DE", "49": code di firme, timbri,
+    tratti) non diventano note: con un ritaglio largo la nota e' illeggibile,
+    altrimenti si ignora il segno."""
     if reading is None:
         return _Field(illeggibile=True)
     text = _clean_name(reading.free_text)
+    if text and reading.free_text.rstrip().endswith("."):
+        text += "."                 # abbreviazione finale ("PONTE CARN.")
     conf = reading.free_confidence
     n_tok = max(1, reading.free_tokens)
     if reading.candidates:
         lex_v, lex_lp = reading.candidates[0]
-        if not text or lex_lp >= reading.free_logprob - 1.0:
+        lconf = float(math.exp(min(0.0, lex_lp) / (n_tok + 1)))
+        sim = _similarity(text, str(lex_v)) if text else 0.0
+        if sim >= NOTA_SIMILE_LESSICO or (not text and lconf >= 0.3):
+            sure = sim >= NOTA_SIMILE_FRASE and lconf >= NOTA_CONF and conf >= NOTA_CONF
+            return _Field(value=str(lex_v), confidence=min(lconf, conf) if text else lconf, incerto=not sure)
+    if not text:
+        return _Field(illeggibile=True, confidence=conf)
+    fixed_text, known, fixed, total = _note_words(text)
+    exact = notes_lexicon().value(fixed_text)
+    if exact is not None:
+        return _Field(value=str(exact), confidence=conf, incerto=fixed > 0 or conf < NOTA_CONF)
+    alnum = re.sub(r"[^A-Z0-9ÀÈÉÌÒÙ]", "", fixed_text)
+    if len(alnum) < NOTA_MIN_CARATTERI and not (total and fixed == 0 and all(
+            re.sub(r"[^A-Z0-9]", "", w) in NOTE_PAROLE for w in fixed_text.split())):
+        # segno breve fuori vocabolario: non e' una nota leggibile; ma se la lettura vincolata
+        # indica con una certa fiducia una nota breve del vocabolario ("104" letto "1oh") la
+        # si propone, da verificare
+        if reading.candidates:
+            lex_v, lex_lp = reading.candidates[0]
             lconf = float(math.exp(min(0.0, lex_lp) / (n_tok + 1)))
-            return _Field(value=str(lex_v), confidence=lconf, incerto=lconf < 0.55)
-    if text:
-        best, sim = None, 0.0
-        for canon, forms in NOTE_FREQUENTI:
-            for form in forms:
-                r = _similarity(text, form)
-                if r > sim:
-                    best, sim = canon, r
-        if best is not None and sim >= SIMILE_NOTA:
-            return _Field(value=best, confidence=min(conf, sim), incerto=sim < 0.9 or conf < 0.55)
-    return _text_field(reading)
+            digits = re.sub(r"[^A-Z0-9]", "", text).translate(_COME_CIFRE)
+            sim = max(_similarity(text, str(lex_v)), _similarity(digits, str(lex_v)))
+            if lconf >= NOTA_CONF_BREVE and sim >= NOTA_SIMILE_BREVE:
+                return _Field(value=str(lex_v), confidence=lconf, incerto=True)
+        if aspect is not None and aspect >= NOTA_LARGA:
+            return _Field(illeggibile=True, confidence=conf)
+        return _Field()
+    best, sim = None, 0.0
+    n_key = len(_key(fixed_text))
+    for canon, forms in NOTE_FREQUENTI:
+        for form in forms:
+            if abs(len(_key(form)) - n_key) > 0.2 * max(n_key, len(_key(form))):
+                continue            # una frase piu' corta o piu' lunga non sostituisce la nota letta
+            r = _similarity(fixed_text, form)
+            if r > sim:
+                best, sim = canon, r
+    if best is not None and sim >= SIMILE_NOTA:
+        return _Field(value=best, confidence=min(conf, sim), incerto=True)
+    # i numeri (protocolli, date) si leggono male facilmente: sempre da verificare
+    sure = total > 0 and known == total and conf >= NOTA_CONF and not re.search(r"\d", fixed_text)
+    return _Field(value=fixed_text, confidence=conf, incerto=not sure)
 
 
 _ETICHETTE = {
@@ -2216,7 +2745,7 @@ def _context_values(f: str, cells: dict[str, Evidence], column_values: list[Any]
     elif f == "ore_dichiarate":
         for a, b in (("eff_entrata", "eff_uscita"), ("prog_entrata", "prog_uscita")):
             d = hours_between(top.get(a), top.get(b))
-            if d is not None and abs(d * 2 - round(d * 2)) < 1e-9 and 0 < d <= HOURS_MAX_DAY:
+            if d is not None and abs(d / HOURS_STEP - round(d / HOURS_STEP)) < 1e-9 and 0 < d <= HOURS_MAX_DAY:
                 out.append(d)
     if column_values:
         out.append(max(set(column_values), key=column_values.count))
@@ -2238,7 +2767,42 @@ def _weak_options(options: list[tuple[Any, float]], extra: list[Any], coverage: 
     return sorted(((v, lp - z) for v, lp in scored), key=lambda t: t[1], reverse=True)
 
 
-def _column_bonus(values: list[Any], own: Any) -> Callable[[Any], float]:
+# Cifre scritte a mano che TrOCR confonde spesso: "1"/"4"/"7", "2"/"9", "0"/"6".
+CONFUSIONI_CIFRE = {"1": "47", "4": "1", "7": "1", "2": "9", "9": "2", "0": "6", "6": "0"}
+W_CONFUSIONE = -4.0      # log-probabilita' (relativa) di un orario ottenuto cambiando una cifra confondibile
+
+
+def _with_confusions(options: list[tuple[Any, float]], prior: Callable[[str], float]) -> list[tuple[Any, float]]:
+    """Aggiunge fra le alternative di un orario gli orari ottenuti cambiando una
+    cifra confondibile delle due letture migliori (es. 19:30 -> 12:30). Partono
+    molto sfavoriti: vincono solo se la plausibilita' (orario scolastico) e la
+    coerenza della riga li sostengono, e in quel caso la cella e' segnalata
+    (valore diverso dalla lettura migliore)."""
+    if not options:
+        return options
+    have = {v for v, _ in options}
+    extra: dict[Any, float] = {}
+    for v, lp in options[:2]:
+        if not isinstance(v, str):
+            continue
+        digits = v.replace(":", "")
+        for i, d in enumerate(digits):
+            for alt in CONFUSIONI_CIFRE.get(d, ""):
+                w = digits[:i] + alt + digits[i + 1:]
+                w = f"{w[:2]}:{w[2:]}"
+                m = _time_minutes(w)
+                if m is None or not TIME_MIN <= m <= TIME_MAX or m % TIME_STEP or w in have:
+                    continue
+                score = lp - prior(v) + prior(w) + W_CONFUSIONE
+                extra[w] = max(extra.get(w, -math.inf), score)
+    if not extra:
+        return options
+    scored = list(options) + list(extra.items())
+    z = _logsumexp(lp for _v, lp in scored)
+    return sorted(((v, lp - z) for v, lp in scored), key=lambda t: t[1], reverse=True)
+
+
+def _column_bonus(values: list[Any], own: Any, weight: float = W_COLONNA) -> Callable[[Any], float]:
     """Preferenza per i valori gia' letti con sicurezza negli altri giorni della colonna."""
     others = list(values)
     if own is not None and own in others:
@@ -2249,7 +2813,7 @@ def _column_bonus(values: list[Any], own: Any) -> Callable[[Any], float]:
     counts: dict[Any, int] = {}
     for v in others:
         counts[v] = counts.get(v, 0) + 1
-    return lambda v: W_COLONNA * counts.get(v, 0) / n
+    return lambda v: weight * counts.get(v, 0) / n
 
 
 def _context_confidence(support: float) -> float:
@@ -2319,7 +2883,8 @@ def _relations(f: str, values: dict[str, Any]) -> list[tuple[tuple[str, ...], An
 def _admissible(f: str, value: Any) -> bool:
     """True se ``value`` e' un valore ammesso dal modulo per il campo ``f``."""
     if f == "ore_dichiarate":
-        return isinstance(value, (int, float)) and 0 < value <= HOURS_MAX_DAY and abs(value * 2 - round(value * 2)) < 1e-9
+        return (isinstance(value, (int, float)) and 0 <= value <= HOURS_MAX_DAY
+                and abs(value / HOURS_STEP - round(value / HOURS_STEP)) < 1e-9)
     m = _time_minutes(value) if isinstance(value, str) else None
     return m is not None and TIME_MIN <= m <= TIME_MAX and m % TIME_STEP == 0
 
@@ -2334,6 +2899,11 @@ def _doubt_reasons(f: str, v: Any, ev: Evidence, p: float, values: dict[str, Any
         reasons.add("alternativa")        # scelto dal contesto contro la lettura migliore
     if p < P_INCERTO:
         reasons.add("bassa_prob")
+    rival = next((math.exp(lp) for u, lp in ev.options if not _same_value(u, v)), 0.0)
+    if rival >= P_RIVALE:
+        # un'altra lettura ammessa resta molto probabile: la coerenza della riga, da sola,
+        # non basta a escluderla (es. "14:00" scritto come "16:00")
+        reasons.add("rivale")
     dom = _dominant(column_values, ev.top)
     if dom is not None and dom != v and ev.p(dom) >= P_ALTERNATIVA:
         reasons.add("colonna")            # diverso dal valore abituale della colonna, che e' fra le letture
@@ -2346,11 +2916,16 @@ def _doubt_reasons(f: str, v: Any, ev: Evidence, p: float, values: dict[str, Any
     tv = values.get(twin) if twin else None
     if tv is not None and tv != v and ev.p(tv) >= P_ALTERNATIVA:
         # programmato e effettivo diversi, il valore dell'altro e' fra le letture di
-        # questa cella e nessuna relazione con le ore giustifica la differenza
-        own = [imp for others, imp, _strict in _relations(f, values) if others != (twin,)]
+        # questa cella e nessuna relazione *obbligatoria* giustifica la differenza: solo
+        # uscita - entrata effettive = ore lo e' (un ritardo vero, 8:30 invece di 8:00 con
+        # mezz'ora in meno); la durata programmata uguale alle ore e' solo frequente e non
+        # distingue 9:30-13:30 da 9:00-13:00 (se la cella gemella e' stata a sua volta
+        # dedotta, vedi la regola in ``assemble``)
+        own = [imp for others, imp, strict in _relations(f, values) if others != (twin,) and strict]
         if not any(_same_value(imp, v) for imp in own):
             reasons.add("gemello")
     return reasons
+
 
 
 # motivi di dubbio che la coerenza con celle sicure puo' superare (gli altri indicano
@@ -2359,14 +2934,37 @@ _SUPERABILI = frozenset({"dedotto", "bassa_prob", "colonna", "lettura_libera_ano
 SETTIMANA_MIN = 2        # celle sicure dello stesso giorno della settimana per confermare l'orario programmato
 
 
-def _weekly_support(cs: _CellState, solid_values: dict[tuple[int, str], Any]) -> bool:
+def _weekly_support(cs: _CellState, solid_values: dict[tuple[int, str], Any],
+                    all_values: dict[tuple[int, str], Any] | None = None) -> bool:
     """L'orario programmato e' settimanale: stesso valore letto con sicurezza negli
-    stessi giorni della settimana (giorno +/- 7, 14...) e nessun valore diverso."""
+    stessi giorni della settimana (giorno +/- 7, 14...) e nessun valore diverso
+    (fra tutti quelli scelti, anche se dubbi: ``all_values``)."""
     if not cs.field.startswith("prog_"):
         return False
-    same = [val for (g, f), val in solid_values.items()
-            if f == cs.field and g != cs.giorno and (g - cs.giorno) % 7 == 0]
-    return len(same) >= SETTIMANA_MIN and all(_same_value(x, cs.value) for x in same)
+
+    def week(values: dict[tuple[int, str], Any]) -> list[Any]:
+        return [val for (g, f), val in values.items()
+                if f == cs.field and g != cs.giorno and (g - cs.giorno) % 7 == 0]
+
+    same = week(solid_values)
+    every = week(all_values) if all_values is not None else same
+    return len(same) >= SETTIMANA_MIN and all(_same_value(x, cs.value) for x in same + every)
+
+
+def _flag_weekly_outliers(states: dict[tuple[int, str], _CellState]) -> None:
+    """L'orario programmato e' settimanale: se negli stessi giorni della settimana
+    (giorno +/- 7, 14...) almeno ``SETTIMANA_MIN`` celle hanno tutte lo stesso valore e
+    questa cella ne ha un altro, la cella va verificata (es. "8:00" letto "9:00" in un
+    solo martedi')."""
+    # anche i valori segnalati delle altre settimane contano: servono solo a segnalare
+    chosen = {k: cs.value for k, cs in states.items()}
+    for (g, f), cs in states.items():
+        if not f.startswith("prog_"):
+            continue
+        same = [val for (g2, f2), val in chosen.items() if f2 == f and g2 != g and (g2 - g) % 7 == 0]
+        if len(same) >= SETTIMANA_MIN and all(_same_value(x, same[0]) for x in same) \
+                and not _same_value(same[0], cs.value):
+            cs.reasons.add("settimana")
 
 
 def _confirm_by_consensus(states: dict[tuple[int, str], _CellState]) -> set[tuple[int, str]]:
@@ -2403,7 +3001,8 @@ def _confirm_by_consensus(states: dict[tuple[int, str], _CellState]) -> set[tupl
                 elif strict and not _partial_hours_ok(cs, by_row[cs.giorno]):
                     violated += 1
             if not holds and not violated:
-                holds = int(_weekly_support(cs, {k: states[k].value for k in solid}))
+                holds = int(_weekly_support(cs, {k: states[k].value for k in solid},
+                                            {k: st.value for k, st in states.items()}))
             if holds and not violated:
                 solid.add(key)
                 confirmed.add(key)
@@ -2420,10 +3019,141 @@ def _partial_hours_ok(cs: _CellState, values: dict[str, Any]) -> bool:
     return d is not None and isinstance(ore, (int, float)) and ore < d
 
 
-def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> ExtractionResult:
-    """Costruisce il risultato finale dai riconoscimenti e dall'analisi d'inchiostro."""
+FORMA_CORTA_ASPETTO = 1.25  # ritaglio (larghezza/altezza) troppo largo per un orario di sola ora ("8", "13")
+
+
+def _short_form(f: str, v: Any, reading: Reading | None, aspect: float | None) -> bool:
+    """Orario letto come sola ora ("13") in un ritaglio largo quanto "13,30": le
+    cifre dei minuti sono probabilmente sfuggite alla lettura."""
+    if f not in TIME_FIELDS or reading is None or aspect is None:
+        return False
+    form = getattr(reading, "forms", {}).get(v)
+    if not form:
+        return False
+    lex = time_lexicon()
+    if len(lex.signature(form)) > 2 or aspect < FORMA_CORTA_ASPETTO:
+        return False
+    # anche la lettura libera ha visto solo l'ora (con piu' cifre decide ``_free_digits_conflict``)
+    return len(lex.signature(_key(reading.free_text))) <= 2
+
+
+def _value_digits(f: str, v: Any) -> set[str]:
+    """Cifre con cui si scrive il valore (per confrontarle con la lettura libera)."""
+    if f in TIME_FIELDS:
+        m = _time_minutes(v) if isinstance(v, str) else None
+        if m is None:
+            return set()
+        h, mm = divmod(m, 60)
+        return {f"{h}{mm:02d}", f"{h:02d}{mm:02d}"}
+    return set()
+
+
+def _free_digits_conflict(f: str, v: Any, reading: Reading | None) -> bool:
+    """La lettura libera mostra almeno tre cifre incompatibili con il valore
+    scelto (es. "10/3" -> 1 0 3 contro 10:00): le cifre lette indicano un altro
+    orario, anche se la lettura libera nel suo insieme non e' interpretabile."""
+    if reading is None or f not in TIME_FIELDS or not reading.free_text:
+        return False
+    digits = time_lexicon().signature(_key(reading.free_text))
+    if len(digits) < 3:
+        return False
+    canon = _value_digits(f, v)
+    if not canon or any(c.startswith(digits) or digits.startswith(c) for c in canon):
+        return False
+    # conta solo se le cifre lette corrispondono a un altro orario ammesso ("1660" non
+    # e' un orario: e' solo "16:00" letto male e non indica un valore diverso)
+    for minutes in range(TIME_MIN, TIME_MAX + 1, TIME_STEP):
+        other = f"{minutes // 60:02d}:{minutes % 60:02d}"
+        if other != v and any(c.startswith(digits) or digits.startswith(c) for c in _value_digits(f, other)):
+            return True
+    return False
+
+
+def _hour_conflict(f: str, v: Any, reading: Reading | None) -> bool:
+    """L'ora letta (prime cifre della lettura libera) e' diversa da quella del valore
+    scelto: es. "13 w." contro 11:00 dedotto dal resto della riga."""
+    if reading is None or f not in TIME_FIELDS or not reading.free_text:
+        return False
+    m = _time_minutes(v) if isinstance(v, str) else None
+    digits = time_lexicon().signature(_key(reading.free_text))
+    if m is None or not digits:
+        return False
+    hour = None
+    if len(digits) >= 2 and 6 <= int(digits[:2]) <= 20:
+        hour = int(digits[:2])
+    elif 6 <= int(digits[0]) <= 9:
+        hour = int(digits[0])
+    return hour is not None and hour != m // 60
+
+
+def row_doubts(values: dict[str, Any], assenza_alunno: bool = False, assenza_operatore: bool = False,
+               trattino: bool = False) -> dict[str, set[str]]:
+    """Controlli di coerenza e plausibilita' della riga sui valori scelti.
+
+    Non cambiano nessun valore: indicano quali celle verificare. Se le ore non
+    tornano con gli orari effettivi almeno una delle tre letture e' sbagliata e
+    non si puo' sapere quale: si segnalano tutte (e l'orario programmato uguale a
+    quello effettivo coinvolto, letto probabilmente nello stesso modo)."""
+    out: dict[str, set[str]] = {}
+
+    def add(fields: Iterable[str], reason: str) -> None:
+        for f in fields:
+            if values.get(f) is not None:
+                out.setdefault(f, set()).add(reason)
+
+    mins = {f: _time_minutes(values.get(f)) if isinstance(values.get(f), str) else None for f in TIME_FIELDS}
+    for f, m in mins.items():
+        if m is not None and not _time_plausible(m):
+            add([f], "fuori_orario")
+    ore = values.get("ore_dichiarate")
+    if isinstance(ore, (int, float)) and ore > ORE_PLAUSIBILI:
+        add(["ore_dichiarate"], "fuori_orario")
+    durations: dict[str, float | None] = {}
+    for kind, (a, b) in (("eff", ("eff_entrata", "eff_uscita")), ("prog", ("prog_entrata", "prog_uscita"))):
+        ma, mb = mins[a], mins[b]
+        durations[kind] = None
+        if ma is None or mb is None:
+            continue
+        if mb <= ma or mb - ma > ORE_PLAUSIBILI * 60:
+            add([a, b], "incoerente")
+            continue
+        durations[kind] = (mb - ma) / 60.0
+    d_eff, d_prog = durations["eff"], durations["prog"]
+    if isinstance(ore, (int, float)):
+        if d_eff is not None:
+            if abs(d_eff - ore) > 0.01 and not (assenza_alunno and ore < d_eff):
+                # non si sa quale lettura sia sbagliata: si verifica l'intera riga
+                add([*TIME_FIELDS, "ore_dichiarate"], "incoerente")
+        elif d_prog is not None and not trattino:
+            if ore > d_prog + 0.01 or (ore < d_prog - 0.01 and not (assenza_alunno or assenza_operatore)):
+                add(["prog_entrata", "prog_uscita", "ore_dichiarate"], "incoerente")
+    # un solo orario effettivo scritto: l'altro manca o e' stato letto come vuoto
+    if (mins["eff_entrata"] is None) != (mins["eff_uscita"] is None) and not trattino:
+        add(["eff_entrata", "eff_uscita"], "incompleto")
+    # lo stesso per l'orario programmato: senza l'altro orario nessuna relazione lo controlla
+    if (mins["prog_entrata"] is None) != (mins["prog_uscita"] is None):
+        add(["prog_entrata", "prog_uscita"], "incompleto")
+    return out
+
+
+def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
+             reasons_out: dict[tuple[int, str], set[str]] | None = None) -> ExtractionResult:
+    """Costruisce il risultato finale dai riconoscimenti e dall'analisi d'inchiostro.
+
+    ``reasons_out`` (facoltativo) riceve i motivi di dubbio di ogni cella di orari/ore
+    segnalata: (giorno, campo) -> motivi (es. ``{"barrato"}``, ``{"bassa_prob", "colonna"}``)."""
     t_lex, h_lex = time_lexicon(), hours_lexicon()
     # 1) evidenze di tutte le celle con scrittura
+    # minuti letti con sicurezza sulla pagina (preferenza per i minuti adattata alla grafia)
+    sure_minutes: list[int] = []
+    for g in range(1, 32):
+        for f in TIME_FIELDS:
+            if plan.cells.get(g, {}).get(f) == TESTO:
+                ev = evidence(readings.get(f"rows.{g}.{f}"), t_lex, "time")
+                m = _time_minutes(ev.top) if ev.options else None
+                if m is not None and ev.coverage >= 0.5 and ev.p(ev.top) >= 0.9:
+                    sure_minutes.append(m % 60)
+    t_prior = page_minute_prior(sure_minutes)
     evs: dict[int, dict[str, Evidence]] = {}
     for g in range(1, 32):
         st = plan.cells.get(g, {})
@@ -2435,7 +3165,7 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
             if f == "ore_dichiarate":
                 evs[g][f] = evidence(reading, h_lex, "hours", _hours_prior)
             else:
-                evs[g][f] = evidence(reading, t_lex, "time", _time_prior)
+                evs[g][f] = evidence(reading, t_lex, "time", t_prior)
     # valori letti con sicurezza in ogni colonna (per la preferenza di colonna)
     column: dict[str, list[Any]] = {f: [] for f in TEXT_FIELDS}
     for g, cells in evs.items():
@@ -2455,17 +3185,22 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
         row.assenza_operatore = st.get("assenza_operatore") in (CROCETTA, SEGNO)
         row.firma = st.get("firma") in (FIRMA, SEGNO)
         for f in ("assenza_alunno", "assenza_operatore", "firma"):
-            if st.get(f) == SEGNO:
+            if st.get(f) in (SEGNO, TIMBRO):
+                # segno dubbio, oppure inchiostro di un timbro sulla cella della firma
                 row.incerti.append(f)
                 row.confidenza[f] = 0.5
         row.trattino_effettivo = TRATTINO in (st.get("eff_entrata"), st.get("eff_uscita"))
         cells = evs[g]
-        options = {f: _with_bonus(ev.options, _column_bonus(column[f], ev.top))
+        options = {f: _with_bonus(ev.options, _column_bonus(
+                       column[f], ev.top, W_COLONNA_PROG if f.startswith("prog_") else W_COLONNA))
                    for f, ev in cells.items() if ev.options}
         for f, ev in cells.items():
             if ev.coverage < COPERTURA_DEBOLE:
                 options[f] = _weak_options(options.get(f, []), _context_values(f, cells, column[f]),
                                            ev.coverage)
+        for f in list(options):
+            if f in TIME_FIELDS:
+                options[f] = _with_confusions(options[f], t_prior)
         chosen = reconcile_row(options, assenza_alunno=row.assenza_alunno)
         values = {f: v for f, (v, _lp) in chosen.items()}
         for f in TEXT_FIELDS:
@@ -2490,24 +3225,69 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
                     confs.append(0.0)
                     continue
                 p = min(p, 0.2)
-            else:
-                # la coerenza con il resto della riga rafforza una lettura gia' preferita
+            elif any(_same_value(imp, v) for _o, imp, _s in _relations(f, values)):
+                # la coerenza con il resto della riga rafforza una lettura gia' preferita (solo
+                # se una relazione esatta la impone: una durata soltanto plausibile non basta)
                 p = 1.0 - (1.0 - p) * (1.0 - _context_confidence(support))
             setattr(row, f, v)
             row.confidenza[f] = round(p, 3)
             confs.append(p)
             reasons = _doubt_reasons(f, v, ev, p, values, column[f])
+            twin = _TWIN.get(f)
+            if twin in cells and twin in values and cells[twin].options:
+                # la cella gemella e' stata riportata a un valore diverso dalla sua lettura
+                # migliore (es. orario effettivo poco leggibile allineato al programmato):
+                # se quella lettura e' plausibile anche qui, l'uguaglianza non conferma nulla
+                tt = cells[twin].top
+                if (not _same_value(values[twin], tt) and not _same_value(tt, v)
+                        and ev.p(tt) >= P_ALTERNATIVA):
+                    reasons.add("gemello")
+            key = f"rows.{g}.{f}"
+            if _short_form(f, v, readings.get(key), plan.aspect.get(key)):
+                reasons.add("forma_corta")
+            if _free_digits_conflict(f, v, readings.get(key)):
+                reasons.add("cifre_diverse")
             states[(g, f)] = _CellState(g, f, v, ev, reasons, row.assenza_alunno)
+        # coerenza e plausibilita' della riga, segni sul foglio (barrature, "/")
+        extra = row_doubts(values, row.assenza_alunno, row.assenza_operatore, row.trattino_effettivo)
+        # la stessa verifica sulle letture migliori: se sono incoerenti fra loro, una scelta
+        # "coerente" fatta dalla riconciliazione non basta a renderle sicure
+        # (solo se per renderle coerenti si e' scartata una lettura chiara: allora anche le
+        # letture usate per correggerla possono essere quelle sbagliate)
+        tops = {f: ev.top for f, ev in cells.items() if ev.options and f in values}
+        forced = [f for f, v in values.items()
+                  if not _same_value(v, cells[f].top) and (
+                      cells[f].p(cells[f].top) * cells[f].coverage >= P_CHIARA
+                      or (cells[f].coverage >= COPERTURA_CONTRARIA and cells[f].p(v) < P_ALTERNATIVA)
+                      or _hour_conflict(f, v, readings.get(f"rows.{g}.{f}")))]
+        if forced:
+            for f2, why in row_doubts(tops, row.assenza_alunno, row.assenza_operatore,
+                                      row.trattino_effettivo).items():
+                if "incoerente" in why and f2 in values:
+                    extra.setdefault(f2, set()).add("incoerente")
+        for f, why in plan.flags.get(g, {}).items():
+            extra.setdefault(f, set()).add(why)
+        for f, why in extra.items():
+            if (g, f) in states:
+                states[(g, f)].reasons |= why
+            elif f not in row.incerti and f in TEXT_FIELDS:
+                row.incerti.append(f)
+                if reasons_out is not None:
+                    reasons_out[(g, f)] = set(why)
         rows.append(row)
 
     # conferma per coerenza: celle incerte solo per la scarsa leggibilita' il cui
     # valore e' quello preferito dalla lettura *e* coincide con quanto imposto
     # dalle celle sicure della stessa riga (es. uscita = entrata + ore)
+    _flag_weekly_outliers(states)
     confirmed = _confirm_by_consensus(states)
     for (g, f), cs in sorted(states.items()):
         row = rows[g - 1]
         if cs.reasons and (g, f) not in confirmed:
+            log.debug("giorno %d %s=%s da verificare: %s", g, f, cs.value, ",".join(sorted(cs.reasons)))
             row.incerti.append(f)
+            if reasons_out is not None:
+                reasons_out[(g, f)] = set(cs.reasons)
             if "dedotto" in cs.reasons:
                 dedotti.append(f"giorno {g} ({etichetta(f)})")
         elif (g, f) in confirmed:
@@ -2519,7 +3299,11 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
     notes: dict[int, _Field] = {}
     for g in range(1, 32):
         if plan.cells.get(g, {}).get("note") == TESTO:
-            notes[g] = _note_field(readings.get(f"rows.{g}.note"))
+            fld = _note_field(_note_reading(readings, g), plan.aspect.get(f"rows.{g}.note"))
+            if plan.flags.get(g, {}).get("note") and fld.value:
+                fld.incerto = True          # scrittura attraversata da una barratura
+            if fld.value or fld.illeggibile:
+                notes[g] = fld
     for g, fld in list(notes.items()):
         if fld.illeggibile or fld.incerto:
             reading = readings.get(f"rows.{g}.note")
@@ -2527,7 +3311,7 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
             for ng in (g - 1, g + 1):
                 other = notes.get(ng)
                 reliable = other is not None and bool(other.value) and not other.illeggibile and (
-                    not other.incerto or other.value in _NOTE_CANONICHE)
+                    not other.incerto or other.value in _NOTE_FRASI)
                 if reliable and text and _similarity(text, str(other.value)) >= SIMILE_NOTA_VICINA:
                     notes[g] = _Field(value=other.value, confidence=fld.confidence, incerto=True)
                     break
@@ -2543,16 +3327,27 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
             row.confidenza["note"] = round(fld.confidence, 3)
 
     header = _assemble_header(plan, readings, rows, confs)
+    flagged_rows = _flag_unreliable_grid(grid, rows, header)
+    avvisi = []
+    lead: list[str] = []        # avviso sulla griglia: prima di ogni altra nota
+    if not grid.detected:
+        avvisi.append(avviso_griglia_incerta())
+        lead.append("Griglia incerta: tabella individuata solo con il modello proporzionale, "
+                    "verificare tutti i valori della pagina.")
+    elif not bool(getattr(grid, "reliable", True)):
+        avvisi.append(avviso_griglia_incerta())
+        lead.append("Griglia incerta: verificare tutti i valori della pagina.")
+    elif flagged_rows:
+        avvisi += [avviso_griglia_incerta(g) for g in flagged_rows]
+        extra_notes.append("Righe della tabella non ben allineate alla griglia: valori da verificare nei giorni "
+                           + ", ".join(str(g) for g in flagged_rows) + ".")
 
     n_incerti = sum(len(r.incerti) for r in rows) + len(header.incerti)
     n_illeggibili = sum(len(r.illeggibili) for r in rows) + len(header.illeggibili)
     detected = bool(grid.detected) or grid.score >= 0.5
     text_conf = float(np.mean(confs)) if confs else 1.0
     confidence = round(max(0.0, min(1.0, 0.85 * text_conf + 0.15 * float(grid.score))), 3)
-    remarks = list(plan.notes) + extra_notes
-    if not grid.detected:
-        remarks.append("Tabella individuata solo con il modello proporzionale: verificare l'allineamento "
-                       "delle righe.")
+    remarks = lead + list(plan.notes) + extra_notes
     if n_illeggibili:
         remarks.append(f"Campi illeggibili: {n_illeggibili}.")
     if dedotti:
@@ -2567,7 +3362,46 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid) -> E
         ocr_notes=" ".join(remarks) or None,
         confidence=confidence,
         engine="locale",
+        avvisi=avvisi,
     )
+
+
+def _flag_unreliable_grid(grid: TableGrid, rows: list[DayRow], header: Header) -> list[int]:
+    """Se l'autoverifica della griglia (``TableGrid.reliable`` / ``row_reliable``)
+    dice che la tabella, o una sua riga, non e' allineata alle linee del modulo,
+    ogni campo di quella zona e' segnalato, anche se vuoto: le celle potrebbero
+    contenere la scrittura della riga vicina e quella della riga giusta potrebbe
+    essere finita altrove. Restituisce i giorni non allineati (tutti se la pagina
+    intera non e' affidabile)."""
+    page_ok = bool(getattr(grid, "reliable", True))
+    row_ok = getattr(grid, "row_reliable", None)
+    out: list[int] = []
+    for row in rows:
+        ok = page_ok
+        if ok and callable(row_ok):
+            try:
+                ok = bool(row_ok(row.giorno))
+            except (ValueError, TypeError, IndexError):
+                ok = True
+        if ok:
+            continue
+        _flag_all(row, header=None)
+        out.append(row.giorno)
+    if not page_ok:
+        _flag_all(None, header)
+    return out
+
+
+def _flag_all(row: DayRow | None, header: Header | None) -> None:
+    """Segnala ogni campo (anche vuoto) della riga o dell'intestazione."""
+    if row is not None:
+        for f in DAY_FIELDS:
+            if f not in row.incerti and f not in row.illeggibili:
+                row.incerti.append(f)
+    if header is not None:
+        for f in HEADER_FIELDS:
+            if f not in header.incerti and f not in header.illeggibili:
+                header.incerti.append(f)
 
 
 def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[DayRow],
@@ -2585,7 +3419,9 @@ def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[Da
         if not plan.header_ink.get(name):
             continue
         ev = evidence(readings.get(f"header.{name}"), lex, "hours" if name == "ore_pei" else "")
-        fld = _choose(ev)
+        # numeri brevi scritti a mano: "1" e "11", "8" e "3" si confondono facilmente;
+        # nessun contesto li conferma, quindi basta un'alternativa plausibile per segnalarli
+        fld = _choose(ev, rival=P_ALTERNATIVA)
         if name == "ore_pei" and fld.value is not None:
             fld.value = float(fld.value)
         _apply_header(header, name, fld)
@@ -2595,7 +3431,8 @@ def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[Da
         ev = evidence(readings.get("header.mese_anno"), None, "month")
         worked = [g for g, st in plan.cells.items()
                   if any(st.get(f) == TESTO for f in TEXT_FIELDS) or st.get("firma") == FIRMA]
-        fld = _choose_month(ev, worked)
+        r_month = readings.get("header.mese_anno")
+        fld = _choose_month(ev, worked, free_text=r_month.free_text if r_month else "")
         if fld.illeggibile:
             header.illeggibili += ["mese", "anno"]
         elif fld.value is not None:
@@ -2615,7 +3452,9 @@ def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[Da
     if plan.totale_ink:
         ev = evidence(readings.get("footer.totale"), total_lexicon(), "hours", _hours_prior)
         somma = sum(r.ore_dichiarate or 0.0 for r in rows)
-        fld = _choose_total(ev, somma)
+        # ore scritte ma illeggibili: il totale puo' superare la somma letta di quanto manca
+        mancanti = sum(1 for r in rows if "ore_dichiarate" in r.illeggibili and r.ore_dichiarate is None)
+        fld = _choose_total(ev, somma, (somma, somma + HOURS_MAX_DAY * mancanti) if mancanti else None)
         _apply_header(header, "totale_mensile_dichiarato", fld)
         if fld.confidence is not None:
             confs.append(fld.confidence)
@@ -2658,7 +3497,50 @@ def calendar_penalty(value: tuple[int, int], worked_days: Sequence[int]) -> floa
     return pen
 
 
-def _choose_month(ev: Evidence, worked_days: Sequence[int], today: date | None = None) -> _Field:
+CAL_MIN_GIORNI = 8         # giorni compilati minimi perche' il calendario decida l'anno da solo
+CAL_MARGINE = 3.0          # penalita' minima (domeniche/festivi: 1,5 l'uno) degli altri anni
+MESE_SIMILE = 0.6          # somiglianza minima della lettura libera con il nome del mese
+
+
+def _month_in_free_text(text: str, m: int) -> bool:
+    """La lettura libera mostra il mese ``m``: il nome (anche storpiato: "Febbrano",
+    "Fembraio") piu' simile a quello di ``m`` che a ogni altro mese, oppure il numero
+    del mese all'inizio ("02/...", "2-...")."""
+    t = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().upper()
+    words = re.findall(r"[A-Z]{4,}", t)
+    if words:
+        w = max(words, key=len)
+        sims = [_similarity(w, name) for name in MESI_NOMI]
+        best = max(range(12), key=lambda i: sims[i])
+        others = max(x for i, x in enumerate(sims) if i != best)
+        return best + 1 == m and sims[best] >= MESE_SIMILE and sims[best] - others >= 0.15
+    digits = re.match(r"\s*(\d)\s*(\d)?\s*[/.,\-|]", t)
+    if not digits:
+        return False
+    num = int("".join(d for d in digits.groups() if d))
+    return num == m
+
+
+def _year_by_calendar(v: tuple[int, int], worked_days: Sequence[int], years: Iterable[int]) -> bool:
+    """Il calendario dei giorni compilati indica l'anno senza ambiguita': con l'anno scelto
+    nessun giorno compilato cade di domenica o in un festivo, con ogni altro anno vicino
+    almeno due."""
+    if len(worked_days) < CAL_MIN_GIORNI:
+        return False
+    m, y = v
+    own = calendar_penalty(v, worked_days)
+    if own < W_CAL_SABATO * 2:        # al piu' qualche sabato
+        return False
+    return all(calendar_penalty((m, yy), worked_days) <= own - CAL_MARGINE for yy in years if yy != y)
+
+
+def _past_years(m: int, years: Iterable[int], today: date) -> list[int]:
+    """Anni per cui il mese ``m`` non e' nel futuro (un mese futuro non si rendiconta)."""
+    return [y for y in years if y * 12 + m <= today.year * 12 + today.month]
+
+
+def _choose_month(ev: Evidence, worked_days: Sequence[int], today: date | None = None,
+                  free_text: str = "") -> _Field:
     """Mese/anno: lettura di mese e anno (separatamente) combinata con la coerenza
     del calendario dei giorni compilati e con la preferenza per i mesi recenti.
 
@@ -2691,10 +3573,34 @@ def _choose_month(ev: Evidence, worked_days: Sequence[int], today: date | None =
         return _Field(illeggibile=True, confidence=0.0)
     p = min(ev.p(v) * ev.coverage, p_post) if v == ev.top else min(p_post, 0.5) * max(ev.coverage, 0.2)
     incerto = v != ev.top or p < P_INCERTO
+    if incerto and _month_year_sure(ev, v, worked_days, _past_years(v[0], years, today), free_text):
+        # mese letto chiaramente (lettura vincolata e lettura libera concordi) e anno
+        # imposto dal calendario dei giorni compilati: l'anno scritto male ("'96", "202")
+        # non lo rende dubbio
+        return _Field(value=v, confidence=max(p, CONF_CALENDARIO), incerto=False)
     return _Field(value=v, confidence=p, incerto=incerto)
 
 
-def _choose_total(ev: Evidence, somma: float) -> _Field:
+CONF_CALENDARIO = 0.8      # confidenza di mese/anno confermati da lettura del mese + calendario
+P_MESE = 0.95              # quota minima del mese scelto fra le letture vincolate
+
+
+def _month_year_sure(ev: Evidence, v: tuple[int, int], worked_days: Sequence[int], years: Iterable[int],
+                     free_text: str) -> bool:
+    m, y = v
+    if y not in years:
+        return False
+    p_month = sum(math.exp(lp) for (mm, _yy), lp in ev.options if mm == m)
+    if p_month < P_MESE or not _month_in_free_text(free_text, m):
+        return False
+    # un anno scritto per intero e diverso nella lettura libera: si lascia il dubbio
+    for yy in re.findall(r"(?<!\d)(20\d\d)(?!\d)", free_text or ""):
+        if int(yy) != y:
+            return False
+    return _year_by_calendar(v, worked_days, years)
+
+
+def _choose_total(ev: Evidence, somma: float, possibile: tuple[float, float] | None = None) -> _Field:
     """Totale mensile: se fra le alternative plausibili c'e' la somma delle ore
     giornaliere la preferisce (segnalandola se non era la lettura migliore)."""
     if not ev.options:
@@ -2707,6 +3613,13 @@ def _choose_total(ev: Evidence, somma: float) -> _Field:
     fld = _choose(ev)
     if fld.value is not None:
         fld.value = float(fld.value)
+        if abs(fld.value - somma) >= 0.01:
+            # diverso dalla somma delle ore lette: o il totale o qualche ora giornaliera e'
+            # letto male (o il foglio e' sbagliato): va guardato, salvo che la differenza
+            # stia tutta nelle ore giornaliere gia' segnalate (``possibile``: intervallo
+            # del totale compatibile con le ore sicure)
+            if possibile is None or not possibile[0] - 0.01 <= fld.value <= possibile[1] + 0.01:
+                fld.incerto = True
     return fld
 
 
@@ -2735,17 +3648,37 @@ TABLE_NOT_FOUND_MSG = (
 )
 
 
+# Secondo parere (GLM-OCR) sulle celle dubbie: motivi di dubbio "strutturali" che il
+# secondo parere non puo' mai togliere (la cella e' barrata, contiene una "/", l'orario
+# e' fuori dalla fascia scolastica): rilette le stesse cifre, il dubbio resterebbe.
+SP_BLOCCANTI = frozenset({"barrato", "barretta", "fuori_orario"})
+SP_MARGINE = 0.2           # margine attorno alla cella grezza (altezze di riga), come nelle misure
+_SP_FAILED: dict[str, str] = {}   # cache del modello -> motivo: non si riprova nella stessa sessione
+_SP_LOCK = threading.Lock()
+
+
 class LocalEngine:
-    """Motore OCR locale: TrOCR + analisi dell'inchiostro, nessun dato inviato in rete."""
+    """Motore OCR locale: TrOCR + analisi dell'inchiostro, nessun dato inviato in rete.
+
+    Con ``second_opinion=True`` (impostazione ``secondo_parere``) le celle di orari e ore
+    rimaste dubbie vengono rilette da un secondo modello offline indipendente
+    (``secondo_parere.SecondoParere``, GLM-OCR) con una politica prudente
+    (``secondo_parere.decidi_riga``): un valore smette di essere segnalato solo se i due
+    modelli concordano *e* una relazione esatta della riga lo conferma; se il secondo
+    parere non e' disponibile (RAM, download, memoria) le celle restano semplicemente
+    segnalate."""
 
     name = "locale"
 
     def __init__(self, model_name: str = DEFAULT_MODEL, device: str = "cpu", cache_dir: Path | None = None,
-                 recognizer: Recognizer | None = None):
+                 recognizer: Recognizer | None = None, second_opinion: bool = False,
+                 second_opinion_reader: Any = None):
         self.model_name = (model_name or DEFAULT_MODEL).strip()
         self.device = device or "cpu"
         self._cache_dir = cache_dir
         self._recognizer = recognizer
+        self.second_opinion = bool(second_opinion or second_opinion_reader is not None)
+        self._sp = second_opinion_reader
 
     @property
     def cache_dir(self) -> Path:
@@ -2845,8 +3778,16 @@ class LocalEngine:
             grid = grid.scaled(w / float(grid.width), h / float(grid.height))
             grid.width, grid.height = w, h
         if not grid.detected and grid.score < 0.5:
+            # nessun valore letto: ogni campo resta da verificare (inserimento manuale)
+            rows = [DayRow(giorno=g) for g in range(1, 32)]
+            header = Header()
+            for r in rows:
+                _flag_all(r, None)
+            _flag_all(None, header)
             return ExtractionResult(
                 is_foglio_firma=False,
+                header=header,
+                rows=rows,
                 ocr_notes=TABLE_NOT_FOUND_MSG,
                 confidence=round(float(grid.score), 3),
                 engine="locale",
@@ -2858,6 +3799,7 @@ class LocalEngine:
             log.info("Righe alte %.1f pixel: risoluzione insufficiente", grid.row_height)
             raise EngineError(LOW_RES_MSG)
         recognizer = self._ensure_recognizer(progress)
+        sp = self._second_opinion_reader(progress) if self.second_opinion else None
         progress(0.3, "Analisi della tabella e delle firme…")
         try:
             plan = plan_page(img, grid)
@@ -2882,12 +3824,152 @@ class LocalEngine:
             log.exception("Errore del riconoscimento offline")
             raise EngineError(f"Errore del riconoscimento offline: {exc}") from exc
         readings = {req.key: res for req, res in zip(plan.requests, results)}
-        progress(0.97, "Controllo di coerenza dei valori letti…")
-        result = assemble(plan, readings, grid)
+        progress(0.95, "Controllo di coerenza dei valori letti…")
+        reasons: dict[tuple[int, str], set[str]] = {}
+        result = assemble(plan, readings, grid, reasons_out=reasons)
+        if self.second_opinion:
+            self._apply_second_opinion(sp, img, grid, plan, result, reasons, progress)
         result.model = self.model_name
         result.usage = Usage(seconds=round(time.monotonic() - t0, 2))
         progress(1.0, "Lettura completata.")
         return result
+
+    # --------------------------------------------------------- secondo parere
+    def _second_opinion_reader(self, progress: ProgressFn) -> Any:
+        """Il secondo parere pronto (scaricato e caricato), oppure None con il motivo
+        registrato per la sessione (le celle dubbie restano segnalate)."""
+        if self._sp is not None:
+            return self._sp
+        from sirio.engines import secondo_parere  # noqa: PLC0415
+
+        key = str(self.cache_dir)
+        with _SP_LOCK:
+            if key in _SP_FAILED:
+                return None
+            sp = secondo_parere.SecondoParere(cache_dir=self.cache_dir)
+            ok, msg = sp.is_available()
+            if not ok:
+                log.info("Secondo parere non disponibile: %s", msg)
+                _SP_FAILED[key] = msg
+                return None
+            try:
+                sp.load(lambda f, m: progress(0.26 + 0.04 * max(0.0, min(1.0, f)), m))
+            except EngineError as exc:
+                log.warning("Secondo parere non disponibile: %s", exc)
+                _SP_FAILED[key] = str(exc)
+                return None
+            except Exception as exc:  # noqa: BLE001 - mai bloccare la lettura per il secondo parere
+                log.exception("Secondo parere non caricabile")
+                _SP_FAILED[key] = f"Secondo parere offline non disponibile: {exc}"
+                return None
+        self._sp = sp
+        return sp
+
+    def _apply_second_opinion(self, sp: Any, img: np.ndarray, grid: TableGrid, plan: PagePlan,
+                              result: ExtractionResult, reasons: dict[tuple[int, str], set[str]],
+                              progress: ProgressFn) -> None:
+        """Rilegge con il secondo parere le celle dubbie di orari/ore e applica
+        ``decidi_riga``: conferme (segnalazione tolta) e sostituzioni (restano segnalate)."""
+        from sirio.engines import secondo_parere  # noqa: PLC0415
+
+        if sp is None:
+            why = _SP_FAILED.get(str(self.cache_dir))
+            if why:
+                result.ocr_notes = _join_notes(result.ocr_notes, f"Secondo parere non usato: {why}")
+            return
+        H, W = img.shape[:2]
+        m = int(round(SP_MARGINE * grid.row_height))
+        crops: list[tuple[np.ndarray, str]] = []
+        keys: list[tuple[int, str]] = []
+        for row in result.rows:
+            g = row.giorno
+            if not _row_ok(grid, g):
+                continue        # riga non allineata alla griglia: nessuna conferma possibile
+            for f in secondo_parere.ROW_FIELDS:
+                if f not in row.incerti and f not in row.illeggibili:
+                    continue
+                if plan.cells.get(g, {}).get(f) != TESTO:
+                    continue
+                x0, y0, x1, y1 = grid.cell(g, f)
+                crop = img[max(0, y0 - m):min(H, y1 + m), max(0, x0 - m):min(W, x1 + m)]
+                if crop.size:
+                    crops.append((crop, secondo_parere.kind_of(f)))
+                    keys.append((g, f))
+        if not crops:
+            return
+        t0 = time.monotonic()
+        try:
+            pareri = sp.read_many(crops, lambda f, msg: progress(0.95 + 0.04 * max(0.0, min(1.0, f)), msg))
+        except Exception as exc:  # noqa: BLE001 - mai perdere la lettura principale
+            log.warning("Secondo parere non riuscito", exc_info=True)
+            msg = str(exc) if isinstance(exc, EngineError) else "errore imprevisto"
+            result.ocr_notes = _join_notes(result.ocr_notes, f"Secondo parere non riuscito ({msg}): "
+                                                             "le celle dubbie restano segnalate.")
+            return
+        by_row: dict[int, dict[str, Any]] = {}
+        for (g, f), pa in zip(keys, pareri):
+            by_row.setdefault(g, {})[f] = pa
+        n_conf = n_sost = 0
+        for row in result.rows:
+            g = row.giorno
+            if g not in by_row:
+                continue
+            flagged = set(row.incerti) | set(row.illeggibili)
+            blocked = {f for f in secondo_parere.ROW_FIELDS
+                       if reasons.get((g, f), set()) & SP_BLOCCANTI or plan.flags.get(g, {}).get(f)}
+            esito = secondo_parere.decidi_riga({f: getattr(row, f) for f in secondo_parere.ROW_FIELDS}, flagged,
+                                               by_row[g], assenza_alunno=row.assenza_alunno, bloccati=blocked)
+            for f, (_old, new) in esito.sostituiti.items():
+                setattr(row, f, new)
+                if f in row.illeggibili:
+                    row.illeggibili.remove(f)
+                if f not in row.incerti:
+                    row.incerti.append(f)
+                n_sost += 1
+            for f in esito.confermati:
+                row.incerti = [x for x in row.incerti if x != f]
+                row.confidenza[f] = round(max(row.confidenza.get(f, 0.0), CONF_SECONDO_PARERE), 3)
+                n_conf += 1
+        log.info("Secondo parere: %d celle rilette in %.1f s, %d confermate, %d corrette",
+                 len(crops), time.monotonic() - t0, n_conf, n_sost)
+        parts = [f"Secondo parere offline ({secondo_parere.MODEL_LABEL}) sulle celle dubbie: {len(crops)} rilette"]
+        if n_conf:
+            parts.append(f"{n_conf} confermate")
+        if n_sost:
+            parts.append(f"{n_sost} corrette (da verificare)")
+        result.ocr_notes = _join_notes(result.ocr_notes, ", ".join(parts) + ".")
+        _refresh_counts(result)
+
+
+CONF_SECONDO_PARERE = 0.85   # confidenza di un valore confermato dal secondo parere
+
+
+def _row_ok(grid: TableGrid, g: int) -> bool:
+    row_ok = getattr(grid, "row_reliable", None)
+    if not bool(getattr(grid, "reliable", True)):
+        return False
+    if callable(row_ok):
+        try:
+            return bool(row_ok(g))
+        except (ValueError, TypeError, IndexError):
+            return True
+    return True
+
+
+def _join_notes(notes: str | None, extra: str) -> str:
+    return f"{notes} {extra}".strip() if notes else extra
+
+
+_COUNT_RE = re.compile(r"Campi da verificare \(lettura incerta\): \d+\.")
+
+
+def _refresh_counts(result: ExtractionResult) -> None:
+    """Aggiorna nelle note il numero dei campi da verificare (dopo il secondo parere)."""
+    if not result.ocr_notes:
+        return
+    n = sum(len(r.incerti) for r in result.rows) + len(result.header.incerti)
+    text = _COUNT_RE.sub(f"Campi da verificare (lettura incerta): {n}." if n else "", result.ocr_notes)
+    result.ocr_notes = re.sub(r"\s{2,}", " ", text).strip() or None
 
 
 __all__ = [

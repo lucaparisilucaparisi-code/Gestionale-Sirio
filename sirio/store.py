@@ -5,6 +5,8 @@ Struttura: ``<root>/<id>/`` con
 * ``page.jpg``  pagina normalizzata (raddrizzata), JPEG q92, lato lungo <= 3600 px;
 * ``thumb.jpg`` miniatura (lato lungo <= 480 px);
 * ``grid.json`` geometria della tabella (``TableGrid.to_dict``) nelle coordinate di ``page.jpg``;
+* ``preparazione.json`` correzioni applicate alla pagina importata (``normalize_page_info``:
+  verso, inclinazione, prospettiva, raddrizzamento a maglia), per spiegarle all'utente;
 * ``doc.json``  il ``Document`` (scritto per ultimo: una cartella senza ``doc.json``
   e' un'importazione interrotta e viene eliminata all'avvio).
 
@@ -48,7 +50,7 @@ from sirio import pdf_io
 from sirio.fsutil import replace_with_retry
 from sirio.models import Document
 from sirio.vision.grid import TableGrid, detect_grid
-from sirio.vision.preprocess import normalize_page
+from sirio.vision.preprocess import normalize_page_info
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ THUMB_JPEG_QUALITY = 82
 PAGE_FILE = "page.jpg"
 THUMB_FILE = "thumb.jpg"
 GRID_FILE = "grid.json"
+PREP_FILE = "preparazione.json"
 DOC_FILE = "doc.json"
 
 PENDING_PREFIX = ".import-"     # importazioni in sospeso: .import-<sha256>.bin / .json
@@ -262,6 +265,14 @@ class DocumentStore:
             return TableGrid.from_dict(raw)
         except (OSError, ValueError, TypeError, DocumentNotFound):
             return None
+
+    def load_preparation(self, doc_id: str) -> dict | None:
+        """Correzioni applicate alla pagina all'importazione (``normalize_page_info``), se note."""
+        try:
+            raw = json.loads((self._dir(doc_id) / PREP_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, DocumentNotFound):
+            return None
+        return raw if isinstance(raw, dict) else None
 
     def save_grid(self, doc_id: str, grid: TableGrid) -> None:
         path = self.grid_path(doc_id)
@@ -511,11 +522,14 @@ class DocumentStore:
             return results
 
     def _import_page(self, image: np.ndarray, name: str, page_no: int, n_pages: int, sha: str) -> Document:
+        prep: dict = {}
         try:
-            page = normalize_page(image)
+            page, prep = normalize_page_info(image)
         except Exception:  # noqa: BLE001 - si conserva la pagina cosi' com'e'
             log.warning("Normalizzazione non riuscita per «%s» pag. %d", name, page_no, exc_info=True)
             page = image
+        # la griglia si cerca sulla pagina gia' raddrizzata e ridimensionata, quella salvata:
+        # le coordinate di grid.json valgono per page.jpg (riquadri dell'interfaccia e motore)
         page = pdf_io.resize_max(page, max_side=PAGE_MAX_SIDE)
         grid = detect_grid(page)
         page_jpeg = pdf_io.encode_jpeg(page, quality=PAGE_JPEG_QUALITY)
@@ -529,6 +543,8 @@ class DocumentStore:
             _atomic_write_bytes(folder / PAGE_FILE, page_jpeg)
             _atomic_write_bytes(folder / THUMB_FILE, thumb_jpeg)
             _atomic_write_bytes(folder / GRID_FILE, json.dumps(grid.to_dict()).encode("utf-8"))
+            if prep:
+                _atomic_write_bytes(folder / PREP_FILE, json.dumps(prep).encode("utf-8"))
             stamp = now_iso()
             doc = Document(
                 id=doc_id,

@@ -620,8 +620,10 @@ def test_codice_attivato(nome, build, codice, gravita, giorno):
 
 
 def test_tutti_i_codici_hanno_un_caso_e_una_descrizione():
-    # E06 (validate_document) e W13 (controllo tra documenti) hanno test dedicati
-    coperti = {c[2] for c in CASI_ATTIVAZIONE} | {"E06_NON_FOGLIO_FIRMA", "W13_POSSIBILE_DUPLICATO"}
+    # E06 (validate_document), W13 (controllo tra documenti), W14 e I06 (avvisi della lettura)
+    # hanno test dedicati
+    coperti = {c[2] for c in CASI_ATTIVAZIONE} | {"E06_NON_FOGLIO_FIRMA", "W13_POSSIBILE_DUPLICATO",
+                                                 "W14_GRIGLIA_INCERTA", "I06_PAGINA_RADDRIZZATA"}
     assert coperti == set(v.CODICI)
     for codice, info in v.CODICI.items():
         assert codice[0] in "EWI"
@@ -1199,6 +1201,54 @@ def test_validate_document_non_foglio_firma():
     v.validate_document(doc)
     assert doc.anomalies[0].codice == "E06_NON_FOGLIO_FIRMA"
     assert doc.totals.ore_riconosciute == 60
+
+
+def test_avvisi_della_lettura_entrano_nelle_anomalie():
+    pagina = v.avviso_griglia_incerta()
+    riga = v.avviso_griglia_incerta(7)
+    raddrizzata = v.avviso_pagina_raddrizzata(["era capovolta", "foglio incurvato o piegato raddrizzato"])
+    assert pagina.codice == "W14_GRIGLIA_INCERTA" and pagina.gravita == "attenzione" and pagina.giorno is None
+    assert "verificare tutti i valori della pagina" in pagina.messaggio
+    assert riga.giorno == 7 and riga.messaggio.startswith("Giorno 7: griglia incerta")
+    assert raddrizzata is not None and raddrizzata.gravita == "info" and raddrizzata.giorno is None
+    assert raddrizzata.messaggio.startswith("Pagina raddrizzata automaticamente (era capovolta")
+    assert v.avviso_pagina_raddrizzata([]) is None
+    for a in (pagina, riga, raddrizzata):
+        assert a.messaggio[0].isupper() and a.messaggio.endswith(".")
+    doc = Document(id="abc", source_file="esempio.pdf", header=make_header(), rows=mese_pulito(),
+                   avvisi=[pagina, raddrizzata])
+    v.validate_document(doc)
+    assert [a.codice for a in doc.anomalies] == ["W14_GRIGLIA_INCERTA", "I06_PAGINA_RADDRIZZATA"]
+    assert doc.totals.stato == "da_verificare" and doc.totals.n_attenzioni == 1 and doc.totals.n_info == 1
+    # rivalidare (es. dopo una correzione dell'utente) non duplica gli avvisi
+    v.validate_document(doc)
+    assert len(doc.anomalies) == 2
+    # gli avvisi arrivano dal risultato della lettura
+    from sirio.models import ExtractionResult
+
+    doc2 = Document(id="d2", source_file="x.pdf")
+    doc2.apply_extraction(ExtractionResult(header=make_header(), rows=mese_pulito(), avvisi=[riga]))
+    v.validate_document(doc2)
+    assert [(a.codice, a.giorno) for a in doc2.anomalies] == [("W14_GRIGLIA_INCERTA", 7)]
+
+
+def test_griglia_incerta_raccoglie_i_campi_vuoti_segnalati():
+    """Con la griglia incerta il motore segnala anche i campi vuoti della zona: per quelli
+    basta l'avviso W14 (niente W04 per ciascuno); i valori letti restano W04."""
+    righe = mese_pulito()
+    righe[6] = DayRow(giorno=7, incerti=["prog_entrata", "firma", "note"])          # riga vuota segnalata
+    righe[8] = replace_row(righe, 9, incerti=["prog_entrata"])[8]                     # valore letto incerto
+    doc = Document(id="g", source_file="g.pdf", header=make_header(), rows=righe,
+                   avvisi=[v.avviso_griglia_incerta(7)])
+    v.validate_document(doc)
+    w04 = [(a.giorno, a.campo) for a in doc.anomalies if a.codice == "W04_CAMPO_INCERTO"]
+    assert w04 == [(9, "prog_entrata")]
+    assert ("W14_GRIGLIA_INCERTA", 7) in [(a.codice, a.giorno) for a in doc.anomalies]
+    doc.avvisi = [v.avviso_griglia_incerta()]
+    doc.rows[8].incerti = ["eff_entrata", "note"]                                     # nota vuota: assorbita
+    v.validate_document(doc)
+    w04 = [(a.giorno, a.campo) for a in doc.anomalies if a.codice == "W04_CAMPO_INCERTO"]
+    assert w04 == [(9, "eff_entrata")]
 
 
 # --- Controlli tra documenti ---------------------------------------------------

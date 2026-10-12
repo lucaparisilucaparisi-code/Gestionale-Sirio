@@ -1256,6 +1256,41 @@ def test_download_model_cli_progress_and_errors(tmp_path: Path, monkeypatch: pyt
                                       "riconoscimento offline: nessuna connessione.")
 
 
+def test_download_model_cli_includes_second_opinion_only_when_enabled(tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    from sirio import config
+    from sirio.engines import secondo_parere as sp
+
+    monkeypatch.setenv("SIRIO_DATA_DIR", str(tmp_path / "dati"))
+    _fake_model(tmp_path / "dati" / "modelli")            # modello TrOCR gia' presente
+    downloads: list[Path] = []
+
+    def fake_download(self, progress=None) -> Path:
+        downloads.append(self.cache_dir)
+        if progress:
+            progress(0.5, "Download del modello GLM-OCR per il secondo parere: 1325 MB di circa 2650 MB…")
+        return self.cache_dir / "glm"
+
+    monkeypatch.setattr(sp.SecondoParere, "download", fake_download)
+    monkeypatch.setattr(sp.SecondoParere, "is_available", lambda self: (True, "pronto"))
+    monkeypatch.setattr(sp.SecondoParere, "is_downloaded", lambda self: False)
+    # impostazione disattivata (predefinita): solo il modello principale
+    assert sirio_app.download_model_cli(stream=io.StringIO()) == 0 and downloads == []
+    config.save_settings(config.Settings(secondo_parere=True))
+    out = io.StringIO()
+    assert sirio_app.download_model_cli(stream=out) == 0
+    assert downloads == [tmp_path / "dati" / "modelli"]
+    assert "GLM-OCR (secondo parere) scaricato" in out.getvalue()
+    # modello indicato esplicitamente: solo quello
+    assert sirio_app.download_model_cli("microsoft/trocr-base-handwritten", stream=io.StringIO()) == 0
+    assert len(downloads) == 1
+    # computer con poca RAM: nessun download, nessun errore
+    monkeypatch.setattr(sp.SecondoParere, "is_available", lambda self: (False, "Secondo parere offline non attivo."))
+    out = io.StringIO()
+    assert sirio_app.download_model_cli(stream=out) == 0 and len(downloads) == 1
+    assert "non attivo" in out.getvalue()
+
+
 def _cli_env() -> dict[str, str]:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     env.pop("SIRIO_DATA_DIR", None)

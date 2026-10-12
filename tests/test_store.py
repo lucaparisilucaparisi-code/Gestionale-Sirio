@@ -72,6 +72,34 @@ def test_add_image_writes_page_thumb_grid_and_doc(store: DocumentStore, png_byte
     assert not list(folder.glob("*.tmp")) and not list(folder.glob(".*.tmp"))
 
 
+def test_upside_down_page_is_saved_upright_with_matching_grid(store: DocumentStore, sheet: np.ndarray) -> None:
+    """La pagina salvata e' quella raddrizzata e la griglia e' nelle sue coordinate (stessa
+    immagine per il motore e per i riquadri dell'interfaccia); le correzioni sono annotate."""
+    from sirio.vision.grid import detect_grid
+
+    flipped = cv2.rotate(sheet, cv2.ROTATE_180)
+    ok, buf = cv2.imencode(".png", flipped)
+    assert ok
+    (doc,) = store.add_file("capovolto.png", buf.tobytes())
+    page = store.load_page(doc.id)
+    grid = store.load_grid(doc.id)
+    assert grid is not None and grid.detected and grid.reliable
+    assert (grid.width, grid.height) == (page.shape[1], page.shape[0])
+    again = detect_grid(page)
+    assert abs(again.row_y[0] - grid.row_y[0]) <= 3 and abs(again.col_x[0] - grid.col_x[0]) <= 3
+    # il giorno 1 e' in alto: la tabella e' nel verso giusto (righe 1..31 dall'alto in basso)
+    assert grid.row_y[0] < grid.row_y[-1] and grid.row_y[0] < page.shape[0] / 2
+    prep = store.load_preparation(doc.id)
+    assert prep is not None and prep["rotazione"] == 180
+    # una pagina gia' dritta non ha correzioni degne di nota
+    ok, buf = cv2.imencode(".png", sheet)
+    (doc2,) = store.add_file("dritto.png", buf.tobytes())
+    from sirio.vision.preprocess import correzioni_testo
+
+    assert correzioni_testo(store.load_preparation(doc2.id)) == []
+    assert correzioni_testo(prep) == ["era capovolta"]
+
+
 def test_dedup_same_file_and_page(store: DocumentStore, png_bytes: bytes) -> None:
     first = store.add_file("a.png", png_bytes)
     seen: list[Document] = []

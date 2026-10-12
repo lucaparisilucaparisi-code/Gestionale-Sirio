@@ -54,12 +54,14 @@ sirio/
   vision/
     preprocess.py              raddrizzamento (deskew), normalizzazione pagina
     grid.py                    individuazione della tabella e delle celle
-    ink.py                     analisi inchiostro (crocette, firme, celle vuote)
+    ink.py                     analisi inchiostro (crocette, firme, celle vuote, inchiostro proprio delle celle)
   engines/
     base.py                    interfaccia comune dei motori OCR
     prompts.py                 prompt e schema JSON per Claude
     claude_engine.py           motore Claude Vision
     local_engine.py            motore locale (TrOCR + OpenCV)
+    strokes.py                 barrature e barrette "/" (tratti a mano che non sono valori)
+    secondo_parere.py          secondo parere offline facoltativo (GLM-OCR) sulle celle dubbie
   web/
     index.html  styles.css  app.js  assets/(logo.svg, sirio.ico, favicon.svg)
 tests/                         pytest (nessun dato personale nel repository)
@@ -113,6 +115,7 @@ class Settings(BaseModel):
     verifica_incrociata: bool = True     # seconda lettura mirata delle righe dubbie (solo Claude)
     concorrenza: int = 3                 # documenti elaborati in parallelo (Claude); il locale usa 1
     local_model: str = "microsoft/trocr-base-handwritten"
+    secondo_parere: bool = False         # rilettura GLM-OCR delle celle dubbie del motore locale (vedi 4.4)
     export_fogli_per_documento: bool = True
     export_giorni_vuoti: bool = False
     tema: Literal["auto", "chiaro", "scuro"] = "auto"
@@ -150,9 +153,21 @@ def resize_max(img, max_side: int | None = None, max_pixels: int | None = None) 
 ```python
 # preprocess.py
 def normalize_page(img: np.ndarray) -> np.ndarray
-    # raddrizza (deskew entro ±7°, stimato dalle linee orizzontali della tabella),
-    # porta in verticale (ruota di 90/180° se il modulo è capovolto o orizzontale: usa
-    # la posizione della tabella e la direzione delle righe), NON ritaglia.
+    # 1) verso (0/90/180/270) da tratti rettilinei anche inclinati o curvi e dalla disposizione
+    #    delle colonne del modulo ("Giorno" stretta a sinistra, Firma/Note larghe a destra), in tre
+    #    fasce; si gira solo con un indizio forte; 2) inclinazione (±7°) e prospettiva (foto di
+    #    sbieco); 3) foglio incurvato/piegato: linee della tabella seguite come curve e pagina
+    #    rimappata a maglia (solo oltre 0,15 righe di curvatura, tenuta solo se la griglia non
+    #    peggiora); 4) se la griglia non è affidabile ma quella della pagina girata di 180° sì, la
+    #    pagina era capovolta; 5) se la griglia resta inaffidabile la geometria è rimisurata su
+    #    una copia a contrasto aumentato; 6) se resta inaffidabile e si era corretta la prospettiva
+    #    (su un foglio incurvato il "bordo" trovato può essere una piega) si riprova senza: la
+    #    maglia segue le linee reali e corregge anche la prospettiva. Si tiene sempre la versione
+    #    con la griglia migliore. NON ritaglia; una scansione già dritta esce identica.
+def normalize_page_info(img) -> tuple[np.ndarray, dict]
+    # come normalize_page + correzioni applicate: {"rotazione", "inclinazione", "prospettiva",
+    # "maglia", "contrasto", "capovolta_dalla_tabella"} (salvate dallo store in preparazione.json)
+def correzioni_testo(info: dict | None) -> list[str]   # frasi per l'utente ("era capovolta", ...)
 def deskew(img) -> tuple[np.ndarray, float]   # (immagine, angolo in gradi)
 
 # grid.py
@@ -168,7 +183,11 @@ class TableGrid:
     header_top: int            # bordo superiore dell'intestazione della tabella ("Giorno | Orario programmato…")
     total_row: tuple[int, int] | None   # (y0, y1) della riga "Totale ore effettive mensili"
     detected: bool             # True = da linee reali; False = modello proporzionale di ripiego
-    score: float               # qualità 0..1
+    score: float               # qualità 0..1 (limitata dall'allineamento)
+    alignment: float | None    # autoverifica (check_alignment): None = non misurata (griglie vecchie)
+    row_quality: list[float] | None   # 31 valori 0..1, uno per riga-giorno
+    reliable: bool             # proprietà: detected e alignment >= GRID_ALIGNMENT_MIN (0,7)
+    def row_reliable(self, giorno: int) -> bool   # reliable e row_quality >= ROW_QUALITY_MIN (0,5)
     def cell(self, giorno: int, colonna: str, pad: int = 0) -> tuple[int, int, int, int]  # (x0, y0, x1, y1)
     def row_box(self, giorno: int, pad: int = 0) -> tuple[int, int, int, int]
     def rows_box(self, g_from: int, g_to: int, include_table_header: bool = False, pad: int = 0) -> tuple[int, int, int, int]
@@ -180,6 +199,7 @@ class TableGrid:
     def scaled(self, sx: float, sy: float) -> "TableGrid"
 
 def detect_grid(img: np.ndarray) -> TableGrid     # mai eccezioni: in caso di insuccesso modello proporzionale
+def check_alignment(img, grid) -> dict           # autoverifica senza OCR (vedi sotto)
 
 # ink.py
 def crop(img, box, pad: int = 0) -> np.ndarray
@@ -188,7 +208,27 @@ def is_blank(img, box) -> bool
 def has_cross(img, box) -> bool          # crocetta nelle colonne assenza
 def has_signature(img, box) -> bool      # firma presente
 def is_dash(img, box) -> bool            # trattino isolato "-"
+
+class PageInk:                           # analisi dell'inchiostro della tabella, una volta per pagina (~1 s)
+    def __init__(self, img, grid)
+    strokes: list[Stroke]                # barrature "diagonale" (righe non usate) e linee "orizzontale"
+    struck_days: set[int] ; line_days: set[int]
+    def own_ink(self, giorno, colonna) -> CellInkResult
+        # .crop/.mask (solo la scrittura propria: linee, barrature e tratti delle celle vicine
+        # sbiancati), .ink_ratio, .empty, .struck, .row_struck, .line_across ("-" tirato a mano),
+        # .slash ("/" isolata), .stroke_angle, .overflow_removed, .strike_removed
 ```
+
+**Autoverifica della griglia** (`check_alignment`, applicata da `detect_grid`): una griglia
+"rilevata" può essere sfalsata di una riga (righe periodiche, intestazione o totali scambiati per
+una riga-giorno) o giusta solo in parte (foglio incurvato). Si misura, senza OCR: quanta parte di
+ogni bordo previsto cade su una linea reale; se i numeri stampati nella colonna "Giorno" hanno una
+cifra nelle righe 1–9 e due nelle 10–31; se la riga dei totali ha la cella unita. Uno sfalsamento
+di righe intere viene corretto; il resto produce `alignment` e `row_quality`. Una tabella con
+quasi tutte le righe trovate non viene scartata solo perché una o due linee verticali sono deboli
+(foto con lo sfondo attorno al foglio): decide l'autoverifica. **Contratto per i
+motori:** con `grid.reliable` False ogni valore della pagina va segnalato; con
+`grid.row_reliable(g)` False ogni valore della riga g.
 
 ### 4.4 `sirio/engines/`
 
@@ -237,13 +277,58 @@ def get_engine(settings: Settings) -> OCREngine   # costruisce il motore scelto 
   `max_retries=4`;
 * `Usage`: token di input/output sommati su tutte le chiamate, costo stimato con i prezzi di `CLAUDE_MODELS`.
 
-**Locale** (`local_engine.py`): rileva la griglia, usa `ink.py` per crocette/firme/trattini/celle
-vuote e TrOCR (`transformers.VisionEncoderDecoderModel` + `TrOCRProcessor`, modello da
-`settings.local_model`, solo CPU) per orari, ore, note e campi d'intestazione; post-elaborazione con
-vincoli (formato HH:MM, minuti 00/15/30/45, 6:00–20:00, coerenza programmato/effettivo/ore); campi con
-bassa confidenza → `incerti`, campi con inchiostro ma lettura impossibile → `illeggibili`.
+**Locale** (`local_engine.py`): usa `ink.py` per crocette/firme/trattini/celle vuote e TrOCR
+(`transformers.VisionEncoderDecoderModel` + `TrOCRProcessor`, modello da `settings.local_model`,
+solo CPU) con decodifica vincolata ai valori ammessi (lessici) più una lettura libera per orari,
+ore, note e campi d'intestazione. Regola guida: **un valore sbagliato non deve mai apparire
+sicuro**; nel dubbio la cella va in `incerti` (o `illeggibili` se scritta ma non interpretabile).
 Download del modello alla prima esecuzione con avanzamento tramite `progress`.
 `is_available()` → False con messaggio se torch/transformers non sono installati.
+
+1. *Analisi della pagina* (`plan_page`, senza OCR). I segni a mano che non sono valori sono
+   cercati da **due rilevatori indipendenti** riuniti in `PageMarks`: `strokes.find_strikes`
+   (tratti lunghi, sottili e rettilinei, cancellati dall'immagine prima dell'analisi delle celle)
+   e `ink.PageInk` (righe barrate per intero, linee orizzontali, barrette "/", inchiostro proprio
+   di ogni cella). Un segno visto da uno solo dei due basta a **segnalare** la cella; solo quelli
+   del primo (o di entrambi) tolgono un valore senza segnalarlo. Regole: riga barrata (diagonale
+   su più celle) → nessun valore, l'inchiostro rimasto (crocette, firme, testo) è segnalato;
+   linea tirata sugli orari effettivi → `trattino_effettivo`; "/" isolata in una riga senza altri
+   orari → nulla (altrove letta e segnalata); code di firme nella colonna Note tolte; nota senza
+   inchiostro proprio → vuota. Se il ritaglio pulito non trova scrittura ma `PageInk` sì, si legge
+   il ritaglio di `PageInk` e il valore resta segnalato.
+2. *Lettura* TrOCR a lotti, con bianco sopra/sotto i ritagli di orari e ore.
+3. *Assemblaggio* (`assemble`): formati reali degli orari ("8:30", "8,30", "830", "8h30", "8"),
+   ore a quarti ("2,5", "2h30'", "1:15", "0"), fascia scolastica plausibile (fuori 7–18 sempre
+   segnalato), scambi di cifre tipici di TrOCR (1/4/7, 2/9, 0/6) solo come alternative segnalate,
+   riconciliazione della riga (ore = uscita − entrata; uguaglianza programmato/effettivo usata solo
+   per gli spareggi) che **segnala invece di correggere**; conferma per coerenza dei soli valori
+   poco leggibili preferiti dalla lettura e imposti da celle sicure; note sicure solo se composte
+   di parole del vocabolario scolastico generico e senza cifre. Regole di prudenza (ognuna rende
+   la cella "da verificare", nessuna cambia un valore): probabilità del valore < 0,7 fra i valori
+   ammessi; un'altra lettura ammessa ≥ 0,25; la coerenza della riga rafforza la fiducia solo se
+   una relazione *esatta* impone il valore (una durata solo plausibile non basta); programmato ≠
+   effettivo con il valore gemello fra le letture della cella, anche quando le due coppie tornano
+   entrambe con le ore, e quando la cella gemella è stata riportata a un valore diverso dalla sua
+   lettura; orario programmato diverso da quello (uguale) degli stessi giorni della settimana; un
+   solo orario programmato (o effettivo) leggibile; crocetta di assenza dell'operatore in una riga
+   firmata con l'orario effettivo; nota breve del vocabolario ("104") proposta da verificare invece
+   di essere scartata. Intestazione: mese/anno sicuri
+   quando il nome del mese è letto (lettura vincolata e libera concordi) e il calendario dei
+   giorni compilati esclude ogni altro anno non futuro; totale mensile segnalato se diverso dalla
+   somma delle ore lette (salvo ore illeggibili che spieghino la differenza).
+4. *Griglia*: con `grid.reliable` False tutti i valori (anche l'intestazione) sono segnalati e il
+   risultato porta l'avviso `W14_GRIGLIA_INCERTA` ("Griglia incerta: verificare tutti i valori
+   della pagina"); con righe non allineate, avviso per quei giorni. `ExtractionResult.avvisi`
+   contiene questi avvisi (vedi 4.6).
+5. *Secondo parere* facoltativo (`settings.secondo_parere`, predefinito **disattivato**):
+   `secondo_parere.SecondoParere` (GLM-OCR, MIT, ~2,65 GB scaricati al primo uso nella stessa
+   cartella dei modelli, ~4,5 GB di RAM; non si attiva sotto 12 GB di RAM totale) rilegge le sole
+   celle dubbie di orari/ore (cella grezza + 0,2 righe di margine). Politica `decidi_riga`: una
+   segnalazione viene tolta solo se i due modelli leggono lo stesso valore *e* una relazione
+   esatta della riga lo conferma con celle sicure; per le altre celle il valore può essere
+   sostituito ma resta segnalato. Mai sulle righe non allineate, sulle celle barrate, con "/" o
+   fuori fascia. Se il modello non è disponibile (RAM, download, memoria) la lettura prosegue
+   senza e le note lo spiegano. Misure sulle pagine reali di sviluppo nel README.
 
 ### 4.5 `sirio/calendario.py`
 
@@ -301,12 +386,19 @@ Codici anomalia (gravità tra parentesi). Messaggi sempre in italiano, concreti,
 | `W10_TOTALE_MENSILE_ASSENTE` | attenzione | totale mensile non scritto |
 | `W11_DOPPIA_ASSENZA` | attenzione | crocette in entrambe le colonne assenza |
 | `W12_ORE_NON_INDICATE` | attenzione | orari effettivi presenti ma colonna "Tot. ore" vuota (ore ricavate dagli orari) |
+| `W14_GRIGLIA_INCERTA` | attenzione | avviso della lettura: la tabella della scansione non è allineata con sicurezza alle righe del modulo (pagina intera o giorni indicati): i valori sono tutti da verificare |
 | `W13_POSSIBILE_DUPLICATO` | attenzione | un altro foglio firma ha lo stesso operatore, alunno, mese e anno (es. stessa pagina scansionata due volte in file diversi: le ore verrebbero conteggiate due volte); controllo **tra documenti**, vedi sotto |
 | `I01_ASSENZA_ALUNNO` | info | assenza alunno (con ore riconosciute e % sul programmato) |
 | `I02_ASSENZA_OPERATORE` | info | assenza operatore (con eventuale nota, es. 104) |
 | `I03_ORARIO_DIVERSO` | info | orario effettivo diverso dal programmato |
 | `I04_ORE_SENZA_PROGRAMMATO` | info | orario effettivo senza orario programmato |
 | `I05_NON_SVOLTO` | info | prestazione programmata ma non svolta (senza ore né assenze), con l'eventuale nota |
+| `I06_PAGINA_RADDRIZZATA` | info | avviso della lettura: pagina capovolta, ruotata, storta, fotografata di sbieco o incurvata, raddrizzata prima della lettura |
+
+**Avvisi della lettura** (`W14`, `I06`): non si ricavano da intestazione e righe, quindi il motore
+(o `processing`) li mette in `ExtractionResult.avvisi`, copiati in `Document.avvisi`;
+`validate_document` li aggiunge alle anomalie a ogni validazione (anche dopo le correzioni
+dell'utente). Costruttori: `avviso_griglia_incerta(giorni=None)`, `avviso_pagina_raddrizzata(frasi)`.
 
 `Totals.stato`: `errori` se n_errori > 0; altrimenti `da_verificare` se n_attenzioni > 0 o campi
 incerti/illeggibili > 0; altrimenti `ok`. Le settimane vanno da lunedì a domenica, troncate al mese.
@@ -366,8 +458,11 @@ class DocumentStore:
     revision: int                                        # incrementata a ogni modifica (per il polling)
     def add_file(self, filename: str, data: bytes,
                  on_document: Callable[[Document], None] | None = None) -> list[Document]
-        # una Document per pagina; salva <root>/<id>/page.jpg (pagina normalizzata, JPEG q92, ≤ 3600 px),
-        # thumb.jpg (≤ 480 px), grid.json (TableGrid.to_dict), doc.json; status "in_coda".
+        # una Document per pagina; salva <root>/<id>/page.jpg (pagina normalizzata con
+        # normalize_page_info e poi ridimensionata, JPEG q92, ≤ 3600 px), thumb.jpg (≤ 480 px),
+        # grid.json (TableGrid.to_dict, cercata sulla stessa pagina salvata: coordinate valide sia per
+        # il motore sia per i riquadri dell'interfaccia), preparazione.json (correzioni applicate),
+        # doc.json; status "in_coda".
         # Dedup: se esiste già un documento con lo stesso sha256+pagina lo restituisce senza duplicarlo.
         # on_document: chiamata per ogni pagina nuova appena salvata (il server la mette in coda).
     def pending_imports(self) -> list[str]               # file la cui importazione è rimasta in sospeso
@@ -379,6 +474,7 @@ class DocumentStore:
     def clear(self) -> None
     def page_path(self, doc_id) -> Path ; def thumb_path(self, doc_id) -> Path
     def load_page(self, doc_id) -> np.ndarray ; def load_grid(self, doc_id) -> TableGrid | None
+    def load_preparation(self, doc_id) -> dict | None    # preparazione.json (None se assente)
 ```
 
 Thread-safe (`threading.RLock`). Id documento: `uuid4().hex[:12]`. Scritture atomiche
@@ -415,7 +511,10 @@ Ciclo per documento: `in_lavorazione` → carica pagina e griglia → `engine.ex
 → `doc.progress`, `doc.status_message`, salvataggio con frequenza limitata) → **anagrafica**
 (`anagrafica.applica_al_risultato`: nomi letti male ricondotti a quelli già confermati, per
 qualunque motore; un suo errore viene registrato e non blocca la lettura) →
-`doc.apply_extraction` → `validate_document` → `completato` (o `scartato` se non è un foglio firma,
+correzioni della pagina (`store.load_preparation` → avviso `I06` e nota "Pagina raddrizzata
+automaticamente: …", per qualunque motore) → `doc.apply_extraction` → `validate_document` →
+`completato` (messaggio "Lettura completata: griglia incerta, verificare i valori" se c'è un avviso
+`W14`; `scartato` se non è un foglio firma,
 `errore` con messaggio in caso di eccezione). Dopo una rilettura il contributo del documento
 all'anagrafica viene scollegato (`scollega_documento`): quanto appreso resta. Se il motore non è disponibile, i documenti restano
 `in_coda` con `status_message` esplicativo finché `kick()`.

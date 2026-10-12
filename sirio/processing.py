@@ -32,8 +32,9 @@ from sirio.config import Settings
 from sirio.engines.base import EngineError, OCREngine, PageInput, get_engine
 from sirio.models import Document, ExtractionResult
 from sirio.store import STATUS_MESSAGE_QUEUED, DocumentNotFound, DocumentStore
-from sirio.validation import validate_document
+from sirio.validation import W14_GRIGLIA_INCERTA, avviso_pagina_raddrizzata, validate_document
 from sirio.vision.grid import TableGrid, detect_grid
+from sirio.vision.preprocess import correzioni_testo
 
 log = logging.getLogger(__name__)
 
@@ -605,7 +606,9 @@ class Processor:
             return
         sink.close()
         self._apply_registry(doc_id, result)
+        self._apply_preparation(doc_id, result)
         elapsed = round(time.monotonic() - started, 2)
+        griglia_incerta = any(a.codice == W14_GRIGLIA_INCERTA for a in result.avvisi)
 
         def finish(doc: Document) -> None:
             doc.apply_extraction(result)
@@ -622,7 +625,8 @@ class Processor:
             doc.progress = 1.0
             if doc.is_foglio_firma:
                 doc.status = "completato"
-                doc.status_message = "Lettura completata"
+                doc.status_message = ("Lettura completata: griglia incerta, verificare i valori" if griglia_incerta
+                                      else "Lettura completata")
             else:
                 doc.status = "scartato"
                 doc.status_message = "Pagina non riconosciuta come foglio firma"
@@ -641,6 +645,22 @@ class Processor:
                 self.anagrafica.scollega_documento(doc_id)
             except Exception:  # noqa: BLE001
                 log.exception("Aggiornamento dell'anagrafica non riuscito per %s", doc_id)
+
+    def _apply_preparation(self, doc_id: str, result: ExtractionResult) -> None:
+        """Spiega all'utente le correzioni fatte alla pagina all'importazione (pagina
+        capovolta, foto di sbieco, foglio incurvato...): avviso I06 e nota di lettura."""
+        try:
+            info = self.store.load_preparation(doc_id)
+        except Exception:  # noqa: BLE001 - informazione accessoria
+            log.debug("Correzioni della pagina non disponibili per %s", doc_id, exc_info=True)
+            return
+        frasi = correzioni_testo(info)
+        avviso = avviso_pagina_raddrizzata(frasi)
+        if avviso is None or not result.is_foglio_firma:
+            return
+        result.avvisi = [*result.avvisi, avviso]
+        nota = "Pagina raddrizzata automaticamente: " + ", ".join(frasi) + "."
+        result.ocr_notes = f"{nota} {result.ocr_notes}" if result.ocr_notes else nota
 
     def _fail(self, doc_id: str, gen: int, message: str) -> None:
         def mark(doc: Document) -> None:

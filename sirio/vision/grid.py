@@ -10,6 +10,26 @@ misurato sul modulo reale. Non solleva mai eccezioni.
 Tutte le coordinate sono in pixel dell'immagine analizzata (di norma la pagina
 normalizzata da ``preprocess.normalize_page``); i riquadri sono tuple
 ``(x0, y0, x1, y1)`` con ``x1``/``y1`` esclusi, gia' limitati all'immagine.
+
+Autoverifica (per il motore)
+----------------------------
+Ogni griglia rilevata viene verificata (``check_alignment``: appoggio sulle
+linee reali, numeri stampati della colonna "Giorno", riga dei totali):
+
+* ``grid.alignment`` (0..1, ``None`` = non misurata, es. griglie salvate da
+  versioni precedenti) e ``grid.reliable``: se ``reliable`` e' False
+  (``alignment < GRID_ALIGNMENT_MIN`` = 0.7, oppure ``detected`` False) TUTTI i
+  valori letti dalla pagina vanno segnalati come incerti;
+* ``grid.row_quality[g-1]`` e ``grid.row_reliable(g)``: qualita' della singola
+  riga (``ROW_QUALITY_MIN`` = 0.5): sotto soglia vanno segnalati i valori di
+  quella riga;
+* ``grid.score`` resta la qualita' complessiva 0..1 ed e' limitata
+  dall'allineamento (``score <= alignment``);
+* uno sfalsamento di righe intere riconosciuto dai numeri stampati viene
+  corretto (``grid.details["sfalsamento_corretto"]``), e una pagina
+  capovolta e' segnalata (``details["verifica"]["capovolta"]``).
+``to_dict``/``from_dict`` includono ``alignment`` e ``row_quality`` (chiavi
+facoltative: i dizionari vecchi restano validi).
 """
 
 from __future__ import annotations
@@ -20,7 +40,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from sirio.vision.preprocess import binarize, resize_to_width, to_bgr, to_gray
+from sirio.vision.preprocess import binarize, enhance_contrast, resize_to_width, to_bgr, to_gray
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +60,12 @@ _COL_INDEX = {name: i for i, name in enumerate(COLUMNS)}
 
 N_DAYS = 31
 N_COLS = len(COLUMNS)
+
+# Soglie dell'autoverifica (vedi ``check_alignment``): sotto GRID_ALIGNMENT_MIN
+# la griglia non e' affidabile e il motore deve segnalare come incerti tutti i
+# valori della pagina; sotto ROW_QUALITY_MIN quelli della singola riga.
+GRID_ALIGNMENT_MIN = 0.7
+ROW_QUALITY_MIN = 0.5
 
 # --- Modello proporzionale (misurato sul modulo reale, A4 verticale) --------
 # Bordi delle colonne in frazione della larghezza della tabella.
@@ -75,6 +101,11 @@ class TableGrid:
     detected: bool             # True = da linee reali; False = modello proporzionale
     score: float               # qualita' 0..1
     details: dict = field(default_factory=dict, compare=False, repr=False)
+    # Autoverifica (``check_alignment``): None = non misurata (griglie vecchie
+    # o costruite a mano). ``alignment`` < GRID_ALIGNMENT_MIN -> pagina da
+    # segnalare per intero; ``row_quality[g-1]`` < ROW_QUALITY_MIN -> riga g da segnalare.
+    alignment: float | None = None
+    row_quality: list[float] | None = None
 
     def __post_init__(self) -> None:
         # tipi normalizzati: interi per le coordinate, punteggio a 4 decimali
@@ -88,6 +119,29 @@ class TableGrid:
             self.total_row = (int(round(self.total_row[0])), int(round(self.total_row[1])))
         self.detected = bool(self.detected)
         self.score = round(float(self.score), 4)
+        if self.alignment is not None:
+            self.alignment = round(float(self.alignment), 4)
+        if self.row_quality is not None:
+            rq = [round(float(v), 3) for v in self.row_quality]
+            self.row_quality = rq if len(rq) == N_DAYS else None
+
+    # ------------------------------------------------------------ affidabilita'
+    @property
+    def reliable(self) -> bool:
+        """True se la griglia e' stata rilevata dalle linee reali E l'autoverifica
+        (se misurata) la conferma. Se False il motore deve segnalare come
+        incerti TUTTI i valori letti dalla pagina."""
+        if not self.detected:
+            return False
+        return self.alignment is None or self.alignment >= GRID_ALIGNMENT_MIN
+
+    def row_reliable(self, giorno: int) -> bool:
+        """True se la riga del giorno indicato e' ben allineata alle linee del
+        modulo (sempre False se l'intera griglia non e' affidabile)."""
+        g = self._check_day(giorno)
+        if not self.reliable:
+            return False
+        return self.row_quality is None or self.row_quality[g - 1] >= ROW_QUALITY_MIN
 
     # ---------------------------------------------------------------- utilita'
     @staticmethod
@@ -189,6 +243,8 @@ class TableGrid:
             "total_row": [int(self.total_row[0]), int(self.total_row[1])] if self.total_row else None,
             "detected": bool(self.detected),
             "score": round(float(self.score), 4),
+            "alignment": None if self.alignment is None else round(float(self.alignment), 4),
+            "row_quality": None if self.row_quality is None else [round(float(v), 3) for v in self.row_quality],
         }
 
     @classmethod
@@ -206,6 +262,8 @@ class TableGrid:
                 total_row=(int(total[0]), int(total[1])) if total else None,
                 detected=bool(d.get("detected", False)),
                 score=float(d.get("score", 0.0)),
+                alignment=None if d.get("alignment") is None else float(d["alignment"]),
+                row_quality=None if d.get("row_quality") is None else [float(v) for v in d["row_quality"]],
             )
         except (KeyError, TypeError, ValueError, IndexError) as exc:
             raise ValueError(f"Descrizione della griglia non valida: {exc}") from exc
@@ -227,6 +285,8 @@ class TableGrid:
             if self.total_row else None,
             detected=self.detected,
             score=self.score,
+            alignment=self.alignment,
+            row_quality=list(self.row_quality) if self.row_quality is not None else None,
         )
 
 
@@ -634,6 +694,12 @@ def _detect(gray: np.ndarray) -> TableGrid | None:
     m_cols = col_found / float(N_COLS + 1)
     body = max(0.0, min(1.0, fit["body"]))
     score = 0.35 * m_rows + 0.25 * m_cols + 0.25 * body + 0.15 * regularity
+    if body < 0.35 and m_rows >= 0.9 and m_cols >= 0.6:
+        # qualche colonna non trovata (linea verticale debole o spezzata, posizione stimata):
+        # le sue fasce vuote non devono far scartare una tabella con quasi tutte le righe;
+        # si guarda la mediana delle colonne invece delle tre piu' deboli (l'autoverifica
+        # dell'allineamento giudica poi la griglia)
+        body = max(body, float(np.mean([np.median(bands.fills(rows[i], rows[i + 1])) for i in range(N_DAYS)])))
     detected = m_rows >= 0.6 and m_cols >= 0.6 and body >= 0.35 and tw >= 0.4 * w
     if detected and not _rows_anchored(fit, strong, h):
         # 31 righe regolari ma ne' intestazione ne' totali al loro posto, oppure
@@ -676,9 +742,309 @@ def _detect(gray: np.ndarray) -> TableGrid | None:
     return grid
 
 
+# ==========================================================================
+# Autoverifica dell'allineamento
+# ==========================================================================
+#
+# Una griglia "rilevata" puo' comunque essere sbagliata: sfalsata di una riga
+# (le righe del modulo sono periodiche, l'intestazione o la riga dei totali
+# scambiate per una riga-giorno), oppure giusta solo in parte (foglio
+# incurvato non del tutto raddrizzato). ``check_alignment`` misura, senza OCR:
+#
+# * appoggio sulle linee: per ogni bordo di riga e di colonna, quanta parte del
+#   segmento previsto cade su una linea reale del modulo (tolleranza 15% della
+#   riga) -> ``linee`` e la qualita' di ogni riga-giorno;
+# * numeri stampati nella colonna "Giorno": le righe 1-9 hanno una cifra, le
+#   10-31 due; si confronta la larghezza dell'inchiostro riga per riga con lo
+#   schema atteso e con quello sfalsato di +-1/+-2 righe (uno sfalsamento ha
+#   lo schema spostato e, ai bordi, la scritta "Giorno" o "Totale ore..." al
+#   posto di un numero) -> ``giorni`` (1 = schema giusto, 0 = sfalsato);
+# * struttura del modulo ai due capi: nella riga dei totali mancano le linee
+#   verticali interne fra "Giorno" e "Tot. ore" (cella unita).
+#
+# ``alignment`` (0..1) combina le misure; sotto ``GRID_ALIGNMENT_MIN`` la
+# griglia non e' affidabile e TUTTI i valori letti dalla pagina vanno segnalati
+# come incerti (le righe possono essere attribuite ai giorni sbagliati).
+# ``row_quality[g-1]`` (0..1) e' la qualita' della singola riga del giorno g:
+# sotto ``ROW_QUALITY_MIN`` i valori di quella riga vanno segnalati.
+
+def _hv_masks(gray_small: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    bw = binarize(gray_small, c=12)
+    h, w = bw.shape
+    hm = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, w // 80), 1)))
+    vm = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(9, h // 120))))
+    return hm > 0, vm > 0
+
+
+def _segment_support(mask: np.ndarray, pos: float, a: float, b: float, tol: float, horizontal: bool) -> float:
+    """Frazione del segmento [a, b) alla coordinata ``pos`` coperta dalla linea
+    (inchiostro entro ``tol`` pixel trasversali)."""
+    h, w = mask.shape
+    if horizontal:
+        y0, y1 = max(0, int(round(pos - tol))), min(h, int(round(pos + tol)) + 1)
+        x0, x1 = max(0, int(round(a))), min(w, int(round(b)))
+        if y1 <= y0 or x1 <= x0:
+            return 0.0
+        return float(mask[y0:y1, x0:x1].any(axis=0).mean())
+    x0, x1 = max(0, int(round(pos - tol))), min(w, int(round(pos + tol)) + 1)
+    y0, y1 = max(0, int(round(a))), min(h, int(round(b)))
+    if y1 <= y0 or x1 <= x0:
+        return 0.0
+    return float(mask[y0:y1, x0:x1].any(axis=1).mean())
+
+
+def _day_number_widths(gray_small: np.ndarray, g: TableGrid) -> np.ndarray:
+    """Larghezza (frazione della cella) dell'inchiostro stampato nella colonna
+    "Giorno" per le righe 0..32 (0 = intestazione, 32 = riga dei totali)."""
+    rh = g.row_height
+    x0, x1 = g.col_x[0], g.col_x[1]
+    cw = x1 - x0
+    ys = [g.header_top] + list(g.row_y) + [g.total_row[1] if g.total_row else g.row_y[-1] + rh]
+    out = np.full(33, np.nan)
+    h, w = gray_small.shape
+    for i in range(33):
+        ya, yb = ys[i], ys[i + 1]
+        if i in (0, 32):                       # bande di intestazione e totali: solo la parte vicina
+            ya, yb = (max(ya, yb - rh), yb) if i == 0 else (ya, min(yb, ya + rh))
+        a = int(round(ya + 0.2 * (yb - ya)))
+        b = int(round(yb - 0.2 * (yb - ya)))
+        xa = int(round(x0 + 0.12 * cw))
+        xb = int(round(x1 - 0.12 * cw))
+        if b - a < 3 or xb - xa < 3 or a < 0 or b > h or xa < 0 or xb > w:
+            continue
+        cell = gray_small[a:b, xa:xb].astype(np.float32)
+        bg = float(np.percentile(cell, 85))
+        dark = float(np.percentile(cell, 2))
+        if bg - dark < 25:
+            out[i] = 0.0
+            continue
+        ink = cell < bg - 0.45 * (bg - dark)
+        cols = ink.sum(axis=0) >= 2
+        idx = np.nonzero(cols)[0]
+        out[i] = 0.0 if idx.size == 0 else (idx[-1] - idx[0] + 1) / float(xb - xa)
+    return out
+
+
+def _day_pattern(widths: np.ndarray) -> tuple[dict[int, float], float]:
+    """Accordo fra le larghezze misurate e lo schema dei numeri stampati (una
+    cifra per 1-9, due cifre per 10-31) per ogni sfalsamento ``s`` (la riga g
+    mostra il numero g+s; oltre i bordi compare la scritta dell'intestazione o
+    dei totali, piu' larga di un numero). Restituisce (accordo per
+    sfalsamento, frazione delle righe-giorno con un numero riconoscibile)."""
+    days = widths[1:32]
+    cand = days[(days > 0.05) & (days < 0.58)]
+    if cand.size < 8:
+        return {s: 0.0 for s in (-2, -1, 0, 1, 2)}, 0.0
+    c1, c2 = float(np.percentile(cand, 20)), float(np.percentile(cand, 80))
+    for _ in range(10):                                  # 2-medie in una dimensione
+        thr = 0.5 * (c1 + c2)
+        lo, hi = cand[cand <= thr], cand[cand > thr]
+        if lo.size == 0 or hi.size == 0:
+            break
+        c1, c2 = float(np.median(lo)), float(np.median(hi))
+    if not 1.4 <= c2 / max(c1, 1e-6) <= 2.8:
+        return {s: 0.0 for s in (-2, -1, 0, 1, 2)}, 0.0
+    thr = 0.5 * (c1 + c2)
+    text_min = min(0.58, c2 + 0.6 * (c2 - c1))
+    cls = np.full(33, -1)                                # -1 incerto, 0 una cifra, 1 due, 2 testo
+    for i, v in enumerate(widths):
+        if np.isnan(v) or v <= 0.05:
+            continue
+        cls[i] = 2 if v >= text_min else (1 if v > thr else 0)
+    readable = float(np.mean((cls[1:32] == 0) | (cls[1:32] == 1)))
+    scores: dict[int, float] = {}
+    for s in (-2, -1, 0, 1, 2):
+        ok = n = 0
+        for g in range(1, 32):
+            if cls[g] < 0:
+                continue
+            d = g + s
+            exp = 2 if not 1 <= d <= 31 else (0 if d <= 9 else 1)
+            if exp != 2 and cls[g] == 2:
+                continue                                 # scrittura a mano debordante: neutra
+            n += 1
+            ok += int(cls[g] == exp)
+        scores[s] = ok / n if n >= 10 else 0.0
+    # pagina capovolta: la riga g mostra il numero 32-g (capovolto)
+    ok = n = 0
+    for g in range(1, 32):
+        if cls[g] in (0, 1):
+            n += 1
+            ok += int(cls[g] == (0 if 32 - g <= 9 else 1))
+    scores[99] = ok / n if n >= 10 else 0.0
+    return scores, readable
+
+
+def check_alignment(img: np.ndarray, grid: TableGrid) -> dict:
+    """Misure di autoverifica della griglia (vedi la nota della sezione).
+
+    Restituisce ``{"alignment", "row_quality", "linee", "giorni", "sfalsamento",
+    "totali_ok"}``; non solleva eccezioni (in caso di errore ``alignment`` 0)."""
+    try:
+        gray = to_gray(img)
+        small, scale = resize_to_width(gray, _WORK_WIDTH)
+        sx = small.shape[1] / float(grid.width)
+        sy = small.shape[0] / float(grid.height)
+        g = grid.scaled(sx, sy)
+        hm, vm = _hv_masks(small)
+        rh = g.row_height
+        tol = max(2.0, 0.15 * rh)
+        cx = g.col_x
+        # appoggio dei bordi orizzontali, cella per cella
+        hs = np.zeros((N_DAYS + 1, N_COLS))
+        for i, y in enumerate(g.row_y):
+            for c in range(N_COLS):
+                m = 0.12 * (cx[c + 1] - cx[c])
+                hs[i, c] = _segment_support(hm, y, cx[c] + m, cx[c + 1] - m, tol, True)
+        # appoggio dei bordi verticali, riga per riga
+        vs = np.zeros((N_DAYS, N_COLS + 1))
+        for d in range(N_DAYS):
+            ya, yb = g.row_y[d], g.row_y[d + 1]
+            m = 0.15 * (yb - ya)
+            for c, x in enumerate(cx):
+                vs[d, c] = _segment_support(vm, x, ya + m, yb - m, max(2.0, 0.15 * rh), False)
+        cell_h = np.minimum(hs[:-1], hs[1:])               # bordo sopra e sotto della cella
+        row_q = np.zeros(N_DAYS)
+        for d in range(N_DAYS):
+            hq = float(np.percentile(cell_h[d], 30))
+            vq = float(np.percentile(vs[d], 30))
+            # le linee orizzontali contano di piu': le verticali corrono continue
+            # e non dicono se la riga e' sfalsata in altezza
+            row_q[d] = min(1.0, 0.7 * hq + 0.3 * vq + 0.1)
+        lines = float(np.mean(row_q))
+        # numeri stampati della colonna "Giorno"
+        widths = _day_number_widths(small, g)
+        pat, readable = _day_pattern(widths)
+        flipped_score = pat.pop(99, 0.0)
+        p0 = pat[0]
+        other = max(v for k, v in pat.items() if k != 0)
+        best = max(pat, key=lambda k: (pat[k], -abs(k)))
+        upside_down = bool(readable >= 0.5 and flipped_score >= 0.85 and flipped_score >= p0 + 0.1)
+        if upside_down:
+            giorni, shift = 0.0, 0
+        elif readable < 0.5:
+            # nella colonna "Giorno" non si riconoscono i numeri stampati: o la
+            # stampa e' illeggibile o le righe non cadono sulle celle
+            giorni, shift = (0.6, 0) if lines >= 0.9 else (0.3, 0)
+        elif p0 >= other + 0.03 and p0 >= 0.8:
+            giorni, shift = 1.0, 0
+        elif other >= p0 + 0.03:
+            giorni, shift = 0.0, best
+        else:
+            giorni, shift = 0.7, 0
+        # riga dei totali: le verticali interne fra Giorno e Tot. ore mancano
+        totals_ok = None
+        if g.total_row and g.total_row[1] - g.total_row[0] > 0.4 * rh:
+            ta, tb = g.total_row
+            inner_tot = np.mean([_segment_support(vm, cx[c], ta + 0.2 * (tb - ta), tb - 0.2 * (tb - ta), tol, False)
+                                 for c in (1, 2, 3, 4)])
+            inner_day = float(np.mean(vs[-1, 1:5]))
+            totals_ok = bool(inner_tot < 0.5 and inner_day > 0.6) if inner_day > 0.6 else None
+        alignment = lines * giorni
+        if totals_ok is False:
+            alignment *= 0.6
+        row_q = row_q * (1.0 if giorni > 0.5 else 0.5)
+        return {
+            "alignment": float(max(0.0, min(1.0, alignment))),
+            "row_quality": [round(float(v), 3) for v in row_q],
+            "linee": round(lines, 3),
+            "giorni": giorni,
+            "schema_giorni": {k: round(v, 3) for k, v in pat.items()},
+            "numeri_leggibili": round(readable, 3),
+            "capovolta": upside_down,
+            "sfalsamento": shift,
+            "totali_ok": totals_ok,
+        }
+    except Exception:  # noqa: BLE001 - la verifica non deve mai bloccare
+        log.exception("Verifica dell'allineamento della griglia non riuscita")
+        return {"alignment": 0.0, "row_quality": [0.0] * N_DAYS, "linee": 0.0, "giorni": 0.0,
+                "schema_giorni": {}, "sfalsamento": 0, "totali_ok": None, "numeri_leggibili": 0.0,
+                "capovolta": False}
+
+
+def _shifted(grid: TableGrid, rows: int) -> TableGrid:
+    """Stessa griglia spostata di ``rows`` righe-giorno (positivo = verso il basso)."""
+    dy = rows * grid.row_height
+    d = grid.to_dict()
+    d["row_y"] = [y + dy for y in grid.row_y]
+    d["header_top"] = grid.header_top + dy
+    if grid.total_row:
+        d["total_row"] = [grid.total_row[0] + dy, grid.total_row[1] + dy]
+    d["alignment"] = None
+    d["row_quality"] = None
+    out = TableGrid.from_dict({k: (int(round(v)) if isinstance(v, float) and k != "score" else v)
+                               for k, v in d.items()})
+    out.details = dict(grid.details)
+    return out
+
+
+def _refine_ends(gray: np.ndarray, grid: TableGrid) -> TableGrid:
+    """Dopo una correzione dello sfalsamento: bordo superiore dell'intestazione
+    e fondo della riga dei totali sulle linee reali piu' vicine alle posizioni
+    attese (se non si trovano restano quelle stimate)."""
+    small, _ = resize_to_width(gray, _WORK_WIDTH)
+    sx = small.shape[1] / float(grid.width)
+    sy = small.shape[0] / float(grid.height)
+    g = grid.scaled(sx, sy)
+    hm, _ = _hv_masks(small)
+    # una linea non perfettamente dritta occupa qualche pixel in altezza
+    hm = cv2.dilate(hm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))) > 0
+    x0, x1 = g.col_x[0], g.col_x[-1]
+    cover = hm[:, max(0, x0):max(0, x1)].mean(axis=1) if x1 > x0 else np.zeros(hm.shape[0])
+    rh = g.row_height
+
+    def nearest_line(a: float, b: float, expected: float) -> int | None:
+        ia, ib = max(0, int(a)), min(cover.size, int(b) + 1)
+        if ib <= ia:
+            return None
+        ys = [ia + k for k in range(ib - ia) if cover[ia + k] >= 0.5]
+        return min(ys, key=lambda y: abs(y - expected)) if ys else None
+
+    top = nearest_line(g.row_y[0] - 1.35 * rh, g.row_y[0] - 0.65 * rh, g.row_y[0] - HEADER_ROWS * rh)
+    bottom = nearest_line(g.row_y[-1] + 0.55 * rh, g.row_y[-1] + 1.4 * rh, g.row_y[-1] + TOTAL_ROWS * rh)
+    d = grid.to_dict()
+    if top is not None:
+        d["header_top"] = int(round(top / sy))
+    if bottom is not None:
+        d["total_row"] = [int(grid.row_y[-1]), int(round(bottom / sy))]
+    out = TableGrid.from_dict(d)
+    out.details = dict(grid.details)
+    return out
+
+
+def _apply_check(img: np.ndarray, grid: TableGrid) -> TableGrid:
+    """Autoverifica della griglia rilevata; se i numeri stampati della colonna
+    "Giorno" indicano con chiarezza uno sfalsamento di righe intere, prova la
+    griglia corretta e la tiene solo se la verifica la conferma."""
+    chk = check_alignment(img, grid)
+    shift = int(chk.get("sfalsamento") or 0)
+    if shift:
+        cand = _shifted(grid, -shift)
+        h = grid.height
+        if cand.header_top >= 0 and (cand.total_row[1] if cand.total_row else cand.row_y[-1]) <= h:
+            chk2 = check_alignment(img, cand)
+            if chk2["alignment"] >= GRID_ALIGNMENT_MIN and chk2["giorni"] >= 1.0:
+                log.info("Griglia sfalsata di %d righe: corretta con i numeri della colonna Giorno", shift)
+                grid, chk = _refine_ends(img, cand), chk2
+                grid.details["sfalsamento_corretto"] = shift
+    grid.alignment = chk["alignment"]
+    grid.row_quality = chk["row_quality"]
+    grid.score = round(min(float(grid.score), float(chk["alignment"])), 4)
+    grid.details["verifica"] = {k: chk[k] for k in ("linee", "giorni", "sfalsamento", "totali_ok",
+                                                     "numeri_leggibili", "capovolta") if k in chk}
+    if not grid.reliable:
+        log.info("Griglia poco affidabile (allineamento %.2f): valori della pagina da verificare",
+                 grid.alignment)
+    return grid
+
+
 def detect_grid(img: np.ndarray) -> TableGrid:
     """Individua la tabella giornaliera. Non solleva mai eccezioni: se la tabella
-    non e' riconoscibile restituisce il modello proporzionale (``detected=False``)."""
+    non e' riconoscibile restituisce il modello proporzionale (``detected=False``).
+
+    Una griglia rilevata viene sempre autoverificata (``check_alignment``):
+    ``alignment``/``row_quality`` dicono quanto fidarsi della pagina e delle
+    singole righe (``TableGrid.reliable``, ``TableGrid.row_reliable``)."""
     try:
         gray = to_gray(img)
     except Exception:  # noqa: BLE001
@@ -691,6 +1057,22 @@ def detect_grid(img: np.ndarray) -> TableGrid:
     except Exception:  # noqa: BLE001
         log.exception("Rilevamento della griglia non riuscito")
         grid = None
+    if grid is not None and grid.detected:
+        grid = _apply_check(gray, grid)
+    if grid is None or not grid.reliable:
+        # moduli stampati chiari, foto in penombra: nuovo tentativo con il
+        # contrasto locale aumentato; si tiene solo se va meglio
+        try:
+            enh = enhance_contrast(gray)
+            g2 = _detect(enh)
+            if g2 is not None and g2.detected:
+                g2 = _apply_check(enh, g2)
+                al = grid.alignment if (grid is not None and grid.detected and grid.alignment is not None) else 0.0
+                if g2.alignment is not None and g2.alignment > al + 0.05:
+                    g2.details["contrasto_aumentato"] = True
+                    grid = g2
+        except Exception:  # noqa: BLE001
+            log.exception("Rilevamento della griglia con contrasto aumentato non riuscito")
     if grid is None:
         return template_grid(W, H, score=0.0)
     return grid
@@ -735,7 +1117,10 @@ def draw_grid(img: np.ndarray, grid: TableGrid) -> np.ndarray:
 
 __all__ = [
     "COLUMNS",
+    "GRID_ALIGNMENT_MIN",
+    "ROW_QUALITY_MIN",
     "TableGrid",
+    "check_alignment",
     "detect_grid",
     "draw_grid",
     "template_grid",

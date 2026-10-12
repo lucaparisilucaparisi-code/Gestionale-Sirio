@@ -47,7 +47,8 @@ def get_engine(settings: "Settings") -> OCREngine:
     if settings.engine == "locale":
         from sirio.engines.local_engine import LocalEngine  # noqa: PLC0415
 
-        return LocalEngine(model_name=settings.local_model)
+        return LocalEngine(model_name=settings.local_model,
+                           second_opinion=bool(getattr(settings, "secondo_parere", False)))
 
     from sirio.config import get_api_key  # noqa: PLC0415
     from sirio.engines.claude_engine import ClaudeEngine  # noqa: PLC0415

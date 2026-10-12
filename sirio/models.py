@@ -184,6 +184,9 @@ class ExtractionResult(BaseModel):
     engine: str = ""                            # "claude" | "locale" | "demo"
     model: str | None = None
     usage: Usage = Field(default_factory=Usage)
+    # avvisi sulla lettura dell'intera pagina (griglia incerta, pagina raddrizzata...):
+    # anomalie che i controlli dei dati non possono ricavare da intestazione e righe
+    avvisi: list[Anomaly] = Field(default_factory=list)
 
 
 class Document(BaseModel):
@@ -211,6 +214,7 @@ class Document(BaseModel):
     ocr_notes: str | None = None
     confidence: float | None = None
     usage: Usage = Field(default_factory=Usage)
+    avvisi: list[Anomaly] = Field(default_factory=list)   # dalla lettura (ExtractionResult.avvisi)
 
     user_verified: bool = False                 # l'utente ha confermato il documento
     user_edited: list[str] = Field(default_factory=list)  # es. ["header.operatore", "rows.3.eff_uscita"]
@@ -228,6 +232,7 @@ class Document(BaseModel):
         self.engine = result.engine
         self.model = result.model
         self.usage = result.usage
+        self.avvisi = list(result.avvisi)
 
     def display_name(self) -> str:
         op = (self.header.operatore or "").strip()

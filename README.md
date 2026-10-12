@@ -58,7 +58,28 @@ avvio lo segnala e indica dove scaricarlo.
 La scrittura a mano è difficile da leggere per qualunque sistema automatico: per
 questo ogni valore viene controllato (coerenza tra orari e ore, totali, firme…) e
 i campi **incerti** o **illeggibili** vengono evidenziati per una rapida verifica
-nella griglia di revisione, prima di generare l'Excel.
+nella griglia di revisione, prima di generare l'Excel. Il motore offline è tarato
+per **non mostrare mai come sicuro un valore dubbio**: preferisce segnalare un valore
+giusto in più piuttosto che lasciarne passare uno sbagliato.
+
+Il motore offline riconosce le varianti reali dei fogli: scansioni capovolte o storte,
+foto di sbieco, fogli incurvati o piegati (raddrizzati automaticamente: l'anomalia
+informativa *pagina raddrizzata automaticamente* lo ricorda), orari scritti "8:30",
+"8,30" o "830", ore come "2,5" o "2h30'", righe non usate barrate, linee tirate sugli
+orari effettivi (prestazione non svolta), "/" nei giorni non lavorati, firme lunghe che
+sconfinano nelle note. Se la tabella della foto non risulta allineata con sicurezza
+alle righe del modulo, compare l'avviso **Griglia incerta: verificare tutti i valori
+della pagina** e tutti i valori della pagina (o delle righe interessate) sono
+segnalati.
+
+**Facoltativo — secondo parere offline.** In *Impostazioni*, con il motore locale, si
+può attivare il *secondo parere offline sulle celle dubbie*: un secondo modello
+(GLM-OCR, circa 2,7 GB scaricati una sola volta, servono almeno 12 GB di RAM) rilegge
+gli orari e le ore incerti e toglie la segnalazione solo quando i due modelli
+concordano e la riga lo conferma (orari e ore coerenti). Sui fogli reali di prova ha
+tolto circa un quinto delle segnalazioni superflue senza rendere sicuro nessun valore
+sbagliato, al costo di 10-50 secondi in più per pagina; per questo è disattivato in modo
+predefinito. Con l'impostazione attiva, `--scarica-modello` scarica anche questo modello.
 
 **Facoltativo — Claude Vision (a pagamento).** Per una precisione superiore sulla
 scrittura difficile, in *Impostazioni* si può scegliere il motore cloud Claude di
@@ -114,6 +135,8 @@ Per ogni foglio vengono verificati, tra gli altri:
 - assenze dell'alunno (con ore riconosciute) e dell'operatore (es. permesso *104*);
 - prestazioni programmate ma non svolte (es. *Ponte di Carnevale*);
 - intestazione incompleta, campi incerti o illeggibili;
+- **griglia incerta** (foto storta o foglio piegato: tutti i valori da verificare) e
+  pagine raddrizzate automaticamente;
 - **possibili fogli duplicati**: più fogli con lo stesso operatore, alunno e mese (ad
   esempio la stessa pagina scansionata due volte in file diversi), segnalati già nella
   revisione e nell'anteprima, prima di generare l'Excel, perché le ore non vengano

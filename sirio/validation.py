@@ -75,11 +75,13 @@ W10_TOTALE_MENSILE_ASSENTE = "W10_TOTALE_MENSILE_ASSENTE"
 W11_DOPPIA_ASSENZA = "W11_DOPPIA_ASSENZA"
 W12_ORE_NON_INDICATE = "W12_ORE_NON_INDICATE"
 W13_POSSIBILE_DUPLICATO = "W13_POSSIBILE_DUPLICATO"
+W14_GRIGLIA_INCERTA = "W14_GRIGLIA_INCERTA"
 I01_ASSENZA_ALUNNO = "I01_ASSENZA_ALUNNO"
 I02_ASSENZA_OPERATORE = "I02_ASSENZA_OPERATORE"
 I03_ORARIO_DIVERSO = "I03_ORARIO_DIVERSO"
 I04_ORE_SENZA_PROGRAMMATO = "I04_ORE_SENZA_PROGRAMMATO"
 I05_NON_SVOLTO = "I05_NON_SVOLTO"
+I06_PAGINA_RADDRIZZATA = "I06_PAGINA_RADDRIZZATA"
 
 # Descrizione dei codici (per legende di interfaccia ed Excel).
 # "gravita" e' quella predefinita; E05 e W03 la adattano al caso.
@@ -182,6 +184,13 @@ CODICI: dict[str, dict[str, str]] = {
         "descrizione": "Un altro foglio firma ha lo stesso operatore, alunno, mese e anno: verificare che non sia "
         "lo stesso foglio scansionato due volte (le ore sarebbero conteggiate due volte).",
     },
+    W14_GRIGLIA_INCERTA: {
+        "gravita": "attenzione",
+        "titolo": "griglia incerta",
+        "descrizione": "La tabella della scansione non è allineata con sicurezza alle righe del modulo (foto "
+        "storta, foglio piegato o incurvato): i valori della pagina, o delle righe indicate, sono tutti da "
+        "verificare.",
+    },
     I01_ASSENZA_ALUNNO: {
         "gravita": "info",
         "titolo": "assenza alunno",
@@ -206,6 +215,12 @@ CODICI: dict[str, dict[str, str]] = {
         "gravita": "info",
         "titolo": "prestazione non svolta",
         "descrizione": "Prestazione programmata non svolta (nessun orario effettivo, nessuna ora, nessuna assenza).",
+    },
+    I06_PAGINA_RADDRIZZATA: {
+        "gravita": "info",
+        "titolo": "pagina raddrizzata automaticamente",
+        "descrizione": "La pagina era capovolta, ruotata, storta, fotografata di sbieco o incurvata ed è stata "
+        "raddrizzata prima della lettura.",
     },
 }
 
@@ -1227,10 +1242,61 @@ def validate(header: Header, rows: list[DayRow]) -> tuple[list[Anomaly], Totals]
     return _finalizza(anomalie, totals)
 
 
+def avviso_griglia_incerta(giorno: int | None = None) -> Anomaly:
+    """Avviso di lettura (``ExtractionResult.avvisi``): griglia non affidabile per l'intera
+    pagina (``giorno`` None) oppure per la riga di un giorno."""
+    if giorno is None:
+        msg = ("Griglia incerta: verificare tutti i valori della pagina (la tabella non è allineata con "
+               "sicurezza alle righe del modulo).")
+        return _anomalia(W14_GRIGLIA_INCERTA, msg)
+    msg = (f"Giorno {int(giorno)}: griglia incerta, verificare tutti i valori della riga (la riga non è "
+           "allineata con sicurezza alla tabella del modulo).")
+    return _anomalia(W14_GRIGLIA_INCERTA, msg, giorno=int(giorno))
+
+
+def avviso_pagina_raddrizzata(correzioni: Iterable[str]) -> Anomaly | None:
+    """Avviso di lettura: la pagina e' stata raddrizzata (``correzioni``: frasi brevi come
+    "capovolta", "foglio incurvato"); None se non c'e' nulla da dire."""
+    elenco = _unici(c for c in correzioni if c)
+    if not elenco:
+        return None
+    return _anomalia(
+        I06_PAGINA_RADDRIZZATA,
+        "Pagina raddrizzata automaticamente (" + ", ".join(elenco) + "): controllare che i valori "
+        "corrispondano ai giorni giusti.",
+    )
+
+
+_VALORI_VUOTI = ("campo vuoto", "nessuna crocetta", "assente")
+
+
+def _con_avvisi(anomalie: list[Anomaly], avvisi: Iterable[Anomaly]) -> list[Anomaly]:
+    """Aggiunge gli avvisi della lettura (una sola volta per messaggio). Con la griglia
+    incerta ogni campo della zona e' segnalato anche se vuoto: per i campi vuoti basta
+    l'avviso W14 della pagina o della riga, senza un'attenzione W04 per ciascuno."""
+    avvisi = [a for a in avvisi if a.codice in CODICI]
+    griglia = [a for a in avvisi if a.codice == W14_GRIGLIA_INCERTA]
+    pagina = any(a.giorno is None for a in griglia)
+    giorni = {a.giorno for a in griglia if a.giorno is not None}
+    out = [a for a in anomalie
+           if not (a.codice == W04_CAMPO_INCERTO and a.valore_letto in _VALORI_VUOTI
+                   and (pagina or (a.giorno is not None and a.giorno in giorni)))]
+    visti = {(a.codice, a.messaggio) for a in out}
+    for a in avvisi:
+        if (a.codice, a.messaggio) not in visti:
+            visti.add((a.codice, a.messaggio))
+            out.append(a.model_copy(deep=True))
+    return out
+
+
 def validate_document(doc: Document) -> Document:
-    """Imposta ``doc.anomalies`` e ``doc.totals`` e restituisce ``doc``."""
+    """Imposta ``doc.anomalies`` e ``doc.totals`` e restituisce ``doc``.
+
+    Agli esiti dei controlli si aggiungono gli avvisi della lettura (``doc.avvisi``:
+    griglia incerta, pagina raddrizzata), che i dati da soli non mostrano."""
     if doc.is_foglio_firma:
-        doc.anomalies, doc.totals = validate(doc.header, doc.rows)
+        anomalie, totals = validate(doc.header, doc.rows)
+        doc.anomalies, doc.totals = _finalizza(_con_avvisi(anomalie, doc.avvisi), totals)
         return doc
     e06 = _anomalia(
         E06_NON_FOGLIO_FIRMA,

@@ -4,8 +4,10 @@
 
 ``python -m sirio --scarica-modello [MODELLO]`` scarica soltanto il modello del motore
 offline (quello delle impostazioni, se non indicato) e termina: lo usano i programmi
-di avvio subito dopo l'installazione delle dipendenze. Codice d'uscita 0 se il modello
-è disponibile (anche se era già presente), 1 in caso d'errore.
+di avvio subito dopo l'installazione delle dipendenze. Con l'impostazione
+``secondo_parere`` attiva (e nessun modello indicato) scarica anche il modello del
+secondo parere offline (GLM-OCR), se il computer ha RAM sufficiente. Codice d'uscita 0
+se i modelli sono disponibili (anche se erano già presenti), 1 in caso d'errore.
 
 1. istanza singola: un lucchetto su ``data_dir()/istanza.lock`` e il file
    ``istanza.json`` ``{port, pid, token}``; se un'istanza e' gia' attiva si apre
@@ -661,26 +663,71 @@ def download_model_cli(model_name: str | None = None, cache_dir: Path | None = N
         return 1
     if present is not None:
         say(f"   Modello già presente: {label} ({present})")
-        return 0
-    size_mb = float(info["mb"]) if info.get("mb") else None
-    printer = _DownloadPrinter(label, size_mb, out)
+    else:
+        size_mb = float(info["mb"]) if info.get("mb") else None
+        printer = _DownloadPrinter(label, size_mb, out)
+        try:
+            path = local_engine.download_model(name, cache, printer)
+        except EngineError as exc:
+            printer.end()
+            say(f"   Download del modello non riuscito: {exc}", err)
+            return 1
+        except KeyboardInterrupt:
+            printer.end()
+            say("   Download del modello interrotto: verrà completato al primo utilizzo del motore offline.", err)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            printer.end()
+            log.exception("Download del modello %s non riuscito", name)
+            say(f"   Download del modello non riuscito per un errore imprevisto: {exc}", err)
+            return 1
+        printer.end()
+        say(f"   Modello {label} scaricato in {path}")
+    if model_name:
+        return 0        # modello indicato esplicitamente: solo quello
     try:
-        path = local_engine.download_model(name, cache, printer)
+        enabled = bool(config.load_settings().secondo_parere)
+    except Exception:  # noqa: BLE001
+        enabled = False
+    if not enabled:
+        return 0
+    return _download_second_opinion(cache, out, say, err)
+
+
+def _download_second_opinion(cache: Path, out: Any, say: Callable[..., None], err: Any) -> int:
+    """Scarica anche il modello del secondo parere (impostazione ``secondo_parere`` attiva)."""
+    try:
+        from sirio.engines import secondo_parere  # noqa: PLC0415
+        from sirio.engines.base import EngineError  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        say(f"   Secondo parere offline non disponibile: {exc}", err)
+        return 1
+    sp = secondo_parere.SecondoParere(cache_dir=cache)
+    ok, msg = sp.is_available()
+    if not ok:
+        say(f"   {msg}")
+        return 0        # non e' un errore: il motore locale funziona anche senza
+    if sp.is_downloaded():
+        say(f"   Modello già presente: {secondo_parere.MODEL_LABEL} (secondo parere)")
+        return 0
+    printer = _DownloadPrinter(f"{secondo_parere.MODEL_LABEL} (secondo parere)", float(secondo_parere.DOWNLOAD_MB), out)
+    try:
+        path = sp.download(printer)
     except EngineError as exc:
         printer.end()
-        say(f"   Download del modello non riuscito: {exc}", err)
+        say(f"   Download del secondo parere non riuscito: {exc}", err)
         return 1
     except KeyboardInterrupt:
         printer.end()
-        say("   Download del modello interrotto: verrà completato al primo utilizzo del motore offline.", err)
+        say("   Download del secondo parere interrotto: verrà completato al primo utilizzo.", err)
         return 1
     except Exception as exc:  # noqa: BLE001
         printer.end()
-        log.exception("Download del modello %s non riuscito", name)
-        say(f"   Download del modello non riuscito per un errore imprevisto: {exc}", err)
+        log.exception("Download del secondo parere non riuscito")
+        say(f"   Download del secondo parere non riuscito per un errore imprevisto: {exc}", err)
         return 1
     printer.end()
-    say(f"   Modello {label} scaricato in {path}")
+    say(f"   Modello {secondo_parere.MODEL_LABEL} (secondo parere) scaricato in {path}")
     return 0
 
 
