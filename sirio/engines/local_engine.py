@@ -2735,6 +2735,13 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
             flags["note"] = "piega"
         elif st == TESTO and nshare >= QUOTA_DUBBIA:
             flags["note"] = "timbro"
+        if st == TIMBRO and (any(states.get(f) == TESTO for f in TEXT_FIELDS)
+                             or states.get("firma") in (FIRMA, SEGNO)
+                             or states.get("assenza_alunno") == CROCETTA
+                             or states.get("assenza_operatore") == CROCETTA):
+            # nota coperta dal timbro in una riga compilata: sotto il timbro puo' esserci
+            # una nota ("ASSENTE ALUNNO" scritta sul timbro): non si legge, si segnala
+            flags["note"] = "sotto_timbro"
         states["note"] = st
         plan.cells[g] = states
         if flags:
@@ -3927,6 +3934,9 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
     # note: formule ricorrenti, testo letto, nota uguale a quella del giorno vicino
     notes: dict[int, _Field] = {}
     for g in range(1, 32):
+        if plan.cells.get(g, {}).get("note") == TIMBRO and plan.flags.get(g, {}).get("note") == "sotto_timbro":
+            notes[g] = _Field(illeggibile=True)
+            continue
         if plan.cells.get(g, {}).get("note") == TESTO:
             fld = _note_field(_note_reading(readings, g), plan.aspect.get(f"rows.{g}.note"))
             if plan.flags.get(g, {}).get("note") and fld.value:

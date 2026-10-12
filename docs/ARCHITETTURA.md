@@ -326,7 +326,8 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    della tabella (oltre 3 righe) non sono timbri: questi ultimi sono blocchi di note scritte
    su più righe, non timbri: si leggono. Una nota su due righe attaccata alla firma non sparisce
    togliendo la firma che sconfina, né una nota lunga (oltre 2,5 righe) che comincia attaccata
-   alla firma: si legge e si segnala. Una cella di orari con
+   alla firma: si legge e si segnala. Una nota coperta dal timbro in una riga compilata (firma,
+   crocette o orari) non si legge ma è segnalata illeggibile, mai scartata in silenzio. Una cella di orari con
    **due fasce scritte una sopra l'altra** ("9:00" sopra "13:00") si legge riga per riga: entrata
    = la prima, uscita = l'ultima, sempre segnalata (motivo `due_orari`). Se il ritaglio pulito non trova scrittura ma `PageInk` sì, si legge
    il ritaglio di `PageInk` e il valore resta segnalato.

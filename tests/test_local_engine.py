@@ -1721,6 +1721,17 @@ def test_halftone_photocopy_is_descreened_before_the_analysis():
         assert plan.cells[g]["prog_entrata"] == le.TESTO and plan.cells[g]["firma"] != le.VUOTA, g
 
 
+def test_note_under_the_stamp_on_a_filled_row_is_flagged():
+    """Nota scritta sopra il timbro della scuola in una riga compilata (crocetta, firma):
+    non si legge ma non sparisce in silenzio: illeggibile. In una riga vuota no."""
+    plan = _plan_with({31: {"note": le.TIMBRO, "assenza_alunno": le.CROCETTA, "firma": le.FIRMA},
+                       30: {"note": le.TIMBRO}})
+    plan.flags[31] = {"note": "sotto_timbro"}
+    res = le.assemble(plan, {}, _grid())
+    assert "note" in res.rows[30].illeggibili and res.rows[30].note is None
+    assert "note" not in res.rows[29].illeggibili
+
+
 def test_time_far_outside_the_sheet_range_is_flagged_not_changed():
     """Un orario sicuro molto fuori dall'intervallo di tutti gli altri orari sicuri del
     foglio (es. "16:00" dove nessun altro supera le 14:00) e' segnalato, mai cambiato;
