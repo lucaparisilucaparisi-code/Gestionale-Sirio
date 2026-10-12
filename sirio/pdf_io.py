@@ -29,12 +29,18 @@ SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"
 IMAGE_EXTENSIONS = SUPPORTED_EXTENSIONS - {".pdf"}
 
 DEFAULT_DPI = 300
-# Limite di sicurezza per il rendering (A3 a 300 dpi ~ 17 Mpx): oltre si riduce la risoluzione.
+# Limite di sicurezza per il rendering: oltre si riduce la risoluzione.
 MAX_RENDER_PIXELS = 40_000_000
-# Le immagini molto grandi (es. scansioni a 600 dpi) vengono ridotte a circa
-# ``dpi`` per un A4, con un margine generoso.
+# Le immagini molto grandi (es. scansioni a 600 dpi) e le pagine PDF di formato
+# fisico molto grande (scansioni impaginate a 72 dpi: una pagina "di 65 cm") vengono
+# ridotte a circa ``dpi`` per un A4, con un margine generoso: il foglio firma e' un
+# A4 e oltre non c'e' dettaglio in piu', solo tempo e memoria.
 _A4_INCHES = (8.27, 11.69)
 _IMAGE_PIXEL_FACTOR = 1.6
+
+
+def _max_page_pixels(dpi: int) -> int:
+    return int(_A4_INCHES[0] * dpi * _A4_INCHES[1] * dpi * _IMAGE_PIXEL_FACTOR)
 
 _MAGIC_IMAGE = (
     b"\x89PNG\r\n\x1a\n",     # PNG
@@ -181,8 +187,9 @@ def _render_page(page, dpi: int):
     rect = page.rect
     zoom = max(dpi, 10) / 72.0
     pixels = rect.width * zoom * rect.height * zoom
-    if pixels > MAX_RENDER_PIXELS:
-        zoom *= math.sqrt(MAX_RENDER_PIXELS / pixels)
+    limit = min(MAX_RENDER_PIXELS, _max_page_pixels(max(dpi, 10)))
+    if pixels > limit:
+        zoom *= math.sqrt(limit / pixels)
         log.info("Pagina molto grande: rendering ridotto a %.0f dpi", zoom * 72)
     return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csRGB, alpha=False,
                            annots=True)
@@ -285,8 +292,7 @@ def _limit_image(img: np.ndarray, dpi: int, source_dpi: float | None) -> np.ndar
         if min(h, w) * scale >= 600:
             return cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))),
                               interpolation=cv2.INTER_AREA)
-    max_pixels = int(_A4_INCHES[0] * dpi * _A4_INCHES[1] * dpi * _IMAGE_PIXEL_FACTOR)
-    return resize_max(img, max_pixels=max_pixels)
+    return resize_max(img, max_pixels=_max_page_pixels(dpi))
 
 
 def _source_dpi(im: Image.Image) -> float | None:

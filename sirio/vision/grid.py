@@ -802,6 +802,10 @@ def _day_number_widths(gray_small: np.ndarray, g: TableGrid) -> np.ndarray:
     ys = [g.header_top] + list(g.row_y) + [g.total_row[1] if g.total_row else g.row_y[-1] + rh]
     out = np.full(33, np.nan)
     h, w = gray_small.shape
+    # sfocatura leggera: nelle fotocopie la colonna "Giorno" e' retinata (tratteggio
+    # fitto scuro) e il retino, preso per inchiostro, occupava tutta la cella; i numeri
+    # stampati, a tratto pieno, restano
+    src = cv2.GaussianBlur(gray_small, (5, 5), 0)
     for i in range(33):
         ya, yb = ys[i], ys[i + 1]
         if i in (0, 32):                       # bande di intestazione e totali: solo la parte vicina
@@ -812,14 +816,14 @@ def _day_number_widths(gray_small: np.ndarray, g: TableGrid) -> np.ndarray:
         xb = int(round(x1 - 0.12 * cw))
         if b - a < 3 or xb - xa < 3 or a < 0 or b > h or xa < 0 or xb > w:
             continue
-        cell = gray_small[a:b, xa:xb].astype(np.float32)
+        cell = src[a:b, xa:xb].astype(np.float32)
         bg = float(np.percentile(cell, 85))
         dark = float(np.percentile(cell, 2))
         if bg - dark < 25:
             out[i] = 0.0
             continue
-        ink = cell < bg - 0.45 * (bg - dark)
-        cols = ink.sum(axis=0) >= 2
+        ink = cell < bg - 0.6 * (bg - dark)
+        cols = ink.sum(axis=0) >= max(2, int(0.2 * (b - a)))
         idx = np.nonzero(cols)[0]
         out[i] = 0.0 if idx.size == 0 else (idx[-1] - idx[0] + 1) / float(xb - xa)
     return out
@@ -873,6 +877,21 @@ def _day_pattern(widths: np.ndarray) -> tuple[dict[int, float], float]:
             ok += int(cls[g] == (0 if 32 - g <= 9 else 1))
     scores[99] = ok / n if n >= 10 else 0.0
     return scores, readable
+
+
+def _totals_ok(vm: np.ndarray, g: TableGrid, vs: np.ndarray, tol: float) -> bool | None:
+    """Riga dei totali al suo posto: le verticali interne fra "Giorno" e "Tot. ore"
+    mancano nella riga dei totali e ci sono nella riga del giorno 31 (None = non
+    verificabile)."""
+    rh = g.row_height
+    if not g.total_row or g.total_row[1] - g.total_row[0] <= 0.4 * rh:
+        return None
+    ta, tb = g.total_row
+    cx = g.col_x
+    inner_tot = np.mean([_segment_support(vm, cx[c], ta + 0.2 * (tb - ta), tb - 0.2 * (tb - ta), tol, False)
+                         for c in (1, 2, 3, 4)])
+    inner_day = float(np.mean(vs[-1, 1:5]))
+    return bool(inner_tot < 0.5 and inner_day > 0.6) if inner_day > 0.6 else None
 
 
 def check_alignment(img: np.ndarray, grid: TableGrid) -> dict:
@@ -932,14 +951,7 @@ def check_alignment(img: np.ndarray, grid: TableGrid) -> dict:
             giorni, shift = 0.0, best
         else:
             giorni, shift = 0.7, 0
-        # riga dei totali: le verticali interne fra Giorno e Tot. ore mancano
-        totals_ok = None
-        if g.total_row and g.total_row[1] - g.total_row[0] > 0.4 * rh:
-            ta, tb = g.total_row
-            inner_tot = np.mean([_segment_support(vm, cx[c], ta + 0.2 * (tb - ta), tb - 0.2 * (tb - ta), tol, False)
-                                 for c in (1, 2, 3, 4)])
-            inner_day = float(np.mean(vs[-1, 1:5]))
-            totals_ok = bool(inner_tot < 0.5 and inner_day > 0.6) if inner_day > 0.6 else None
+        totals_ok = _totals_ok(vm, g, vs, tol)
         alignment = lines * giorni
         if totals_ok is False:
             alignment *= 0.6
@@ -1023,7 +1035,14 @@ def _apply_check(img: np.ndarray, grid: TableGrid) -> TableGrid:
         h = grid.height
         if cand.header_top >= 0 and (cand.total_row[1] if cand.total_row else cand.row_y[-1]) <= h:
             chk2 = check_alignment(img, cand)
-            if chk2["alignment"] >= GRID_ALIGNMENT_MIN and chk2["giorni"] >= 1.0:
+            rq2 = chk2.get("row_quality") or [0.0]
+            # la griglia spostata deve poggiare sulle linee almeno quanto l'originale e le
+            # righe che entrano in zona nuova (prima e ultima) devono essere righe vere: una
+            # griglia con le righe di altezza sbagliata in una parte del foglio (foglio
+            # incurvato) non si corregge con uno spostamento, ne' sopra ne' sotto
+            if (chk2["alignment"] >= GRID_ALIGNMENT_MIN and chk2["giorni"] >= 1.0
+                    and chk2["linee"] >= chk["linee"] - 0.01
+                    and min(rq2[0], rq2[-1]) >= ROW_QUALITY_MIN):
                 log.info("Griglia sfalsata di %d righe: corretta con i numeri della colonna Giorno", shift)
                 grid, chk = _refine_ends(img, cand), chk2
                 grid.details["sfalsamento_corretto"] = shift

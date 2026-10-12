@@ -64,10 +64,14 @@ giusto in più piuttosto che lasciarne passare uno sbagliato.
 
 Il motore offline riconosce le varianti reali dei fogli: scansioni capovolte o storte,
 foto di sbieco, fogli incurvati o piegati (raddrizzati automaticamente: l'anomalia
-informativa *pagina raddrizzata automaticamente* lo ricorda), orari scritti "8:30",
-"8,30" o "830", ore come "2,5" o "2h30'", righe non usate barrate, linee tirate sugli
-orari effettivi (prestazione non svolta), "/" nei giorni non lavorati, firme lunghe che
-sconfinano nelle note. Se la tabella della foto non risulta allineata con sicurezza
+informativa *pagina raddrizzata automaticamente* lo ricorda), fotocopie con la colonna
+dei giorni scura, PDF di formato fuori misura, orari scritti "8:30", "8,30" o "830" (anche
+sfalsati, come "8:10 - 13:10"), ore come "2,5" o "2h30'", due fasce orarie scritte una
+sopra l'altra nella stessa cella (lette e sempre segnalate), righe non usate barrate,
+linee tirate sugli orari effettivi (prestazione non svolta), "/" nei giorni non lavorati,
+firme lunghe che sconfinano nelle note, ombre e aloni del retro del foglio. Confronta
+anche la grafia delle celle fra loro: se due orari scritti allo stesso modo sono letti
+con minuti diversi, il dubbio viene segnalato. Se la tabella della foto non risulta allineata con sicurezza
 alle righe del modulo, compare l'avviso **Griglia incerta: verificare tutti i valori
 della pagina** e tutti i valori della pagina (o delle righe interessate) sono
 segnalati.

@@ -618,6 +618,51 @@ def test_grid_self_check_on_blank_and_misaligned_grids():
     assert check_alignment(page, TableGrid.from_dict(d))["alignment"] < GRID_ALIGNMENT_MIN
 
 
+def test_shift_correction_is_kept_only_if_the_shifted_grid_holds(monkeypatch):
+    """La correzione dello sfalsamento (numeri della colonna "Giorno") si tiene solo se la
+    griglia spostata poggia sulle linee almeno quanto l'originale e la sua prima e ultima
+    riga sono righe vere: un foglio incurvato con le righe sbagliate solo in una parte non
+    diventa "affidabile" spostando tutto di una riga."""
+    from sirio.vision import grid as gm
+
+    page, grid = _processed(0, 0.0)
+    ok_rows = [1.0] * 31
+
+    def fake(first: dict, second: dict):
+        calls = iter([first, second])
+        return lambda img, g: next(calls)
+
+    base = {"alignment": 0.0, "row_quality": ok_rows, "linee": 0.92, "giorni": 0.0, "sfalsamento": 1,
+            "totali_ok": None, "numeri_leggibili": 0.97, "capovolta": False}
+    bad = {**base, "alignment": 0.9, "giorni": 1.0, "sfalsamento": 0, "linee": 0.90,
+           "row_quality": [0.16] + ok_rows[1:]}
+    monkeypatch.setattr(gm, "check_alignment", fake(base, bad))
+    gray = cv2.cvtColor(page, cv2.COLOR_BGR2GRAY)
+    assert not gm._apply_check(gray, grid).reliable
+    good = {**bad, "linee": 0.92, "row_quality": ok_rows}
+    monkeypatch.setattr(gm, "check_alignment", fake(base, good))
+    fixed = gm._apply_check(gray, grid)
+    assert fixed.reliable and fixed.details.get("sfalsamento_corretto") == 1
+
+
+def test_day_numbers_readable_on_a_hatched_day_column():
+    """Fotocopia con la colonna "Giorno" retinata scura: i numeri stampati restano
+    riconoscibili (la verifica della griglia non declassa la pagina)."""
+    page, grid = _processed(0, 0.0)
+    img = page.copy()
+    x0, x1 = grid.col_x[0] + 3, grid.col_x[1] - 3
+    y0, y1 = grid.row_y[0] + 3, grid.row_y[-1] - 3
+    zone = img[y0:y1, x0:x1].astype(np.int16)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    hatch = np.where(((xx + yy) % 4) < 2, 70, 0)             # retino diagonale fitto
+    dark = np.clip(zone - 120 - hatch[..., None], 0, 255)
+    numbers = zone < 110                                    # i numeri stampati restano piu' scuri
+    dark[numbers] = np.clip(zone[numbers] - 150, 0, 255)
+    img[y0:y1, x0:x1] = dark.astype(np.uint8)
+    chk = check_alignment(img, grid)
+    assert chk["numeri_leggibili"] >= 0.9 and chk["giorni"] == 1.0, chk
+
+
 # --------------------------------------------------------------------------
 # Inchiostro proprio: barrature, linee attraverso, debordamenti, "/"
 # --------------------------------------------------------------------------

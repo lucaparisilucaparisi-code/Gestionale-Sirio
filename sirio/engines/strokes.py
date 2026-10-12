@@ -35,6 +35,12 @@ STRIKE_MIN_LEN = 2.6        # lunghezza minima di una barratura (altezze di riga
 STRIKE_MAX_THICK = 0.13     # spessore medio massimo (altezze di riga)
 STRIKE_MAX_DEV = 0.16       # scarto massimo (90 percentile) dalla linea adattata (altezze di riga)
 PRINTED_SPAN = 0.8          # frazione della tabella oltre la quale un tratto e' una linea stampata
+PRINTED_RESIDUE = 0.06      # semispessore (altezze di riga) del residuo di linea stampata cancellato
+# Fascia di scrittura scambiata per una linea: spessore medio e scarto dalla curva
+# entrambi alti (misurati: scrittura 0,08-0,11 / 0,12-0,15 righe; linee tracciate a
+# mano e barre al piu' 0,05 di spessore oppure 0,10 di scarto)
+TEXT_BAND_THICK = 0.07
+TEXT_BAND_DEV = 0.11
 HORIZONTAL_DEG = 20.0       # inclinazione massima di una linea "orizzontale" (trattino lungo)
 HORIZONTAL_MAX_ROWS = 1.0   # ... e altezza massima (altezze di riga): resta dentro una riga
 SLASH_MIN_DEG = 18.0        # inclinazione di una barretta "/" rispetto all'orizzontale
@@ -118,6 +124,30 @@ def _printed_lines(ink: np.ndarray, unit: float, rows: list[float], cols: list[f
     hl = cv2.dilate(hl, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2 * t + 1)))
     vl = cv2.dilate(vl, cv2.getStructuringElement(cv2.MORPH_RECT, (2 * t + 1, 3)))
     return (hl | vl) > 0
+
+
+def _curve_residuals(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Distanza di ogni pixel dalla curva (parabola lungo l'asse principale) adattata."""
+    pts = np.stack([xs, ys], axis=1).astype(np.float64)
+    mean = pts.mean(axis=0)
+    evals, evecs = np.linalg.eigh(np.cov((pts - mean).T))
+    major = evecs[:, int(np.argmax(evals))]
+    minor = np.array([-major[1], major[0]])
+    along = (pts - mean) @ major
+    perp = (pts - mean) @ minor
+    try:
+        coef = np.polyfit(along, perp, 2) if float(along.max() - along.min()) > 4 else np.array(
+            [0.0, 0.0, float(perp.mean())])
+        return np.abs(perp - np.polyval(coef, along))
+    except (np.linalg.LinAlgError, ValueError):
+        return np.abs(perp)
+
+
+def is_text_band(thick: float, dev: float, unit: float) -> bool:
+    """Gruppo di pezzi "rettilinei" che e' in realta' una fascia di scrittura (cifre di
+    celle vicine ricucite fra loro e alla linea su cui poggiano): spesso e alto insieme,
+    una linea tracciata non lo e' mai."""
+    return thick > TEXT_BAND_THICK * unit and dev > TEXT_BAND_DEV * unit
 
 
 def stroke_shape(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float, float, float]:
@@ -246,15 +276,21 @@ def find_strikes(gray: np.ndarray, grid: TableGrid, ignore: np.ndarray | None = 
         thick = xs.size / max(1.0, sum(float(np.linalg.norm(m["b"] - m["a"])) + 1.0 for m in members))
         if length < min_len or thick > STRIKE_MAX_THICK * unit or dev > STRIKE_MAX_DEV * unit:
             continue
+        if is_text_band(thick, dev, unit):
+            continue
         bx, by = int(xs.min()), int(ys.min())
         bw, bh = int(xs.max()) - bx + 1, int(ys.max()) - by + 1
-        mask[ys, xs] = True
         ym = float(np.median(ys))
         printed = ((angle <= 10 and bw >= PRINTED_SPAN * table_w) or (angle >= 80 and bh >= PRINTED_SPAN * table_h)
                    or (angle <= 5 and min(abs(ym - y) for y in row_y) <= 0.25 * unit))
         if printed:
-            # linea stampata non allineata con la griglia: si cancella ma non e' una barratura
+            # linea stampata non allineata con la griglia: si cancella ma non e' una barratura.
+            # Solo i pixel sulla linea: la scrittura appoggiata sul bordo della riga (cifre
+            # che toccano la linea, ricucite al residuo della linea) resta
+            near = _curve_residuals(xs, ys) <= max(2.0, PRINTED_RESIDUE * unit)
+            mask[ys[near], xs[near]] = True
             continue
+        mask[ys, xs] = True
         horiz = angle <= HORIZONTAL_DEG and bh <= HORIZONTAL_MAX_ROWS * unit
         info.strokes.append(Stroke(bx + x0, by + y0, bx + bw + x0, by + bh + y0, angle, length, thick, horiz))
         # celle attraversate: lunghezza del tratto dentro ogni cella

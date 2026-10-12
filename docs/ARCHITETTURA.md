@@ -141,7 +141,9 @@ SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"
 def count_pages(data: bytes, filename: str) -> int
 def iter_pages(data: bytes, filename: str, dpi: int = 300) -> Iterator[tuple[int, np.ndarray]]
     # (indice pagina 0-based, immagine BGR uint8). PDF via PyMuPDF (import pymupdf).
-    # Per PDF scansionati: renderizza a `dpi` (300). TIFF multipagina supportati via Pillow.
+    # Per PDF scansionati: renderizza a `dpi` (300), al massimo quanto un A4 a `dpi` con margine
+    # (~14 Mpx): le scansioni impaginate a 72 dpi (pagine "di 65 cm") non diventano immagini da
+    # 40 Mpx. TIFF multipagina supportati via Pillow.
 def decode_image(data: bytes) -> np.ndarray          # BGR, gestisce EXIF orientation
 def encode_jpeg(img: np.ndarray, quality: int = 90, max_side: int | None = None) -> bytes
 def encode_png(img: np.ndarray, max_side: int | None = None) -> bytes
@@ -232,8 +234,12 @@ def ink_under_crease(img, box, creases, unit, mask=None) -> bool
 "rilevata" può essere sfalsata di una riga (righe periodiche, intestazione o totali scambiati per
 una riga-giorno) o giusta solo in parte (foglio incurvato). Si misura, senza OCR: quanta parte di
 ogni bordo previsto cade su una linea reale; se i numeri stampati nella colonna "Giorno" hanno una
-cifra nelle righe 1–9 e due nelle 10–31; se la riga dei totali ha la cella unita. Uno sfalsamento
-di righe intere viene corretto; il resto produce `alignment` e `row_quality`. Una tabella con
+cifra nelle righe 1–9 e due nelle 10–31 (letti dopo una leggera sfocatura: nelle fotocopie la
+colonna è retinata scura e il retino non va preso per inchiostro); se la riga dei totali ha la
+cella unita. Uno sfalsamento di righe intere viene corretto solo se la griglia spostata poggia
+sulle linee almeno quanto l'originale e la sua prima e ultima riga sono righe vere (un foglio
+incurvato con le righe sbagliate solo in una parte resta "non affidabile"); il resto produce
+`alignment` e `row_quality`. Una tabella con
 quasi tutte le righe trovate non viene scartata solo perché una o due linee verticali sono deboli
 (foto con lo sfondo attorno al foglio): decide l'autoverifica. **Contratto per i
 motori:** con `grid.reliable` False ogni valore della pagina va segnalato; con
@@ -303,7 +309,16 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    su più celle) → nessun valore, l'inchiostro rimasto (crocette, firme, testo) è segnalato;
    linea tirata sugli orari effettivi → `trattino_effettivo`; "/" isolata in una riga senza altri
    orari → nulla (altrove letta e segnalata); code di firme nella colonna Note tolte; nota senza
-   inchiostro proprio → vuota. Se il ritaglio pulito non trova scrittura ma `PageInk` sì, si legge
+   inchiostro proprio → vuota, salvo che l'inchiostro attribuito alle celle vicine sia una
+   scrittura consistente (es. "FERIE" staccata di poco dalla firma, presa per la sua
+   continuazione): allora si legge e si segnala (motivo `attribuzione`). Le linee stampate non
+   allineate alla griglia si cancellano solo lungo la linea, e una "fascia di scrittura" (cifre di
+   celle vicine appoggiate sulla linea della riga, ricucite fra loro: spessa e alta insieme) non è
+   mai una linea né una barratura. Crocette e firme di inchiostro chiarissimo (meno di 60 livelli
+   sulla carta: ombre, aloni del retro del foglio) sono celle vuote; fra 60 e 110 sono segni da
+   verificare (le crocette e le firme vere misurate sono tutte oltre 130). Una cella di orari con
+   **due fasce scritte una sopra l'altra** ("9:00" sopra "13:00") si legge riga per riga: entrata
+   = la prima, uscita = l'ultima, sempre segnalata (motivo `due_orari`). Se il ritaglio pulito non trova scrittura ma `PageInk` sì, si legge
    il ritaglio di `PageInk` e il valore resta segnalato.
    **Pieghe del foglio** (`ink.find_creases`, foto di fogli piegati): la linea lunga quasi
    verticale che attraversa molte righe non è un segno in nessuna colonna; viene tolta come le
@@ -318,7 +333,9 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    comunque il segno da verificare. Nella colonna Note si legge (segnalato) solo ciò che resta
    tolta la struttura, se è scrittura vera.
 2. *Lettura* TrOCR a lotti, con bianco sopra/sotto i ritagli di orari e ore.
-3. *Assemblaggio* (`assemble`): formati reali degli orari ("8:30", "8,30", "830", "8h30", "8"),
+3. *Assemblaggio* (`assemble`): formati reali degli orari ("8:30", "8,30", "830", "8h30", "8")
+   a passi di 5 minuti (orari sfalsati "8:10 - 13:10"; i minuti non a quarti d'ora partono
+   sfavoriti e diventano normali solo se la pagina li usa: almeno 3 letture sicure),
    ore a quarti ("2,5", "2h30'", "1:15", "0"), fascia scolastica plausibile (fuori 7–18 sempre
    segnalato), scambi di cifre tipici di TrOCR (1/4/7, 2/9, 0/6) solo come alternative segnalate,
    riconciliazione della riga (ore = uscita − entrata; uguaglianza programmato/effettivo usata solo
@@ -336,12 +353,18 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    ore riconosciute che non sono una frazione "tonda" (¼, ⅓, ½, ⅔, ¾, intera) della durata
    programmata (es. 1,5 su 11:00–16:00) → orario programmato e ore da verificare; un
    solo orario programmato (o effettivo) leggibile; crocetta di assenza dell'operatore in una riga
-   firmata con l'orario effettivo; firma o crocetta in una riga senza orari, ore, trattini e note
-   (segno isolato: timbro, firma del piè di pagina, macchia); nota breve del vocabolario ("104")
+   firmata con l'orario effettivo; firma o crocetta in una riga senza alcun valore sicuro (segno
+   isolato: timbro, firma del piè di pagina, macchia, barra "/" di una riga annullata); minuti di
+   un orario diversi da quelli delle celle di altre righe con la scrittura più simile (stessa
+   grafia, es. "13:ↄↄ" letto con sicurezza "13:30" dove gli altri "ↄↄ" sono letti ":00": la riga
+   resta coerente perché anche l'entrata si sposta, quindi la coerenza non basta a confermare);
+   nota fatta di sole parole vuote ("IL", "DI LA") mai sicura; nota breve del vocabolario ("104")
    proposta da verificare invece di essere scartata; nota scritta per davvero (due righe, o
    almeno tre segni larghi e alti come una parola breve, es. "104") di cui nessuna lettura è accettata →
    `illeggibili`, mai vuota in silenzio (lo stesso per ogni campo: inchiostro proprio presente e
-   nessun valore → segnalato). Intestazione: mese/anno sicuri
+   nessun valore → segnalato). Firma del coordinatore: contano solo i segni per lo più dentro la
+   sua riga; i tratti che vengono da fuori (firma del referente che sale nella riga, timbro che
+   la copre) la rendono da verificare. Intestazione: mese/anno sicuri
    quando il nome del mese è letto (lettura vincolata e libera concordi) e il calendario dei
    giorni compilati esclude ogni altro anno non futuro; totale mensile segnalato se diverso dalla
    somma delle ore lette (salvo ore illeggibili che spieghino la differenza).

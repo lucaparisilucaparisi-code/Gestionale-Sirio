@@ -113,3 +113,15 @@ def test_stroke_shape_of_a_straight_line():
     ys = 0.5 * xs + 3
     length, thick, dev, angle = st.stroke_shape(xs, ys)
     assert 220 <= length <= 225 and dev < 1e-6 and 26 <= angle <= 27.5
+
+
+
+def test_text_band_is_not_a_line():
+    """Misure reali (in altezze di riga): cifre scritte in basso in tre celle di fila,
+    ricucite alla linea della riga, contro barrature, linee "non svolta" e barre "/"."""
+    unit = 100.0
+    for thick, dev in ((0.084, 0.130), (0.105, 0.150), (0.078, 0.124)):          # scrittura
+        assert st.is_text_band(thick * unit, dev * unit, unit)
+    for thick, dev in ((0.036, 0.096), (0.042, 0.025), (0.031, 0.058), (0.093, 0.060),
+                       (0.082, 0.056), (0.090, 0.094)):                            # linee vere
+        assert not st.is_text_band(thick * unit, dev * unit, unit)

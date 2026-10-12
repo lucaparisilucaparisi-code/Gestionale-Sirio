@@ -173,7 +173,11 @@ def _fmt_size(mb: float) -> str:
 
 TIME_MIN = 6 * 60          # 06:00
 TIME_MAX = 20 * 60         # 20:00
-TIME_STEP = 15             # minuti ammessi: 00, 15, 30, 45
+# minuti ammessi: multipli di 5. I quarti d'ora sono i piu' comuni, ma c'e' chi
+# lavora "8:10 - 13:10" (orari scolastici sfalsati): con i soli quarti un 8:10
+# scritto chiaramente diventava un 8:30 *sicuro*. I minuti non a quarti partono
+# sfavoriti (``page_minute_prior``) e contano solo se la pagina li usa davvero.
+TIME_STEP = 5
 HOURS_MAX_DAY = 8.0
 
 MESI_NOMI = (
@@ -216,6 +220,13 @@ NOTE_PAROLE: frozenset[str] = frozenset(
     "SULLA", "DEL", "DELLA", "DELL", "DI", "DA", "AL", "ALLA", "IL", "LA", "LO", "PER", "CON", "SU", "NEL",
     "MATTINA", "POMERIGGIO", "GIORNO", "GIORNATA", "FESTIVITA", "SANTO", "PATRONO", "COMUNE", "CHIUSO",
     "CHIUSA", "RETRIBUITO", "RETRIBUITA", "MALATO", "MALATA", "LEGGE", "EVENTO", "TEATRO",
+))
+
+
+# Parole che da sole non fanno una nota (articoli, preposizioni)
+PAROLE_VUOTE = frozenset((
+    "IL", "LA", "LO", "LE", "GLI", "I", "DI", "DA", "AL", "ALLA", "SUL", "SULLA", "DEL", "DELLA", "DELL",
+    "PER", "CON", "SU", "NEL", "E", "A", "IN", "UN", "UNA",
 ))
 
 
@@ -334,7 +345,7 @@ _TIME_SEPARATORS = (":", ".", ",", ";", "'", "H", "")
 
 @functools.cache
 def time_lexicon() -> Lexicon:
-    """Orari 06:00-20:00 a passi di 15 minuti nelle scritture reali: "8:00",
+    """Orari 06:00-20:00 a passi di 5 minuti nelle scritture reali: "8:00",
     "08.30", "8,30", "10,30", "800", "1100", "830", "8h30", "8:30h", "8"..."""
     pairs: list[tuple[str, str]] = []
     for minutes in range(TIME_MIN, TIME_MAX + 1, TIME_STEP):
@@ -1743,6 +1754,7 @@ class PagePlan:
     sostituzione: str | None = None
     sostituzione_incerta: bool = False
     firma_coordinatore: bool = False
+    firma_coordinatore_incerta: bool = False   # inchiostro di altri segni (firma/timbro del referente)
     timbro_referente: bool = False
     totale_ink: bool = False
     data_ink: bool = False
@@ -1971,6 +1983,57 @@ def foreign_ink(gray: np.ndarray, grid: TableGrid) -> ForeignInk | None:
     return ForeignInk(mask=keep[lab] & m, ink=m, origin=(zx0, zy0))
 
 
+def _overlap(box: Box, other: Box) -> float:
+    """Frazione dell'area di ``box`` coperta da ``other``."""
+    x0, y0, x1, y1 = box
+    ix = max(0, min(x1, other[2]) - max(x0, other[0]))
+    iy = max(0, min(y1, other[3]) - max(y0, other[1]))
+    area = max(1, (x1 - x0) * (y1 - y0))
+    return ix * iy / area
+
+
+def _owned_components(gray: np.ndarray, box: Box, unit: float, band: float, rows: Sequence[float] = (),
+                      cols: Sequence[float] = ()) -> tuple[list[tuple[int, int, int, int, int]],
+                                                           list[tuple[int, int, int, int, int]]]:
+    """Componenti d'inchiostro che toccano ``box``, divise fra proprie (per lo piu'
+    dentro il riquadro) ed estranee (per lo piu' fuori: tratti di una firma o di un
+    timbro vicini che sconfinano). Analisi su una zona estesa di ``band`` sopra e sotto;
+    le statistiche (x, y, w, h, area) sono quelle della parte nel riquadro."""
+    H, W = gray.shape[:2]
+    x0, y0, x1, y1 = box
+    ey0, ey1 = max(0, int(y0 - band)), min(H, int(y1 + band))
+    region = gray[ey0:ey1, x0:x1]
+    if region.size == 0 or y1 <= y0 or x1 <= x0:
+        return [], []
+    bg = _paper_level(region)
+    ink_mask = region < _ink_threshold(bg)
+    h_lines, v_lines = _line_mask(ink_mask, unit, [y - ey0 for y in rows], [x - x0 for x in cols], split=True)
+    m = ink_mask & ~(h_lines | v_lines)
+    # un tratto che attraversa una linea orizzontale resta un solo segno (la firma del
+    # referente che sale nella riga del coordinatore non diventa un segno a se')
+    r = max(2, int(round(0.1 * unit)))
+    near = cv2.dilate(m.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2 * r + 1))) > 0
+    conn = m | (h_lines & near)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(conn.astype(np.uint8), connectivity=8)
+    lab = np.where(m, lab, 0)
+    stats = stats.copy()
+    stats[:, 4] = np.bincount(lab.ravel(), minlength=n)
+    a, b = y0 - ey0, y1 - ey0
+    inner = lab[a:b]
+    inside = np.bincount(inner.ravel(), minlength=n)
+    min_area = max(4.0, (0.04 * unit) ** 2)
+    own: list[tuple[int, int, int, int, int]] = []
+    foreign: list[tuple[int, int, int, int, int]] = []
+    for k in range(1, n):
+        if inside[k] < min_area:
+            continue
+        ys, xs = np.nonzero(inner == k)
+        st = (int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1),
+              int(inside[k]))
+        (own if inside[k] >= 0.5 * stats[k][4] else foreign).append(st)
+    return own, foreign
+
+
 def _signature_like(comps: Sequence[tuple[int, int, int, int, int]], unit: float) -> bool:
     big = [c for c in comps if max(c[2], c[3]) >= 0.35 * unit]
     area = sum(c[4] for c in big)
@@ -2067,10 +2130,11 @@ def _remove_overflow(gray: np.ndarray, grid: TableGrid, g: int) -> int:
     return erased
 
 
-def split_text_lines(crop: np.ndarray, unit: float) -> list[np.ndarray]:
+def split_text_lines(crop: np.ndarray, unit: float, min_width: float | None = None) -> list[np.ndarray]:
     """Divide un ritaglio (inchiostro scuro su bianco) in due righe di testo se la
     scrittura e' disposta su due righe separate da una valle netta del profilo
-    orizzontale; altrimenti restituisce il ritaglio intero."""
+    orizzontale; altrimenti restituisce il ritaglio intero. ``min_width``: larghezza
+    minima di ognuna delle due righe (altezze di riga; default ``LINEA_MIN_LARGHEZZA``)."""
     ink = crop < 160
     prof = ink.sum(axis=1).astype(np.float64)
     rows = np.nonzero(prof > 0)[0]
@@ -2101,7 +2165,8 @@ def split_text_lines(crop: np.ndarray, unit: float) -> list[np.ndarray]:
         x0, x1 = max(0, int(cols[0]) - pad), min(part.shape[1], int(cols[-1]) + 1 + pad)
         out.append(cv2.copyMakeBorder(part[:, x0:x1], pad // 2, pad // 2, 0, 0, cv2.BORDER_CONSTANT, value=255))
     # due righe vere: entrambe larghe (un frammento della riga vicina non e' una riga)
-    if min(widths) < max(LINEA_MIN_LARGHEZZA * unit, 0.3 * max(widths)):
+    lim = LINEA_MIN_LARGHEZZA if min_width is None else min_width
+    if min(widths) < max(lim * unit, 0.3 * max(widths)):
         return [crop]
     return out
 
@@ -2109,6 +2174,7 @@ def split_text_lines(crop: np.ndarray, unit: float) -> list[np.ndarray]:
 LINEA_MIN_ALTEZZA = 0.22    # altezza minima (altezze di riga) di ognuna delle due righe di una nota
 LINEA_MIN_LARGHEZZA = 1.0   # larghezza minima (altezze di riga) di ognuna delle due righe
 LINEA_VALLE = 0.15          # profilo nella valle fra le righe rispetto al picco della riga piu' debole
+ORARI_DUE_RIGHE_LARGHEZZA = 0.6   # larghezza minima (righe) di ognuno dei due orari in una cella
 
 
 def _note_reading(readings: dict[str, Reading], g: int) -> Reading | None:
@@ -2150,6 +2216,28 @@ def _substantial_note(crop: np.ndarray, unit: float, min_width: float = NOTA_SCR
     return big >= NOTA_SCRITTA_TRATTI
 
 
+# Segni chiarissimi nelle colonne delle crocette e delle firme: ombre, aloni della
+# scrittura sul retro del foglio, macchie. Misurato su 465 celle di 18 fogli: crocette
+# e firme vere hanno l'inchiostro scuro almeno 132 livelli sulla carta, le ombre 20-60.
+SEGNO_MIN_SCURO = 60.0      # sotto: non e' un segno a penna (cella vuota)
+SEGNO_SCURO_SICURO = 110.0  # sotto: segno troppo chiaro per essere sicuro (matita, penna scarica)
+
+
+def _faint_mark(st: str, marks: PageMarks, g: int, f: str) -> str:
+    """Crocetta o firma fatta di inchiostro troppo chiaro: vuota se e' solo un'ombra,
+    da verificare se e' un segno chiaro."""
+    if st not in (CROCETTA, FIRMA, SEGNO):
+        return st
+    dark = marks.darkness(g, f)
+    if dark is None:
+        return st
+    if dark < SEGNO_MIN_SCURO:
+        return VUOTA
+    if dark < SEGNO_SCURO_SICURO:
+        return SEGNO
+    return st
+
+
 class PageMarks:
     """Segni a mano che non sono valori (barrature, linee, barrette "/"), dall'unione
     di due rilevatori indipendenti: ``strokes.find_strikes`` (tratti lunghi e sottili,
@@ -2162,6 +2250,7 @@ class PageMarks:
     def __init__(self, gray: np.ndarray, img: np.ndarray, grid: TableGrid):
         self.grid = grid
         self.img = img
+        self.gray = gray
         # pieghe del foglio (lunghe linee quasi verticali che non sono la griglia): rumore
         # per crocette, firme e testo di ogni colonna, tolte come le barrature
         self.creases: list[Any] = []
@@ -2290,6 +2379,20 @@ class PageMarks:
         r = self.own(g, f)
         return bool(r is not None and r.empty)
 
+    def darkness(self, g: int, f: str) -> float | None:
+        """Quanto e' scuro l'inchiostro proprio della cella rispetto alla carta vicina
+        (90 percentile, livelli di grigio); None se non misurabile."""
+        r = self.own(g, f)
+        if r is None or r.empty:
+            return None
+        m = np.asarray(r.mask, dtype=bool)
+        x0, y0 = int(r.box[0]), int(r.box[1])
+        sub = self.gray[y0:y0 + m.shape[0], x0:x0 + m.shape[1]].astype(np.float32)
+        if sub.shape != m.shape or not m.any():
+            return None
+        paper = float(np.percentile(sub, 90))
+        return float(np.percentile(paper - sub[m], 90))
+
 
 def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
     """Analizza l'inchiostro della pagina e prepara i ritagli da leggere."""
@@ -2364,6 +2467,14 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
             if st != TESTO or crop is None:
                 continue
             key = f"rows.{g}.{f}"
+            lines = split_text_lines(crop, rh, min_width=ORARI_DUE_RIGHE_LARGHEZZA)
+            if len(lines) > 1:
+                # due fasce orarie nella stessa cella ("9:00" sopra "13:00"): l'entrata e'
+                # la prima, l'uscita l'ultima; le ore restano quelle scritte. Sempre da
+                # verificare (la riga non torna con le ore: c'e' una pausa in mezzo)
+                flags.setdefault(f, "due_orari")
+                if f in TIME_FIELDS:
+                    crop = lines[0] if f.endswith("entrata") else lines[-1]
             plan.aspect[key] = crop.shape[1] / max(1.0, float(crop.shape[0]))
             if f == "ore_dichiarate":
                 plan.requests.append(_text_request(key, crop, h_lex, beams=5, max_tokens=6, vpad=VPAD_NUMERI))
@@ -2385,7 +2496,7 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 states["eff_entrata"] = states["eff_uscita"] = TRATTINO
         for f in ("assenza_alunno", "assenza_operatore"):
             box = grid.cell(g, f)
-            st = _cell_state_cross(gray, box)
+            st = _faint_mark(_cell_state_cross(gray, box), marks, g, f)
             if st == CROCETTA and (marks.struck(g, f) or marks.slash(g, f) or marks.empty(g, f)):
                 # pezzo di barratura, "/" isolata o inchiostro che secondo l'analisi delle
                 # celle appartiene a una cella vicina (es. l'inizio di una firma): forse
@@ -2397,7 +2508,7 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 st = SEGNO          # parte di un timbro o di una firma del pie' di pagina
             states[f] = st
         fbox = grid.cell(g, "firma")
-        st = _cell_state_signature(gray, fbox)
+        st = _faint_mark(_cell_state_signature(gray, fbox), marks, g, "firma")
         share = foreign.share(fbox) if foreign is not None and st != VUOTA else 0.0
         if st != VUOTA and _inside_stamp(gray, fbox, stamps):
             st = TIMBRO
@@ -2438,7 +2549,17 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
             else:
                 source = foreign_gray       # scrittura vera rimasta: letta e segnalata
         elif st == TESTO and marks.empty(g, "note"):
-            st = VUOTA          # solo code di firme, linee o tratti delle righe vicine
+            # solo code di firme, linee o tratti delle righe vicine; ma se cio' che e' stato
+            # attribuito alle celle vicine e' una scrittura consistente (una parola staccata
+            # di poco dalla firma, es. "FERIE" subito dopo la firma, presa per la sua
+            # continuazione in corsivo) la nota si legge e si segnala, mai persa in silenzio
+            c = grid.col_index("note")
+            whole = clean_crop(gray, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]),
+                               extend=(0.3, 0.5))
+            if whole is not None and _substantial_note(whole, rh):
+                flags["note"] = "attribuzione"
+            else:
+                st = VUOTA
         if st == TESTO and states["firma"] != VUOTA and source is gray:
             if notes_gray is None:
                 notes_gray = gray.copy()
@@ -2524,8 +2645,12 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
         end = min(_label_end(gray, lab_box, rh), int(grid.col_x[0] + (COORD_LABEL_END + 0.08) * tw))
         end = max(end, int(grid.col_x[0] + (COORD_LABEL_END - 0.12) * tw))
         cbox = _clip_box((end + 0.15 * rh, ty0, grid.col_x[-1], ty1), W, H)
-        _r, comps = _components(gray, cbox, rh, rows=(ty0, ty1), cols=(grid.col_x[-1],))
-        plan.firma_coordinatore = _signature_like(comps, rh)
+        own, foreign = _owned_components(gray, cbox, rh, th, rows=(ty0, ty1, ty1 + th), cols=(grid.col_x[-1],))
+        plan.firma_coordinatore = _signature_like(own, rh)
+        # tratti che vengono da fuori (la firma del referente che sale nella riga, il
+        # timbro che la copre): non sono la firma del coordinatore ma la rendono dubbia
+        plan.firma_coordinatore_incerta = _signature_like(foreign, rh) or any(
+            _overlap(cbox, sb) > 0.15 for sb in stamps)
         # timbro e firma del referente: riquadro sotto la riga dei totali (o timbro che la sovrasta)
         rbox_full = _clip_box((grid.col_x[6], ty1 + 0.08 * th, grid.col_x[-1], ty1 + 1.05 * th), W, H)
         end = min(_label_end(gray, rbox_full, rh), int(grid.col_x[0] + (REFERENT_LABEL_END + 0.08) * tw))
@@ -2587,34 +2712,47 @@ def _time_plausible(m: int | None) -> bool:
     return m is not None and ORARIO_LIMITE[0] <= m <= ORARIO_LIMITE[1]
 
 
-# Distribuzione dei minuti della pagina (00/30/15-45): pseudo-conteggi della
+# Distribuzione dei minuti della pagina (00/30/15-45/altri): pseudo-conteggi della
 # preferenza generica, aggiornati con i minuti letti con sicurezza sulla pagina
-# (chi scrive solo orari tondi rende piu' sospetto un "8:30"; chi usa le mezz'ore no).
+# (chi scrive solo orari tondi rende piu' sospetto un "8:30"; chi usa le mezz'ore no;
+# chi lavora "8:10 - 13:10" rende normali i minuti 10).
 MINUTI_PSEUDO = {0: 3.0, 30: 2.0, 15: 0.5, 45: 0.5}
+MINUTI_PSEUDO_ALTRI = 0.02     # minuti non a quarti d'ora (05, 10, 20...)
 MINUTI_MIN_LOG = -2.5
+MINUTI_MIN_LOG_ALTRI = -3.5    # minuti non a quarti mai letti con sicurezza sulla pagina
+MINUTI_IN_USO = 3              # letture sicure con gli stessi minuti per considerarli "in uso"
 
 
 def page_minute_prior(minutes: Iterable[int]) -> Callable[[str], float]:
     """Preferenza (log, 0 per i minuti piu' probabili) per i minuti degli orari,
     adattata ai minuti letti con sicurezza sulla pagina."""
-    counts = dict(MINUTI_PSEUDO)
+    counts = {m: MINUTI_PSEUDO.get(m, MINUTI_PSEUDO_ALTRI) for m in range(0, 60, TIME_STEP)}
+    seen: dict[int, int] = {}
     for m in minutes:
         if m in counts:
-            counts[m] += 1.0
+            seen[m] = seen.get(m, 0) + 1
+    for m, n in seen.items():
+        # i minuti non a quarti contano solo se ricorrono (una lettura isolata di "8:10"
+        # e' piu' spesso un 8:00 letto male che un orario davvero sfalsato)
+        if m in MINUTI_PSEUDO or n >= MINUTI_IN_USO:
+            counts[m] += float(n)
     # l'ora piena non e' mai penalizzata (e' la scrittura piu' comune in generale): sulle
     # pagine con molte mezz'ore le mezz'ore smettono di esserlo, su quelle senza lo diventano di piu'
-    table = {m: 0.0 if m == 0 else max(MINUTI_MIN_LOG, min(0.0, math.log(c / counts[0])))
+    table = {m: 0.0 if m == 0 else max(MINUTI_MIN_LOG if (m in MINUTI_PSEUDO or counts[m] >= MINUTI_IN_USO)
+                                       else MINUTI_MIN_LOG_ALTRI, min(0.0, math.log(c / counts[0])))
              for m, c in counts.items()}
 
     def prior(value: str) -> float:
         m = _time_minutes(value)
         if m is None:
             return 0.0
-        s = table.get(m % 60, MINUTI_MIN_LOG)
+        s = table.get(m % 60, MINUTI_MIN_LOG_ALTRI)
         if not ORARIO_PIENO[0] <= m <= ORARIO_PIENO[1]:
             s += W_ORARIO_BORDO if _time_plausible(m) else W_ORARIO_FUORI
         return s
 
+    # minuti che sulla pagina sono una scrittura normale (quarti d'ora e minuti ricorrenti)
+    prior.in_uso = frozenset(m for m, v in table.items() if v > MINUTI_MIN_LOG_ALTRI)  # type: ignore[attr-defined]
     return prior
 
 
@@ -2912,8 +3050,12 @@ def _note_field(reading: Reading | None, aspect: float | None = None) -> _Field:
     if exact is not None:
         return _Field(value=str(exact), confidence=conf, incerto=fixed > 0 or conf < NOTA_CONF)
     alnum = re.sub(r"[^A-Z0-9ÀÈÉÌÒÙ]", "", fixed_text)
-    if len(alnum) < NOTA_MIN_CARATTERI and not (total and fixed == 0 and all(
-            re.sub(r"[^A-Z0-9]", "", w) in NOTE_PAROLE for w in fixed_text.split())):
+    words = [re.sub(r"[^A-Z0-9]", "", w) for w in fixed_text.split()]
+    # una nota di sole parole "vuote" ("IL", "DI LA"): una barra o una coda di firma letta
+    # come parola, non una nota
+    vuota = bool(words) and all(w in PAROLE_VUOTE for w in words)
+    if len(alnum) < NOTA_MIN_CARATTERI and not (total and fixed == 0 and not vuota and all(
+            w in NOTE_PAROLE for w in words)):
         # segno breve fuori vocabolario: non e' una nota leggibile; ma se la lettura vincolata
         # indica con una certa fiducia una nota breve del vocabolario ("104" letto "1oh") la
         # si propone, da verificare
@@ -2939,7 +3081,8 @@ def _note_field(reading: Reading | None, aspect: float | None = None) -> _Field:
     if best is not None and sim >= SIMILE_NOTA:
         return _Field(value=best, confidence=min(conf, sim), incerto=True)
     # i numeri (protocolli, date) si leggono male facilmente: sempre da verificare
-    sure = total > 0 and known == total and conf >= NOTA_CONF and not re.search(r"\d", fixed_text)
+    sure = (total > 0 and known == total and conf >= NOTA_CONF and not re.search(r"\d", fixed_text)
+            and not vuota)
     return _Field(value=fixed_text, confidence=conf, incerto=not sure)
 
 
@@ -3128,8 +3271,10 @@ def _admissible(f: str, value: Any) -> bool:
 
 
 def _doubt_reasons(f: str, v: Any, ev: Evidence, p: float, values: dict[str, Any],
-                   column_values: list[Any]) -> set[str]:
-    """Motivi per cui il valore ``v`` scelto per il campo ``f`` va verificato."""
+                   column_values: list[Any], minuti: Iterable[int] | None = None) -> set[str]:
+    """Motivi per cui il valore ``v`` scelto per il campo ``f`` va verificato.
+
+    ``minuti``: minuti degli orari "normali" sulla pagina (default: i quarti d'ora)."""
     reasons: set[str] = set()
     if ev.coverage < P_LEGGIBILE:
         reasons.add("dedotto")            # la scrittura somiglia poco a qualsiasi valore ammesso
@@ -3146,10 +3291,15 @@ def _doubt_reasons(f: str, v: Any, ev: Evidence, p: float, values: dict[str, Any
     if dom is not None and dom != v and ev.p(dom) >= P_ALTERNATIVA:
         reasons.add("colonna")            # diverso dal valore abituale della colonna, che e' fra le letture
     if ev.free_value is not None and ev.free_value != v:
-        # la lettura libera indica un altro valore: ammesso dal modulo (es. 11:30 invece
-        # di 11:00) oppure no (es. 11:10, minuti non a quarti d'ora: piu' probabilmente
-        # una cifra letta male)
-        reasons.add("lettura_libera" if _admissible(f, ev.free_value) else "lettura_libera_anomala")
+        # la lettura libera indica un altro valore: normale sulla pagina (es. 11:30 invece
+        # di 11:00; 11:10 dove i minuti 10 ricorrono) oppure no (es. 11:10 dove nessuno
+        # scrive i minuti 10: piu' probabilmente una cifra letta male)
+        normale = _admissible(f, ev.free_value)
+        if normale and f in TIME_FIELDS:
+            m = _time_minutes(ev.free_value)
+            normale = m is not None and m % 60 in (frozenset(minuti) if minuti is not None
+                                                   else frozenset(MINUTI_PSEUDO))
+        reasons.add("lettura_libera" if normale else "lettura_libera_anomala")
     twin = _TWIN.get(f)
     tv = values.get(twin) if twin else None
     if tv is not None and tv != v and ev.p(tv) >= P_ALTERNATIVA:
@@ -3353,10 +3503,15 @@ def _value_digits(f: str, v: Any) -> set[str]:
     return set()
 
 
-def _free_digits_conflict(f: str, v: Any, reading: Reading | None) -> bool:
+def _free_digits_conflict(f: str, v: Any, reading: Reading | None,
+                          minuti: Iterable[int] | None = None) -> bool:
     """La lettura libera mostra almeno tre cifre incompatibili con il valore
     scelto (es. "10/3" -> 1 0 3 contro 10:00): le cifre lette indicano un altro
-    orario, anche se la lettura libera nel suo insieme non e' interpretabile."""
+    orario, anche se la lettura libera nel suo insieme non e' interpretabile.
+
+    ``minuti``: minuti "normali" sulla pagina (default: i quarti d'ora). Un "11.10"
+    su una pagina dove nessuno scrive i minuti 10 e' un 11:00 letto male, non un
+    altro orario; dove i minuti 10 ricorrono e' un orario diverso."""
     if reading is None or f not in TIME_FIELDS or not reading.free_text:
         return False
     digits = time_lexicon().signature(_key(reading.free_text))
@@ -3367,7 +3522,10 @@ def _free_digits_conflict(f: str, v: Any, reading: Reading | None) -> bool:
         return False
     # conta solo se le cifre lette corrispondono a un altro orario ammesso ("1660" non
     # e' un orario: e' solo "16:00" letto male e non indica un valore diverso)
+    ammessi = frozenset(minuti) if minuti is not None else frozenset(MINUTI_PSEUDO)
     for minutes in range(TIME_MIN, TIME_MAX + 1, TIME_STEP):
+        if minutes % 60 not in ammessi:
+            continue
         other = f"{minutes // 60:02d}:{minutes % 60:02d}"
         if other != v and any(c.startswith(digits) or digits.startswith(c) for c in _value_digits(f, other)):
             return True
@@ -3537,7 +3695,7 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
             setattr(row, f, v)
             row.confidenza[f] = round(p, 3)
             confs.append(p)
-            reasons = _doubt_reasons(f, v, ev, p, values, column[f])
+            reasons = _doubt_reasons(f, v, ev, p, values, column[f], getattr(t_prior, "in_uso", None))
             twin = _TWIN.get(f)
             if twin in cells and twin in values and cells[twin].options:
                 # la cella gemella e' stata riportata a un valore diverso dalla sua lettura
@@ -3550,7 +3708,7 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
             key = f"rows.{g}.{f}"
             if _short_form(f, v, readings.get(key), plan.aspect.get(key)):
                 reasons.add("forma_corta")
-            if _free_digits_conflict(f, v, readings.get(key)):
+            if _free_digits_conflict(f, v, readings.get(key), getattr(t_prior, "in_uso", None)):
                 reasons.add("cifre_diverse")
             states[(g, f)] = _CellState(g, f, v, ev, reasons, row.assenza_alunno)
         # coerenza e plausibilita' della riga, segni sul foglio (barrature, "/")
@@ -3584,6 +3742,7 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
     # conferma per coerenza: celle incerte solo per la scarsa leggibilita' il cui
     # valore e' quello preferito dalla lettura *e* coincide con quanto imposto
     # dalle celle sicure della stessa riga (es. uscita = entrata + ore)
+    _flag_minute_lookalikes(plan, states)
     solid0 = {k for k, cs in states.items() if not cs.reasons}
     _flag_weekly_outliers(states, solid0)
     _flag_schedule_plausibility(states, solid0)
@@ -3688,20 +3847,104 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
 
 
 def _lonely_marks(row: DayRow, states: dict[str, str]) -> list[str]:
-    """Firme e crocette di una riga senza orari, ore, trattini e note (nessuna
-    scrittura nelle celle di testo): un segno isolato e' sospetto.
+    """Firme e crocette di una riga senza alcun valore sicuro (orari, ore, nota):
+    un segno isolato e' sospetto.
 
-    Una nota letta con incertezza non conta come contenuto della riga: spesso e'
-    proprio un pezzo del timbro o della firma del pie' di pagina che ha prodotto
-    anche il falso segno."""
+    Vale anche per le righe con scrittura solo dubbia: le righe "annullate" con una
+    barra in ogni cella (giorno non lavorato) hanno barre anche nella colonna della
+    firma e delle assenze, che sembrano una firma o una crocetta; e una nota letta con
+    incertezza spesso e' proprio un pezzo del timbro o della firma del pie' di pagina
+    che ha prodotto anche il falso segno."""
     nota_sicura = bool(row.note) and "note" not in row.incerti and "note" not in row.illeggibili
-    if nota_sicura or row.trattino_effettivo:
+    if nota_sicura:
         return []
-    if any(states.get(f) in (TESTO, TRATTINO, NULLO) for f in TEXT_FIELDS):
-        return []
-    if any(getattr(row, f) is not None for f in TEXT_FIELDS):
+    if any(getattr(row, f) is not None and f not in row.incerti and f not in row.illeggibili
+           for f in TEXT_FIELDS):
         return []
     return [f for f in ("firma", "assenza_alunno", "assenza_operatore") if getattr(row, f)]
+
+
+# Coerenza della grafia dei minuti: chi scrive "00" lo scrive sempre allo stesso modo.
+# TrOCR legge a volte con sicurezza "13:30" uno "13:00" scritto con gli zeri a ricciolo
+# ("13:ↄↄ") e la riga resta coerente (anche l'entrata diventa ":30"); la scrittura dei
+# minuti di quella cella pero' somiglia a quella delle celle lette ":00".
+GRAFIA_PARTE_MINUTI = 0.42      # parte destra della scrittura confrontata (frazione della larghezza)
+GRAFIA_VICINI = 3               # celle piu' somiglianti (di altre righe) consultate
+GRAFIA_MIN_CELLE = 8            # orari letti sulla pagina perche' il confronto abbia senso
+GRAFIA_SIMILE = 0.5             # somiglianza minima (correlazione) per contare una cella come "uguale"
+
+
+def _glyph(img: np.ndarray | None, right: float = 1.0) -> np.ndarray | None:
+    """Impronta della scrittura di un ritaglio (con ``right`` < 1 solo la parte destra:
+    i minuti di un orario)."""
+    if img is None or img.size == 0:
+        return None
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.nonzero(gray < 160)
+    if xs.size < 20:
+        return None
+    x1 = int(xs.max()) + 1
+    w = x1 - int(xs.min())
+    sub = gray[int(ys.min()):int(ys.max()) + 1, x1 - max(1, int(round(right * w))):x1]
+    if sub.size == 0:
+        return None
+    v = cv2.resize(255 - sub, (32, 20), interpolation=cv2.INTER_AREA).astype(np.float32)
+    v = cv2.GaussianBlur(v, (3, 3), 0).ravel()
+    v -= v.mean()
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0 else None
+
+
+def _minute_glyph(img: np.ndarray | None) -> np.ndarray | None:
+    return _glyph(img, GRAFIA_PARTE_MINUTI)
+
+
+def _flag_lookalikes(cells: list[tuple[int, str, Any]], feats: list[np.ndarray]) -> list[int]:
+    """Indici delle celle il cui valore e' diverso da quello su cui concorda la maggioranza
+    delle celle (di altre righe) con la scrittura piu' simile."""
+    if len(cells) < GRAFIA_MIN_CELLE:
+        return []
+    F = np.stack(feats)
+    sim = F @ F.T
+    out: list[int] = []
+    for i, (g, _f, own) in enumerate(cells):
+        near = [j for j in np.argsort(-sim[i]) if cells[j][0] != g][:GRAFIA_VICINI]
+        if len(near) < GRAFIA_VICINI:
+            continue
+        vals = [cells[j][2] for j in near if sim[i][j] >= GRAFIA_SIMILE]
+        if not vals:
+            continue
+        top = max(set(vals), key=vals.count)
+        if top != own and vals.count(top) * 2 > GRAFIA_VICINI:
+            out.append(i)
+    return out
+
+
+def _flag_minute_lookalikes(plan: PagePlan, states: dict[tuple[int, str], _CellState]) -> list[tuple[int, str]]:
+    """Segnala (senza cambiarlo) l'orario i cui minuti sono diversi da quelli delle celle
+    di altre righe con la scrittura piu' simile (la maggioranza delle piu' simili concorda
+    su minuti diversi). Motivo non superabile dalla coerenza della riga: lo stesso errore
+    di lettura sposta di solito insieme entrata e uscita.
+
+    (Per le ore scritte lo stesso confronto non serve: cifre diverse si somigliano poco e
+    i valori unici sulla pagina darebbero solo falsi allarmi.)"""
+    images = {r.key: r.image for r in plan.requests}
+    cells: list[tuple[int, str, Any]] = []
+    feats: list[np.ndarray] = []
+    for (g, f), cs in states.items():
+        if f not in TIME_FIELDS:
+            continue
+        m = _time_minutes(cs.value)
+        fv = _minute_glyph(images.get(f"rows.{g}.{f}")) if m is not None else None
+        if fv is not None:
+            cells.append((g, f, m % 60))
+            feats.append(fv)
+    out: list[tuple[int, str]] = []
+    for i in _flag_lookalikes(cells, feats):
+        g, f, _v = cells[i]
+        states[(g, f)].reasons.add("grafia_minuti")
+        out.append((g, f))
+    return sorted(out)
 
 
 FUORI_INTERVALLO_MIN = 90      # minuti oltre il minimo/massimo degli altri orari sicuri
@@ -3825,6 +4068,8 @@ def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[Da
     if plan.sostituzione_incerta:
         header.incerti.append("sostituzione")
     header.firma_coordinatore = plan.firma_coordinatore
+    if plan.firma_coordinatore_incerta:
+        header.incerti.append("firma_coordinatore")
     header.timbro_referente = plan.timbro_referente
     if plan.totale_ink:
         ev = evidence(readings.get("footer.totale"), total_lexicon(), "hours", _hours_prior)

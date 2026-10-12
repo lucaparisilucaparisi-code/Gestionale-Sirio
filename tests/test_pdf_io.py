@@ -82,6 +82,24 @@ def test_pdf_custom_dpi(sheet):
     assert abs(img.shape[1] - 827) <= 2 and abs(img.shape[0] - 1169) <= 2
 
 
+def test_pdf_physically_huge_page_is_rendered_at_a4_size(sheet):
+    import pymupdf
+
+    # scansione impaginata a 72 dpi: pagina "di 66 x 94 cm" con l'immagine a piena pagina
+    h, w = sheet.shape[:2]
+    ok, png = cv2.imencode(".png", sheet)
+    assert ok
+    doc = pymupdf.open()
+    page = doc.new_page(width=w * 0.75, height=h * 0.75)
+    page.insert_image(page.rect, stream=png.tobytes())
+    data = doc.tobytes()
+    doc.close()
+    (_, img), = list(pdf_io.iter_pages(data, "grande.pdf", dpi=300))
+    # non oltre un A4 a 300 dpi (con il margine delle immagini), proporzioni conservate
+    assert img.shape[0] * img.shape[1] <= 2481 * 3508 * 1.6 * 1.01
+    assert abs(img.shape[0] / img.shape[1] - h / w) < 0.01
+
+
 def test_pdf_page_rotation_is_applied(sheet):
     import pymupdf
 

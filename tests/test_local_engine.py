@@ -19,6 +19,7 @@ import os
 from datetime import date
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -129,7 +130,8 @@ def test_time_lexicon_forms_and_tolerances():
     # fuori dai vincoli del modulo
     assert lex.value("5:00") is None          # prima delle 06:00
     assert lex.value("21:00") is None         # dopo le 20:00
-    assert lex.value("8:10") is None          # minuti non a quarti d'ora
+    assert lex.value("8:10") == "08:10"        # minuti non a quarti d'ora (orari sfalsati)
+    assert lex.value("8:07") is None          # minuti non multipli di 5
     assert lex.value("Atlas") is None
     assert lex.is_prefix("8:") and lex.is_prefix("1") and not lex.is_prefix("8:7")
     assert lex.signature("8.00") == lex.signature("8:00") == lex.signature("8:OO")
@@ -1516,6 +1518,72 @@ def test_signature_on_row_with_only_an_uncertain_note_is_flagged():
     assert le._lonely_marks(sicura, st) == []
     compilata = DayRow(giorno=30, firma=True, prog_entrata="08:00", note="X", incerti=["note"])
     assert le._lonely_marks(compilata, {**st, "prog_entrata": le.TESTO}) == []
+
+
+def test_marks_on_a_row_with_only_doubtful_values_are_flagged():
+    """Riga "annullata" con una barra in ogni cella: le barre nelle colonne di orari
+    sono lette come valori dubbi, quella nella colonna della firma sembra una firma.
+    Senza almeno un valore sicuro nella riga, firma e crocette sono da verificare."""
+    from sirio.models import DayRow
+
+    st = {"prog_entrata": le.NULLO, "ore_dichiarate": le.TESTO, "firma": le.FIRMA,
+          "assenza_operatore": le.CROCETTA}
+    barrata = DayRow(giorno=14, ore_dichiarate=1.0, firma=True, assenza_operatore=True,
+                     incerti=["ore_dichiarate"])
+    assert le._lonely_marks(barrata, st) == ["firma", "assenza_operatore"]
+    solo_trattini = DayRow(giorno=15, firma=True, trattino_effettivo=True)
+    assert le._lonely_marks(solo_trattini, {"eff_entrata": le.TRATTINO, "firma": le.FIRMA}) == ["firma"]
+    lavorata = DayRow(giorno=16, prog_entrata="08:00", eff_entrata="09:00", firma=True,
+                      incerti=["eff_entrata"])
+    assert le._lonely_marks(lavorata, {"prog_entrata": le.TESTO, "firma": le.FIRMA}) == []
+
+
+def test_minutes_off_the_quarter_hour_are_read_when_the_page_uses_them():
+    """Chi lavora "8:10 - 13:10": i minuti 10 sono ammessi e, se ricorrono sulla pagina,
+    una lettura libera "13.10" contro un 13:30 scelto e' un orario diverso (segnalato).
+    Su una pagina dove nessuno scrive i minuti 10, "11.10" resta una cifra letta male."""
+    prior = le.page_minute_prior([10, 10, 10, 10, 0, 0])
+    assert 10 in prior.in_uso and prior("08:10") > le.MINUTI_MIN_LOG_ALTRI
+    generic = le.page_minute_prior([10, 0, 0])            # una sola lettura: non "in uso"
+    assert 10 not in generic.in_uso and generic("08:10") <= le.MINUTI_MIN_LOG_ALTRI
+    assert generic("08:00") > generic("08:30") > generic("08:10")
+    r = le.Reading([("13:30", -0.1)], "13.10", -0.2, 4)
+    assert le._free_digits_conflict("prog_uscita", "13:30", r, prior.in_uso)
+    assert not le._free_digits_conflict("prog_uscita", "13:30", r, generic.in_uso)
+
+
+def _glyph_image(text: str, seed: int) -> np.ndarray:
+    """Ritaglio di un orario "scritto" con un tratto leggermente diverso a ogni seme."""
+    rng = np.random.default_rng(seed)
+    img = np.full((60, 200), 255, np.uint8)
+    cv2.putText(img, text, (8 + int(rng.integers(0, 6)), 45 + int(rng.integers(-3, 3))),
+                cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.3, 0, 2 + int(rng.integers(0, 2)))
+    return img
+
+
+def test_minutes_written_like_the_others_but_read_differently_are_flagged():
+    """Stessa grafia dei minuti di tutte le altre celle lette ":00", ma letta ":30"
+    (zeri a ricciolo letti come "30"): segnalata anche se la riga e' coerente; i
+    minuti ":30" scritti davvero diversi non lo sono."""
+    plan = _plan_with({})
+    states = {}
+    for g in range(2, 12):
+        for f in ("prog_entrata", "prog_uscita"):
+            vero = "11:00" if f == "prog_entrata" else "13:00"
+            letto = "13:30" if (g, f) == (5, "prog_uscita") else vero
+            plan.requests.append(le.ReadRequest(f"rows.{g}.{f}", _glyph_image(vero.replace(":", "."), g)))
+            ev = le.Evidence([(letto, 0.0)], 1.0)
+            states[(g, f)] = le._CellState(g, f, letto, ev, set())
+    flagged = le._flag_minute_lookalikes(plan, states)
+    assert flagged == [(5, "prog_uscita")] and "grafia_minuti" in states[(5, "prog_uscita")].reasons
+    # pagina con mezz'ore vere (scritte "30"): nessun segnale
+    plan2 = _plan_with({})
+    states2 = {}
+    for g in range(2, 12):
+        v = "11:30" if g % 2 else "11:00"
+        plan2.requests.append(le.ReadRequest(f"rows.{g}.prog_entrata", _glyph_image(v.replace(":", "."), g)))
+        states2[(g, "prog_entrata")] = le._CellState(g, "prog_entrata", v, le.Evidence([(v, 0.0)], 1.0), set())
+    assert le._flag_minute_lookalikes(plan2, states2) == []
 
 
 def test_time_far_outside_the_sheet_range_is_flagged_not_changed():
