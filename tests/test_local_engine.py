@@ -1696,6 +1696,31 @@ def test_halftone_dots_do_not_join_writing():
     assert out.sum() == m[100:104, 50:350].sum()
 
 
+def test_halftone_photocopy_is_descreened_before_the_analysis():
+    """Fotocopia con il fondino retinato (puntini fitti su tutta la tabella): riconosciuta e
+    "deretinata", le righe vuote restano vuote e quelle scritte restano scritte; una pagina
+    normale non viene toccata."""
+    page, grid, truth = _synthetic(0)
+    gray = cv2.cvtColor(page, cv2.COLOR_BGR2GRAY)
+    assert not le.is_halftone(gray, grid)
+    screened = page.copy()
+    step = max(4, int(round(grid.row_height / 9)))
+    ys, xs = np.mgrid[0:page.shape[0]:step, 0:page.shape[1]:step]
+    for y, x in zip(ys.ravel(), xs.ravel()):
+        cv2.circle(screened, (int(x), int(y)), 1, (90, 90, 90), -1)
+    assert le.is_halftone(cv2.cvtColor(screened, cv2.COLOR_BGR2GRAY), grid)
+    plan = le.plan_page(screened, grid)
+    assert any("retinato" in n for n in plan.notes)
+    rows = {r["giorno"]: r for r in truth["rows"]}
+    empty = [g for g, r in rows.items() if not any(r.get(f) for f in (*le.TEXT_FIELDS, "firma"))]
+    written = [g for g, r in rows.items() if r.get("prog_entrata") and r.get("firma")]
+    assert empty and written
+    for g in empty:
+        assert plan.cells[g]["firma"] == le.VUOTA and plan.cells[g]["prog_entrata"] == le.VUOTA, g
+    for g in written:
+        assert plan.cells[g]["prog_entrata"] == le.TESTO and plan.cells[g]["firma"] != le.VUOTA, g
+
+
 def test_time_far_outside_the_sheet_range_is_flagged_not_changed():
     """Un orario sicuro molto fuori dall'intervallo di tutti gli altri orari sicuri del
     foglio (es. "16:00" dove nessun altro supera le 14:00) e' segnalato, mai cambiato;

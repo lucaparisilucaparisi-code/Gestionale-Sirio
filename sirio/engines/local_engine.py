@@ -1739,6 +1739,8 @@ def _components(gray: np.ndarray, box: Box, unit: float, rows: Sequence[float] =
 
 TIME_FIELDS = ("prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita")
 TEXT_FIELDS = (*TIME_FIELDS, "ore_dichiarate")
+_COPPIA = {"prog_entrata": "prog_uscita", "prog_uscita": "prog_entrata",
+           "eff_entrata": "eff_uscita", "eff_uscita": "eff_entrata"}
 
 # Stati delle celle dopo l'analisi dell'inchiostro.
 VUOTA, TESTO, TRATTINO, CROCETTA, FIRMA, SEGNO, TIMBRO, NULLO = (
@@ -2208,6 +2210,7 @@ LINEA_MIN_ALTEZZA = 0.22    # altezza minima (altezze di riga) di ognuna delle d
 LINEA_MIN_LARGHEZZA = 1.0   # larghezza minima (altezze di riga) di ognuna delle due righe
 LINEA_VALLE = 0.15          # profilo nella valle fra le righe rispetto al picco della riga piu' debole
 ORARI_DUE_RIGHE_LARGHEZZA = 0.6   # larghezza minima (righe) di ognuno dei due orari in una cella
+ORARI_DUE_RIGHE_ALTEZZA = 0.25    # altezza minima (righe) di ognuno: i pezzi delle righe vicine sono piu' bassi
 
 
 def _note_reading(readings: dict[str, Reading], g: int) -> Reading | None:
@@ -2235,6 +2238,12 @@ NOTA_BREVE_LARGHEZZA = 0.8     # nota breve di tre segni ("104": circa 1-1,5 rig
 
 
 NOTA_OLTRE_FIRMA = 2.5      # righe: scrittura nelle Note piu' lunga di qualsiasi coda di firma
+
+
+def _ink_height(crop: np.ndarray) -> int:
+    """Altezza (pixel) dell'inchiostro di un ritaglio pulito."""
+    rows = np.nonzero((crop < 160).any(axis=1))[0]
+    return int(rows[-1] - rows[0] + 1) if rows.size else 0
 
 
 def _ink_width(crop: np.ndarray) -> int:
@@ -2468,8 +2477,44 @@ class PageMarks:
         return float(np.percentile(paper - sub[m], 90))
 
 
+# Fotocopie con il fondino retinato (puntini fitti su tutta la pagina): i puntini sembrano
+# inchiostro (firme, crocette, scrittura nelle righe vuote). Misurato: pagine retinate circa
+# 58 puntini per riga quadrata, tutte le altre meno di 3.
+RETINO_PUNTINI = 15.0
+
+
+def is_halftone(gray: np.ndarray, grid: TableGrid) -> bool:
+    """True se la tabella e' coperta da un retino di puntini (fotocopia retinata)."""
+    rh = grid.row_height
+    region = gray[max(0, grid.row_y[0]):max(0, grid.row_y[-1]), max(0, grid.col_x[1]):max(0, grid.col_x[-1])]
+    if region.size == 0 or rh <= 4:
+        return False
+    m = region < _ink_threshold(_paper_level(region))
+    n, _lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return False
+    tiny = int((st[1:, cv2.CC_STAT_AREA] < (STRUTTURA_PUNTINO * rh) ** 2).sum())
+    return tiny / (region.shape[0] * region.shape[1] / (rh * rh)) >= RETINO_PUNTINI
+
+
+def descreen(img: np.ndarray, grid: TableGrid) -> np.ndarray:
+    """Toglie il retino: sfocatura alla scala dei puntini e sfondo locale riportato a
+    carta bianca (il retino diventa carta, la scrittura resta piu' scura)."""
+    gray = to_gray(img)
+    rh = grid.row_height
+    blur = cv2.GaussianBlur(gray, (0, 0), max(1.0, 0.025 * rh))
+    k = max(9, int(0.6 * rh) | 1)
+    bg = cv2.morphologyEx(blur, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+    bg = cv2.blur(bg, (k, k)).astype(np.float32)
+    out = np.clip(blur.astype(np.float32) / np.maximum(bg, 1.0) * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+
+
 def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
     """Analizza l'inchiostro della pagina e prepara i ritagli da leggere."""
+    retino = is_halftone(to_gray(img), grid)
+    if retino:
+        img = descreen(img, grid)
     gray0 = to_gray(img)
     H, W = gray0.shape[:2]
     rh = grid.row_height
@@ -2479,6 +2524,8 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
     # prima di ogni analisi delle celle e si ricorda quali celle attraversano
     marks = PageMarks(gray0, img, grid)
     gray = erase(gray0, marks.strikes.mask)
+    if retino:
+        plan.notes.append("Fotocopia con il fondino retinato: retino tolto prima della lettura.")
     if marks.n_strokes:
         plan.notes.append(f"Linee di barratura riconosciute e ignorate: {marks.n_strokes}.")
     if marks.creases:
@@ -2542,7 +2589,7 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 continue
             key = f"rows.{g}.{f}"
             lines = split_text_lines(crop, rh, min_width=ORARI_DUE_RIGHE_LARGHEZZA)
-            if len(lines) > 1:
+            if len(lines) > 1 and min(_ink_height(x) for x in lines) >= ORARI_DUE_RIGHE_ALTEZZA * rh:
                 # due fasce orarie nella stessa cella ("9:00" sopra "13:00"): l'entrata e'
                 # la prima, l'uscita l'ultima; le ore restano quelle scritte. Sempre da
                 # verificare (la riga non torna con le ore: c'e' una pausa in mezzo)
@@ -2824,7 +2871,7 @@ def _time_plausible(m: int | None) -> bool:
 MINUTI_PSEUDO = {0: 3.0, 30: 2.0, 15: 0.5, 45: 0.5}
 MINUTI_PSEUDO_ALTRI = 0.02     # minuti non a quarti d'ora (05, 10, 20...)
 MINUTI_MIN_LOG = -2.5
-MINUTI_MIN_LOG_ALTRI = -3.5    # minuti non a quarti mai letti con sicurezza sulla pagina
+MINUTI_MIN_LOG_ALTRI = -5.0    # minuti non a quarti mai letti con sicurezza sulla pagina
 MINUTI_IN_USO = 3              # letture sicure con gli stessi minuti per considerarli "in uso"
 
 
@@ -3692,6 +3739,10 @@ def row_doubts(values: dict[str, Any], assenza_alunno: bool = False, assenza_ope
             if abs(d_eff - ore) > 0.01 and not (assenza_alunno and ore < d_eff):
                 # non si sa quale lettura sia sbagliata: si verifica l'intera riga
                 add([*TIME_FIELDS, "ore_dichiarate"], "incoerente")
+            elif d_prog is not None and d_eff > d_prog + 0.01:
+                # lavorato piu' del programmato (8:00-9:00 programmato, 8:00-13:00 svolto):
+                # quasi sempre un orario programmato letto male
+                add(["prog_entrata", "prog_uscita"], "incoerente")
         elif d_prog is not None and not trattino:
             if ore > d_prog + 0.01 or (ore < d_prog - 0.01 and not (assenza_alunno or assenza_operatore)):
                 add(["prog_entrata", "prog_uscita", "ore_dichiarate"], "incoerente")
@@ -3715,12 +3766,19 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
     # minuti letti con sicurezza sulla pagina (preferenza per i minuti adattata alla grafia)
     sure_minutes: list[int] = []
     for g in range(1, 32):
+        tops: dict[str, int] = {}
         for f in TIME_FIELDS:
             if plan.cells.get(g, {}).get(f) == TESTO:
                 ev = evidence(readings.get(f"rows.{g}.{f}"), t_lex, "time")
                 m = _time_minutes(ev.top) if ev.options else None
                 if m is not None and ev.coverage >= 0.5 and ev.p(ev.top) >= 0.9:
-                    sure_minutes.append(m % 60)
+                    tops[f] = m % 60
+        for f, m in tops.items():
+            # minuti non a quarti d'ora: contano solo se anche l'altro orario della coppia li
+            # ha (orari sfalsati "8:10 - 13:10"); un "15:30" letto "15:50" accanto a un
+            # "13:30" non rende normali i minuti 50
+            if m in MINUTI_PSEUDO or tops.get(_COPPIA[f]) == m:
+                sure_minutes.append(m)
     t_prior = page_minute_prior(sure_minutes)
     evs: dict[int, dict[str, Evidence]] = {}
     for g in range(1, 32):
