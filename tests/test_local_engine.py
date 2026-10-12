@@ -1543,6 +1543,9 @@ def test_marks_on_a_row_with_only_doubtful_values_are_flagged():
     st2 = {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO, "firma": le.FIRMA}
     assert le._lonely_marks(difficile, st2, firma_vera=True) == []
     assert le._lonely_marks(difficile, st2, firma_vera=False) == ["firma"]
+    # ... ma se la "scrittura" degli orari sono barre (riga annullata con "/ / /"), no
+    barre = {"prog_entrata": "barretta", "prog_uscita": "barretta"}
+    assert le._lonely_marks(difficile, st2, firma_vera=True, flags=barre) == ["firma"]
     # riga senza scrittura nelle celle di orari: anche una firma vera e' isolata
     assert le._lonely_marks(DayRow(giorno=30, firma=True), {"firma": le.FIRMA}, firma_vera=True) == ["firma"]
 
@@ -1639,6 +1642,46 @@ def test_two_time_slots_in_one_cell_are_read_line_by_line():
     single = np.full((120, 220), 255, np.uint8)
     cv2.putText(single, "10.30", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 0, 3)
     assert len(le.split_text_lines(single, 120.0, min_width=le.ORARI_DUE_RIGHE_LARGHEZZA)) == 1
+
+
+def test_monthly_total_written_on_the_day_31_row():
+    """Casella del totale vuota e "28" nelle ore del giorno 31 (impossibile come ore di un
+    giorno): e' il totale mensile scritto una riga sopra, riportato come totale e da
+    verificare; un valore giornaliero plausibile resta invece le ore del giorno 31."""
+    plan = _plan_with({31: {"ore_dichiarate": le.TESTO}})
+    readings = {"rows.31.ore_dichiarate": le.Reading([], "28", -0.1, 2),
+                le.TOTALE_RIGA_31: le.Reading([(28.0, -0.05)], "28", -0.06, 2)}
+    res = le.assemble(plan, readings, _grid())
+    assert res.header.totale_mensile_dichiarato == 28.0 and "totale_mensile_dichiarato" in res.header.incerti
+    assert res.rows[30].ore_dichiarate is None and "ore_dichiarate" not in res.rows[30].illeggibili
+    plan2 = _plan_with({31: {"ore_dichiarate": le.TESTO}})
+    readings2 = {"rows.31.ore_dichiarate": le.Reading([(3.0, -0.05)], "3", -0.06, 2),
+                 le.TOTALE_RIGA_31: le.Reading([(3.0, -0.05)], "3", -0.06, 2)}
+    res2 = le.assemble(plan2, readings2, _grid())
+    assert res2.header.totale_mensile_dichiarato is None and res2.rows[30].ore_dichiarate == 3.0
+
+
+def test_header_number_read_as_split_digits_is_flagged():
+    """"13" letto come due segni staccati "1 2": il numero (12) non e' sicuro."""
+    plan = _plan_with({})
+    plan.header_ink["ore_pei"] = True
+    res = le.assemble(plan, {"header.ore_pei": le.Reading([(12.0, -0.001)], "1 2", -0.01, 3)}, _grid())
+    assert res.header.ore_pei == 12.0 and "ore_pei" in res.header.incerti
+    res = le.assemble(plan, {"header.ore_pei": le.Reading([(13.0, -0.001)], "13", -0.01, 2)}, _grid())
+    assert res.header.ore_pei == 13.0 and "ore_pei" not in res.header.incerti
+
+
+def test_hours_with_only_doubtful_times_are_flagged():
+    """Ore lette con sicurezza ma orari della riga tutti dubbi: le ore non hanno riscontro
+    (orari letti male che per caso tornano con le ore lette male)."""
+    plan = _plan_with({9: FULL_ROW})
+    readings = {**_row_readings(9, "16:00", "18:00", 2.0)}
+    for f in le.TIME_FIELDS:
+        readings[f"rows.9.{f}"] = _faint(readings[f"rows.9.{f}"].candidates[0][0], "11:00")
+    res = le.assemble(plan, readings, _grid())
+    row = res.rows[8]
+    assert all(f in row.incerti for f in le.TIME_FIELDS)
+    assert row.ore_dichiarate == 2.0 and "ore_dichiarate" in row.incerti
 
 
 def test_time_far_outside_the_sheet_range_is_flagged_not_changed():

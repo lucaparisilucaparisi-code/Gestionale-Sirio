@@ -1871,6 +1871,10 @@ def stamp_boxes(gray: np.ndarray, grid: TableGrid) -> list[Box]:
         x, y, w, h, area = (int(v) for v in stats[i])
         if not (w >= 1.5 * rh and h >= 1.5 * rh and 0.5 <= w / float(h) <= 2.0 and area >= 0.3 * w * h):
             continue
+        if h > TIMBRO_MAX_RIGHE * rh:
+            # macchia alta piu' di un timbro: fondino retinato della fotocopia o scrittura
+            # fusa, non un timbro (sotto un "timbro" note e firme non si leggono)
+            continue
         if y + h + zy0 < grid.row_y[-1] - TIMBRO_DAL_FONDO * rh:
             # lontano dal fondo della tabella: un blocco di note scritte su piu' righe
             # ("USCITO / PRIMA" in due giorni di fila), non il timbro della scuola
@@ -1885,6 +1889,7 @@ def stamp_boxes(gray: np.ndarray, grid: TableGrid) -> list[Box]:
 
 
 TIMBRO_DAL_FONDO = 3.0     # righe: un timbro arriva almeno fin qui dal fondo della tabella
+TIMBRO_MAX_RIGHE = 8.0     # righe: altezza massima di un timbro (misurati fino a 6)
 
 
 def _inside_stamp(gray: np.ndarray, box: Box, stamps: Sequence[Box]) -> bool:
@@ -2238,7 +2243,7 @@ SEGNO_SCURO_SICURO = 110.0  # sotto: segno troppo chiaro per essere sicuro (mati
 # tutte sotto 0,05.
 FIRMA_TRATTO = 0.12         # sotto: un tratto solo, non una firma (da verificare)
 FIRMA_VERA = 0.17           # da qui: forma di firma...
-FIRMA_SPESSORE = 0.10       # ... se anche fitta (spessore medio): le linee ondulate non lo sono (firme vere >= 0,117 nel 99%)
+FIRMA_SPESSORE = 0.11       # ... se anche fitta (spessore medio): le linee ondulate non lo sono (firme vere >= 0,117 nel 99%)
 CROCETTA_TRATTO = 0.08      # sotto: una barra, non una crocetta (da verificare)
 
 
@@ -2696,6 +2701,12 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
         plan.totale_ink = crop is not None
         if crop is not None:
             plan.requests.append(_text_request("footer.totale", crop, total_lexicon(), beams=6, max_tokens=6))
+        elif plan.cells.get(31, {}).get("ore_dichiarate") == TESTO:
+            # casella del totale vuota e scrittura nelle ore del giorno 31: spesso e' il totale
+            # mensile scritto una riga sopra (si decide in ``assemble`` dal valore letto)
+            r31 = next((r for r in plan.requests if r.key == "rows.31.ore_dichiarate"), None)
+            if r31 is not None:
+                plan.requests.append(ReadRequest(TOTALE_RIGA_31, r31.image, total_lexicon(), beams=6, max_tokens=6))
         th = ty1 - ty0
         tw = grid.col_x[-1] - grid.col_x[0]
         # firma del coordinatore: a destra dell'etichetta, nella riga dei totali
@@ -3859,15 +3870,16 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
         st = plan.cells.get(row.giorno, {})
         # firma o crocetta in una riga senza orari, ore e note: segno isolato (timbro,
         # firma del pie' di pagina, piega, macchia): mai sicuro
-        for f in _lonely_marks(row, st, row.giorno in plan.firme_vere):
+        for f in _lonely_marks(row, st, row.giorno in plan.firme_vere, plan.flags.get(row.giorno)):
             if f not in row.incerti and f not in row.illeggibili:
                 row.incerti.append(f)
                 row.confidenza[f] = min(row.confidenza.get(f, 0.5), 0.5)
-        if (row.ore_dichiarate and "ore_dichiarate" not in row.incerti
-                and all(getattr(row, f) is None for f in TIME_FIELDS)
-                and not any(st.get(f) == TESTO for f in TIME_FIELDS)):
-            # ore (diverse da zero) in una riga senza alcun orario: nessun riscontro
-            # possibile ("0" della riga annullata letto "3")
+        if row.ore_dichiarate and "ore_dichiarate" not in row.incerti and not any(
+                getattr(row, f) is not None and f not in row.incerti and f not in row.illeggibili
+                for f in TIME_FIELDS):
+            # ore (diverse da zero) senza alcun orario sicuro nella riga: nessun riscontro
+            # possibile ("0" della riga annullata letto "3"; "1" letto "2" con orari tutti
+            # dubbi che per caso tornano con il "2")
             row.incerti.append("ore_dichiarate")
     if _flag_difficult_page(rows):
         extra_notes.append("Scrittura difficile per il motore: quasi tutti gli orari e le ore della pagina "
@@ -3913,7 +3925,8 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
     )
 
 
-def _lonely_marks(row: DayRow, states: dict[str, str], firma_vera: bool = False) -> list[str]:
+def _lonely_marks(row: DayRow, states: dict[str, str], firma_vera: bool = False,
+                  flags: dict[str, str] | None = None) -> list[str]:
     """Firme e crocette di una riga senza alcun valore sicuro (orari, ore, nota):
     un segno isolato e' sospetto.
 
@@ -3931,7 +3944,9 @@ def _lonely_marks(row: DayRow, states: dict[str, str], firma_vera: bool = False)
            for f in TEXT_FIELDS):
         return []
     marks = [f for f in ("firma", "assenza_alunno", "assenza_operatore") if getattr(row, f)]
-    scritta = any(states.get(f) == TESTO for f in TEXT_FIELDS)
+    # scrittura vera nelle celle di orari e ore: non barre ("/" di una riga annullata)
+    flags = flags or {}
+    scritta = any(states.get(f) == TESTO and flags.get(f) not in ("barretta", "barrato") for f in TEXT_FIELDS)
     if firma_vera and scritta:
         marks = [f for f in marks if f != "firma"]
     return marks
@@ -4123,6 +4138,9 @@ def _flag_all(row: DayRow | None, header: Header | None) -> None:
                 header.incerti.append(f)
 
 
+TOTALE_RIGA_31 = "footer.totale_riga31"
+
+
 def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[DayRow],
                      confs: list[float]) -> Header:
     header = Header()
@@ -4141,6 +4159,11 @@ def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[Da
         # numeri brevi scritti a mano: "1" e "11", "8" e "3" si confondono facilmente;
         # nessun contesto li conferma, quindi basta un'alternativa plausibile per segnalarli
         fld = _choose(ev, rival=P_ALTERNATIVA)
+        r = readings.get(f"header.{name}")
+        if fld.value is not None and r is not None and re.search(r"\d\s+\d", r.free_text or ""):
+            # cifre lette staccate ("1 2"): la lettura ha visto due segni separati, il
+            # numero e' incerto (un "13" letto "1 2" diventava 12 sicuro)
+            fld.incerto = True
         if name == "ore_pei" and fld.value is not None:
             fld.value = float(fld.value)
         _apply_header(header, name, fld)
@@ -4179,6 +4202,18 @@ def _assemble_header(plan: PagePlan, readings: dict[str, Reading], rows: list[Da
         _apply_header(header, "totale_mensile_dichiarato", fld)
         if fld.confidence is not None:
             confs.append(fld.confidence)
+    elif TOTALE_RIGA_31 in readings and header.totale_mensile_dichiarato is None:
+        ev = evidence(readings.get(TOTALE_RIGA_31), total_lexicon(), "hours")
+        top = ev.top if ev.options else None
+        r31 = rows[30]
+        if (isinstance(top, (int, float)) and top > HOURS_MAX_DAY and ev.coverage >= P_LEGGIBILE
+                and r31.ore_dichiarate is None):
+            # numero impossibile come ore di un giorno: e' il totale mensile scritto nella
+            # riga del giorno 31; riportato come totale, da verificare
+            header.totale_mensile_dichiarato = float(top)
+            header.incerti.append("totale_mensile_dichiarato")
+            r31.illeggibili = [f for f in r31.illeggibili if f != "ore_dichiarate"]
+            r31.incerti = [f for f in r31.incerti if f != "ore_dichiarate"]
     if plan.data_ink:
         ev = evidence(readings.get("footer.data"), None, "date")
         _apply_header(header, "data_compilazione", _choose(ev))
