@@ -14,12 +14,16 @@ Pipeline di una pagina
    (righe non usate annullate in diagonale, linea orizzontale sugli orari
    effettivi = "non svolta") vengono trovate e cancellate prima di ogni analisi;
    una "/" isolata in una riga senza orari non e' un valore.
+   Anche le pieghe del foglio (``ink.find_creases``: lunghe linee quasi verticali
+   continue per molte righe, non stampate) sono tolte in ogni colonna: la
+   scrittura che attraversano (o che vi resta sotto) e' segnalata.
 2. **Inchiostro** (``sirio.vision.ink``): ogni cella dei 31 giorni viene
    classificata come vuota, trattino, crocetta (assenze: X, x, A, spunte),
-   firma o scrittura. Timbri sulle colonne Firma/Note, inizio di una firma che
-   sconfina nella colonna delle assenze e celle attraversate da barrature sono
-   segnalati; le code delle firme che sconfinano nella colonna "Note" vengono
-   tolte prima di decidere se c'e' una nota.
+   firma o scrittura. Timbri sulle colonne Firma/Note, timbri e firme del pie'
+   di pagina che sconfinano nelle ultime righe (``foreign_ink``), inizio di una
+   firma che sconfina nella colonna delle assenze e celle attraversate da
+   barrature sono segnalati; le code delle firme che sconfinano nella colonna
+   "Note" vengono tolte prima di decidere se c'e' una nota.
 3. **Ritagli puliti**: le celle con scrittura vengono ritagliate togliendo le
    linee della griglia e i tratti delle celle vicine; per orari e ore si
    aggiunge bianco sopra e sotto (TrOCR riduce ogni ritaglio a un quadrato); le
@@ -50,10 +54,17 @@ Pipeline di una pagina
    riga (o lo stesso orario programmato negli stessi giorni della settimana)
    conferma proprio il valore preferito dalla lettura. Scrittura presente ma non
    interpretabile -> ``illeggibili`` (valore ``None``).
+   Firme e crocette in una riga senza orari, ore e note sono sempre da
+   verificare (segno isolato). L'orario programmato e' confrontato con gli
+   stessi giorni della settimana (valori e durata; basta una settimana letta con
+   sicurezza) e, con l'alunno assente, le ore riconosciute devono essere una
+   frazione tonda della durata programmata (di solito la meta').
 7. **Note**: riportate come sicure solo se lette con buona fiducia e fatte di
    parole note (vocabolario generico della scuola, abbreviazioni puntate
    comprese) senza numeri; le letture brevi fuori vocabolario (code di firme,
-   timbri, tratti) non diventano note.
+   timbri, tratti) non diventano note. Una nota scritta per davvero (due righe,
+   o inchiostro largo e alto come una parola) che non viene letta e' illeggibile,
+   mai vuota in silenzio.
 
 Precisione misurata (CPU a 4 core)
 ----------------------------------
@@ -1738,6 +1749,7 @@ class PagePlan:
     notes: list[str] = field(default_factory=list)
     aspect: dict[str, float] = field(default_factory=dict)              # chiave -> larghezza/altezza del ritaglio
     flags: dict[int, dict[str, str]] = field(default_factory=dict)      # giorno -> campo -> motivo di dubbio
+    note_scritta: set[int] = field(default_factory=set)   # giorni con una nota scritta per davvero (vedi plan_page)
 
 
 def _cell_state_text(img: np.ndarray, box: Box, allow_dash: bool) -> str:
@@ -1871,6 +1883,92 @@ def _inside_stamp(gray: np.ndarray, box: Box, stamps: Sequence[Box]) -> bool:
         covered[max(0, sy0 - grow - y0):max(0, sy1 + grow - y0),
                 max(0, sx0 - grow - x0):max(0, sx1 + grow - x0)] = True
     return float((m & covered).sum()) >= 0.6 * total
+
+
+STRUTTURA_SOTTO = 0.3      # quota minima dell'inchiostro di una struttura sotto la tabella (pie' di pagina)...
+STRUTTURA_SOTTO_RIGHE = 1.0   # ... oppure estensione sotto la tabella (righe)
+QUOTA_ESTRANEA = 0.5       # quota dell'inchiostro della cella che appartiene a una struttura: non e' della riga
+QUOTA_DUBBIA = 0.15        # ... quota oltre la quale il segno della riga e' da verificare
+
+
+@dataclass
+class ForeignInk:
+    """Inchiostro delle colonne di destra (assenze, firma, note) che appartiene a
+    strutture piu' grandi di una riga: timbro tondo della scuola, firma del referente
+    o del coordinatore appoggiate sull'angolo della tabella. ``mask``: pixel delle
+    strutture; ``ink``: tutto l'inchiostro della zona (linee stampate escluse);
+    ``origin``: angolo in alto a sinistra della zona nell'immagine."""
+
+    mask: np.ndarray
+    ink: np.ndarray
+    origin: tuple[int, int]
+
+    def share(self, box: Box, inner: float = 0.06) -> float:
+        """Quota dell'inchiostro del riquadro che appartiene alle strutture."""
+        ox, oy = self.origin
+        x0, y0, x1, y1 = box
+        mx, my = int(round(inner * (x1 - x0))), int(round(inner * (y1 - y0)))
+        h, w = self.ink.shape
+        a0, a1 = max(0, y0 + my - oy), min(h, y1 - my - oy)
+        b0, b1 = max(0, x0 + mx - ox), min(w, x1 - mx - ox)
+        if a1 <= a0 or b1 <= b0:
+            return 0.0
+        total = int(self.ink[a0:a1, b0:b1].sum())
+        if total == 0:
+            return 0.0
+        return float(self.mask[a0:a1, b0:b1].sum()) / total
+
+    def erase(self, gray: np.ndarray) -> np.ndarray:
+        """Copia di ``gray`` senza l'inchiostro delle strutture."""
+        out = gray.copy()
+        ox, oy = self.origin
+        h, w = self.mask.shape
+        sel = cv2.dilate(self.mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        view = out[oy:oy + h, ox:ox + w]
+        view[sel[:view.shape[0], :view.shape[1]]] = 255
+        return out
+
+
+def foreign_ink(gray: np.ndarray, grid: TableGrid) -> ForeignInk | None:
+    """Strutture d'inchiostro che non appartengono a una riga (vedi ``ForeignInk``).
+
+    Una struttura (tratti uniti, compresi i frammenti vicini di un timbro) entra
+    nelle righe della tabella ma sta in buona parte sotto di essa (riga dei totali,
+    pie' di pagina: timbro della scuola, firme del referente e del coordinatore):
+    almeno ``STRUTTURA_SOTTO`` del suo inchiostro, oppure scende per almeno
+    ``STRUTTURA_SOTTO_RIGHE`` righe. La coda di una firma dell'ultima riga che
+    sfiora la riga dei totali non basta. Le strutture alte piu' righe dentro la
+    tabella (firme di righe vicine che si toccano) restano delle righe: i timbri
+    tondi interni alla tabella sono cercati da ``stamp_boxes``."""
+    H, W = gray.shape[:2]
+    rh = grid.row_height
+    zx0 = max(0, int(grid.col_x[6] - 0.3 * rh))
+    zy0 = max(0, int(grid.row_y[0] - 0.5 * rh))
+    region = gray[zy0:H, zx0:W]
+    if region.size == 0 or rh <= 4:
+        return None
+    m = region < _ink_threshold(_paper_level(region))
+    rows = [y - zy0 for y in grid.row_y] + ([grid.total_row[1] - zy0] if grid.total_row else [])
+    m &= ~_line_mask(m, rh, rows, [x - zx0 for x in grid.col_x[6:]])
+    r = max(1, int(round(0.08 * rh)))
+    link = cv2.dilate(m.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(link, connectivity=8)
+    bottom = int(round(grid.row_y[-1] - zy0))
+    if n <= 1 or bottom >= lab.shape[0]:
+        return None
+    labm = np.where(m, lab, 0)
+    total = np.bincount(labm.ravel(), minlength=n)
+    under = np.bincount(labm[bottom:].ravel(), minlength=n)
+    keep = np.zeros(n, dtype=bool)
+    for k in range(1, n):
+        x, y, w, h, _a = (int(v) for v in stats[k])
+        if y >= bottom - 0.1 * rh or total[k] == 0:
+            continue                    # tutta sotto la tabella: non tocca le righe
+        keep[k] = (under[k] >= STRUTTURA_SOTTO * total[k]
+                   or y + h - bottom >= STRUTTURA_SOTTO_RIGHE * rh)
+    if not keep.any():
+        return None
+    return ForeignInk(mask=keep[lab] & m, ink=m, origin=(zx0, zy0))
 
 
 def _signature_like(comps: Sequence[tuple[int, int, int, int, int]], unit: float) -> bool:
@@ -2030,6 +2128,23 @@ def _note_reading(readings: dict[str, Reading], g: int) -> Reading | None:
 
 NOTE_MIN_WIDTH = 0.6        # larghezza minima (altezze di riga) di una nota vera
 NOTE_MIN_HEIGHT = 0.3
+NOTA_SCRITTA_LARGHEZZA = 1.5   # inchiostro largo almeno cosi' (righe)...
+NOTA_SCRITTA_ALTEZZA = 0.3     # ... e alto almeno cosi' (righe), in piu' tratti: e' scrittura
+NOTA_SCRITTA_TRATTI = 3
+
+
+def _substantial_note(crop: np.ndarray, unit: float) -> bool:
+    """Il ritaglio pulito della nota contiene scrittura vera: inchiostro largo e alto
+    come una parola, fatto di piu' tratti (non una coda di firma o un trattino)."""
+    m = crop < 160
+    if not m.any():
+        return False
+    ys, xs = np.nonzero(m)
+    if xs.max() - xs.min() + 1 < NOTA_SCRITTA_LARGHEZZA * unit or ys.max() - ys.min() + 1 < NOTA_SCRITTA_ALTEZZA * unit:
+        return False
+    n, _lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    big = int((stats[1:, cv2.CC_STAT_AREA] >= max(6.0, (0.06 * unit) ** 2)).sum()) if n > 1 else 0
+    return big >= NOTA_SCRITTA_TRATTI
 
 
 class PageMarks:
@@ -2043,10 +2158,22 @@ class PageMarks:
 
     def __init__(self, gray: np.ndarray, img: np.ndarray, grid: TableGrid):
         self.grid = grid
-        self.strikes = find_strikes(gray, grid)
+        self.img = img
+        # pieghe del foglio (lunghe linee quasi verticali che non sono la griglia): rumore
+        # per crocette, firme e testo di ogni colonna, tolte come le barrature
+        self.creases: list[Any] = []
+        crease_mask: np.ndarray | None = None
+        try:
+            self.creases, crease_mask = ink.find_creases(img, grid)
+        except Exception:  # noqa: BLE001 - analisi aggiuntiva
+            log.warning("Ricerca delle pieghe del foglio non riuscita", exc_info=True)
+        self.crease_mask = crease_mask
+        self.strikes = find_strikes(gray, grid, ignore=crease_mask)
+        if crease_mask is not None and crease_mask.shape[:2] == gray.shape[:2]:
+            self.strikes.mask = crease_mask if self.strikes.mask is None else (self.strikes.mask | crease_mask)
         self.page: Any = None
         try:
-            self.page = ink.PageInk(img, grid)
+            self.page = ink.PageInk(img, grid, creases=(self.creases, crease_mask))
         except Exception:  # noqa: BLE001 - analisi aggiuntiva: senza, restano i segni del primo rilevatore
             log.warning("Analisi dell'inchiostro delle celle non riuscita", exc_info=True)
         self._own: dict[tuple[int, str], Any] = {}
@@ -2088,6 +2215,36 @@ class PageMarks:
             return True
         r = self.own(g, f)
         return bool(r is not None and (r.struck or r.row_struck))
+
+    def crease(self, g: int, f: str, on_ink: bool = False) -> bool:
+        """Cella attraversata da una piega del foglio (tolta dall'immagine prima
+        dell'analisi). Con ``on_ink`` solo se la piega passa sulla scrittura rimasta
+        (entro 0,15 righe dai suoi bordi): una piega nella parte vuota della cella
+        non ha tagliato nulla."""
+        box = self.grid.cell(g, f)
+        hits = [c for c in self.creases if c.crosses(box)]
+        if not hits or not on_ink:
+            return bool(hits)
+        r = self.own(g, f)
+        mask = None if r is None else np.asarray(r.mask, dtype=bool)
+        if mask is None or not mask.any():
+            return True
+        xs = np.nonzero(mask.any(axis=0))[0]
+        reach = 0.15 * self.grid.row_height
+        lo, hi = box[0] + xs.min() - reach, box[0] + xs.max() + reach
+        yc = (box[1] + box[3]) / 2.0
+        return any(lo - c.half_width <= c.x_at(yc) <= hi + c.half_width for c in hits)
+
+    def hidden_by_crease(self, g: int, f: str) -> bool:
+        """Scrittura sotto la piega (piu' scura della piega), tolta con essa."""
+        if not self.creases:
+            return False
+        try:
+            return ink.ink_under_crease(self.img, self.grid.cell(g, f), self.creases, self.grid.row_height,
+                                        self.crease_mask)
+        except Exception:  # noqa: BLE001
+            log.debug("Controllo della scrittura sotto la piega non riuscito", exc_info=True)
+            return True
 
     def line_across(self, g: int, f: str) -> bool:
         if self.strikes.horizontal(g, self.grid.col_index(f)):
@@ -2141,12 +2298,24 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
     gray = erase(gray0, marks.strikes.mask)
     if marks.n_strokes:
         plan.notes.append(f"Linee di barratura riconosciute e ignorate: {marks.n_strokes}.")
+    if marks.creases:
+        giorni = sorted({g for c in marks.creases for g in c.days})
+        plan.notes.append(f"Piega del foglio (linea verticale lunga) riconosciuta e ignorata nei giorni "
+                          f"{giorni[0]}-{giorni[-1]}: la scrittura che attraversa e' da verificare.")
     if marks.struck_rows:
         plan.notes.append("Righe barrate (non usate) nei giorni "
                           + ", ".join(str(g) for g in sorted(marks.struck_rows))
                           + ": l'eventuale scrittura rimasta e' da verificare.")
     notes_gray: np.ndarray | None = None
     stamps = stamp_boxes(gray, grid)
+    # timbri e firme del pie' di pagina che sconfinano nelle ultime righe: il loro
+    # inchiostro non e' un segno della riga
+    foreign: ForeignInk | None = None
+    try:
+        foreign = foreign_ink(gray, grid)
+    except Exception:  # noqa: BLE001 - analisi aggiuntiva
+        log.warning("Analisi dei timbri e delle firme del pie' di pagina non riuscita", exc_info=True)
+    foreign_gray: np.ndarray | None = None
     for g in range(1, 32):
         states: dict[str, str] = {}
         flags: dict[str, str] = {}
@@ -2174,8 +2343,17 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 elif marks.slash(g, f):
                     # barretta vista solo dall'analisi dell'inchiostro: si legge e si segnala
                     flags[f] = "barretta"
+            if st != TESTO and marks.crease(g, f) and marks.hidden_by_crease(g, f):
+                # scrittura finita sotto la piega e sparita togliendola: si legge il ritaglio
+                # con la piega e il valore resta da verificare
+                crop = clean_crop(gray0, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]))
+                if crop is not None:
+                    st = TESTO
+                    flags[f] = "piega"
             if st == TESTO and marks.struck(g, f):
                 flags[f] = "barrato"
+            elif st == TESTO and marks.crease(g, f, on_ink=True):
+                flags.setdefault(f, "piega")      # scrittura tagliata dalla piega tolta
             states[f] = st
             if st != TESTO or crop is None:
                 continue
@@ -2207,13 +2385,28 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 # celle appartiene a una cella vicina (es. l'inizio di una firma): forse
                 # non e' una crocetta
                 st = SEGNO
+            elif st != SEGNO and marks.crease(g, f) and (st == CROCETTA or marks.hidden_by_crease(g, f)):
+                st = SEGNO          # crocetta attraversata da una piega (tolta), o segno sotto la piega
+            elif st == CROCETTA and foreign is not None and foreign.share(box) >= QUOTA_DUBBIA:
+                st = SEGNO          # parte di un timbro o di una firma del pie' di pagina
             states[f] = st
         fbox = grid.cell(g, "firma")
         st = _cell_state_signature(gray, fbox)
+        share = foreign.share(fbox) if foreign is not None and st != VUOTA else 0.0
         if st != VUOTA and _inside_stamp(gray, fbox, stamps):
             st = TIMBRO
+        elif share >= QUOTA_ESTRANEA:
+            # inchiostro per lo piu' di un timbro o di una firma del pie' di pagina: se
+            # tolto resta una firma, e' da verificare; altrimenti non e' una firma della riga
+            if foreign_gray is None:
+                foreign_gray = foreign.erase(gray)
+            st = SEGNO if _cell_state_signature(foreign_gray, fbox) == FIRMA else TIMBRO
+        elif st == FIRMA and share >= QUOTA_DUBBIA:
+            st = SEGNO
         elif st == FIRMA and marks.struck(g, "firma"):
             st = SEGNO
+        elif st == VUOTA and marks.crease(g, "firma") and marks.hidden_by_crease(g, "firma"):
+            st = SEGNO          # tratto sotto la piega: da verificare
         states["firma"] = st
         if st in (FIRMA, SEGNO) and states["assenza_operatore"] == CROCETTA:
             worked = any(states[f] == TESTO for f in ("eff_entrata", "eff_uscita"))
@@ -2223,12 +2416,24 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 states["assenza_operatore"] = SEGNO
         box = grid.cell(g, "note")
         st = _cell_state_text(gray, box, allow_dash=True)
+        nshare = foreign.share(box) if foreign is not None and st == TESTO else 0.0
+        source = gray
         if st == TESTO and _inside_stamp(gray, box, stamps):
             st = TIMBRO
+        elif st == TESTO and nshare >= QUOTA_ESTRANEA:
+            # per lo piu' timbro o firma del pie' di pagina: si guarda cio' che resta senza
+            if foreign_gray is None:
+                foreign_gray = foreign.erase(gray)
+            c = grid.col_index("note")
+            rest = None if ink.is_blank(foreign_gray, box) else clean_crop(
+                foreign_gray, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]), extend=(0.3, 0.5))
+            if rest is None or not (_substantial_note(rest, rh) or len(split_text_lines(rest, rh)) > 1):
+                st = TIMBRO                 # solo frammenti del timbro o della firma
+            else:
+                source = foreign_gray       # scrittura vera rimasta: letta e segnalata
         elif st == TESTO and marks.empty(g, "note"):
             st = VUOTA          # solo code di firme, linee o tratti delle righe vicine
-        source = gray
-        if st == TESTO and states["firma"] != VUOTA:
+        if st == TESTO and states["firma"] != VUOTA and source is gray:
             if notes_gray is None:
                 notes_gray = gray.copy()
             if _remove_overflow(notes_gray, grid, g):
@@ -2247,6 +2452,10 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 key = f"rows.{g}.note"
                 plan.aspect[key] = crop.shape[1] / max(1.0, float(crop.shape[0]))
                 lines = split_text_lines(crop, rh)
+                if len(lines) > 1 or _substantial_note(crop, rh):
+                    # scrittura vera (due righe, o larga e alta come una parola): se nessuna
+                    # lettura viene accettata la nota va segnalata, non lasciata vuota
+                    plan.note_scritta.add(g)
                 if len(lines) == 1:
                     plan.requests.append(_text_request(key, crop, n_lex, beams=4, free_beams=3,
                                                        charset=NOTE_CHARS, max_tokens=20, min_aspect=2.0))
@@ -2257,6 +2466,10 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                                                            charset=NOTE_CHARS, max_tokens=16, min_aspect=2.0))
         if st == TESTO and marks.struck(g, "note"):
             flags["note"] = "barrato"
+        elif st == TESTO and marks.crease(g, "note", on_ink=True):
+            flags["note"] = "piega"
+        elif st == TESTO and nshare >= QUOTA_DUBBIA:
+            flags["note"] = "timbro"
         states["note"] = st
         plan.cells[g] = states
         if flags:
@@ -2951,20 +3164,87 @@ def _weekly_support(cs: _CellState, solid_values: dict[tuple[int, str], Any],
     return len(same) >= SETTIMANA_MIN and all(_same_value(x, cs.value) for x in same + every)
 
 
-def _flag_weekly_outliers(states: dict[tuple[int, str], _CellState]) -> None:
+def _flag_weekly_outliers(states: dict[tuple[int, str], _CellState],
+                          solid: set[tuple[int, str]] | None = None) -> None:
     """L'orario programmato e' settimanale: se negli stessi giorni della settimana
-    (giorno +/- 7, 14...) almeno ``SETTIMANA_MIN`` celle hanno tutte lo stesso valore e
-    questa cella ne ha un altro, la cella va verificata (es. "8:00" letto "9:00" in un
-    solo martedi')."""
+    (giorno +/- 7, 14...) le altre celle hanno tutte lo stesso valore e questa cella
+    ne ha un altro, la cella va verificata (es. "8:00" letto "9:00" in un solo
+    martedi'). Bastano ``SETTIMANA_MIN`` celle concordi, oppure una sola se letta
+    con sicurezza (mesi con poche settimane utili: festivi, assenze, gite)."""
     # anche i valori segnalati delle altre settimane contano: servono solo a segnalare
-    chosen = {k: cs.value for k, cs in states.items()}
+    if solid is None:
+        solid = {k for k, cs in states.items() if not cs.reasons}
     for (g, f), cs in states.items():
         if not f.startswith("prog_"):
             continue
-        same = [val for (g2, f2), val in chosen.items() if f2 == f and g2 != g and (g2 - g) % 7 == 0]
-        if len(same) >= SETTIMANA_MIN and all(_same_value(x, same[0]) for x in same) \
-                and not _same_value(same[0], cs.value):
+        same = [k for k in states if k[1] == f and k[0] != g and (k[0] - g) % 7 == 0]
+        if not same or not all(_same_value(states[k].value, states[same[0]].value) for k in same):
+            continue
+        if _same_value(states[same[0]].value, cs.value):
+            continue
+        if len(same) >= SETTIMANA_MIN or any(k in solid for k in same):
             cs.reasons.add("settimana")
+
+
+ORE_ASSENZA_QUOTE = (0.25, 1 / 3, 0.5, 2 / 3, 0.75, 1.0)   # ore riconosciute / durata programmata (alunno assente)
+ORE_ASSENZA_TOLLERANZA = 0.03
+DURATA_SETTIMANA_DIVERSA = 1.0   # ore: durata programmata diversa da quella degli stessi giorni della settimana
+
+
+def _prog_duration(values: dict[str, Any]) -> float | None:
+    a, b = values.get("prog_entrata"), values.get("prog_uscita")
+    if not isinstance(a, str) or not isinstance(b, str):
+        return None
+    return hours_between(a, b)
+
+
+def _flag_schedule_plausibility(states: dict[tuple[int, str], _CellState],
+                                solid: set[tuple[int, str]] | None = None) -> None:
+    """Controlli di plausibilita' dell'orario programmato (solo segnalazioni, nessun
+    valore cambiato):
+
+    * con l'alunno assente le ore riconosciute sono di solito una frazione "tonda"
+      della durata programmata (meta': 1 di 2 ore, 1,5 di 3, 2 di 4); un rapporto
+      come 1,5 / 5 = 0,3 indica un orario programmato (o le ore) letto male;
+    * durata programmata diversa di almeno ``DURATA_SETTIMANA_DIVERSA`` ore da
+      quella (concorde) degli stessi giorni della settimana."""
+    if solid is None:
+        solid = {k for k, cs in states.items() if not cs.reasons}
+    by_row: dict[int, dict[str, _CellState]] = {}
+    for (g, f), cs in states.items():
+        by_row.setdefault(g, {})[f] = cs
+    values = {g: {f: cs.value for f, cs in cells.items()} for g, cells in by_row.items()}
+    durations = {g: _prog_duration(v) for g, v in values.items()}
+    for g, cells in by_row.items():
+        d = durations[g]
+        if d is None or d <= 0:
+            continue
+        prog = [cells[f] for f in ("prog_entrata", "prog_uscita")]
+        ore = values[g].get("ore_dichiarate")
+        absent = any(cs.assenza_alunno for cs in cells.values())
+        if absent and isinstance(ore, (int, float)) and ore > 0:
+            ratio = float(ore) / d
+            if not any(abs(ratio - q) <= ORE_ASSENZA_TOLLERANZA for q in ORE_ASSENZA_QUOTE):
+                for cs in prog + ([cells["ore_dichiarate"]] if "ore_dichiarate" in cells else []):
+                    cs.reasons.add("assenza_ore")
+        others = [(durations[g2], g2) for g2 in by_row if g2 != g and (g2 - g) % 7 == 0
+                  and durations[g2] is not None]
+        if any("settimana" in cs.reasons for cs in prog):
+            continue                    # gia' segnalato dal confronto dei valori
+        if others and all(abs(o - others[0][0]) < 1e-6 for o, _ in others) \
+                and abs(d - others[0][0]) >= DURATA_SETTIMANA_DIVERSA - 1e-6 \
+                and (len(others) >= SETTIMANA_MIN
+                     or any((g2, "prog_entrata") in solid and (g2, "prog_uscita") in solid for _o, g2 in others)):
+            # si segnala l'orario che differisce da quello prevalente nelle altre settimane;
+            # se non si puo' dire quale, entrambi
+            def odd_one(cs: _CellState) -> bool:
+                vals = [by_row[g2][cs.field].value for _o, g2 in others]
+                same = sum(1 for v in vals if _same_value(v, cs.value))
+                return 2 * same <= len(vals)
+
+            odd = [cs for cs in prog if odd_one(cs)]
+            for cs in odd or prog:
+                cs.reasons.add("settimana")
 
 
 def _confirm_by_consensus(states: dict[tuple[int, str], _CellState]) -> set[tuple[int, str]]:
@@ -3279,7 +3559,9 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
     # conferma per coerenza: celle incerte solo per la scarsa leggibilita' il cui
     # valore e' quello preferito dalla lettura *e* coincide con quanto imposto
     # dalle celle sicure della stessa riga (es. uscita = entrata + ore)
-    _flag_weekly_outliers(states)
+    solid0 = {k for k, cs in states.items() if not cs.reasons}
+    _flag_weekly_outliers(states, solid0)
+    _flag_schedule_plausibility(states, solid0)
     confirmed = _confirm_by_consensus(states)
     for (g, f), cs in sorted(states.items()):
         row = rows[g - 1]
@@ -3302,6 +3584,10 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
             fld = _note_field(_note_reading(readings, g), plan.aspect.get(f"rows.{g}.note"))
             if plan.flags.get(g, {}).get("note") and fld.value:
                 fld.incerto = True          # scrittura attraversata da una barratura
+            if not fld.value and not fld.illeggibile and (g in plan.note_scritta or plan.flags.get(g, {}).get("note")):
+                # scrittura vera nella cella ma nessuna lettura accettata: mai una nota
+                # vuota in silenzio
+                fld.illeggibile = True
             if fld.value or fld.illeggibile:
                 notes[g] = fld
     for g, fld in list(notes.items()):
@@ -3325,6 +3611,14 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
                 row.incerti.append("note")
         if fld.confidence is not None:
             row.confidenza["note"] = round(fld.confidence, 3)
+    for row in rows:
+        st = plan.cells.get(row.giorno, {})
+        # firma o crocetta in una riga senza orari, ore e note: segno isolato (timbro,
+        # firma del pie' di pagina, piega, macchia): mai sicuro
+        for f in _lonely_marks(row, st):
+            if f not in row.incerti and f not in row.illeggibili:
+                row.incerti.append(f)
+                row.confidenza[f] = min(row.confidenza.get(f, 0.5), 0.5)
 
     header = _assemble_header(plan, readings, rows, confs)
     flagged_rows = _flag_unreliable_grid(grid, rows, header)
@@ -3364,6 +3658,18 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
         engine="locale",
         avvisi=avvisi,
     )
+
+
+def _lonely_marks(row: DayRow, states: dict[str, str]) -> list[str]:
+    """Firme e crocette di una riga senza orari, ore, trattini e note (nessuna
+    scrittura nelle celle di testo): un segno isolato e' sospetto."""
+    if row.note or row.trattino_effettivo:
+        return []
+    if any(states.get(f) in (TESTO, TRATTINO, NULLO) for f in (*TEXT_FIELDS, "note")):
+        return []
+    if any(getattr(row, f) is not None for f in TEXT_FIELDS):
+        return []
+    return [f for f in ("firma", "assenza_alunno", "assenza_operatore") if getattr(row, f)]
 
 
 def _flag_unreliable_grid(grid: TableGrid, rows: list[DayRow], header: Header) -> list[int]:
@@ -3651,7 +3957,7 @@ TABLE_NOT_FOUND_MSG = (
 # Secondo parere (GLM-OCR) sulle celle dubbie: motivi di dubbio "strutturali" che il
 # secondo parere non puo' mai togliere (la cella e' barrata, contiene una "/", l'orario
 # e' fuori dalla fascia scolastica): rilette le stesse cifre, il dubbio resterebbe.
-SP_BLOCCANTI = frozenset({"barrato", "barretta", "fuori_orario"})
+SP_BLOCCANTI = frozenset({"barrato", "barretta", "fuori_orario", "piega", "assenza_ore"})
 SP_MARGINE = 0.2           # margine attorno alla cella grezza (altezze di riga), come nelle misure
 _SP_FAILED: dict[str, str] = {}   # cache del modello -> motivo: non si riprova nella stessa sessione
 _SP_LOCK = threading.Lock()

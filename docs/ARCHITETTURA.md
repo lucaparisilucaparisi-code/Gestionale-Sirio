@@ -210,13 +210,22 @@ def has_signature(img, box) -> bool      # firma presente
 def is_dash(img, box) -> bool            # trattino isolato "-"
 
 class PageInk:                           # analisi dell'inchiostro della tabella, una volta per pagina (~1 s)
-    def __init__(self, img, grid)
+    def __init__(self, img, grid, creases=None)   # creases: risultato di find_creases (None = cercate qui)
     strokes: list[Stroke]                # barrature "diagonale" (righe non usate) e linee "orizzontale"
+    creases: list[Crease]                # pieghe del foglio, tolte dall'inchiostro come le barrature
     struck_days: set[int] ; line_days: set[int]
     def own_ink(self, giorno, colonna) -> CellInkResult
-        # .crop/.mask (solo la scrittura propria: linee, barrature e tratti delle celle vicine
-        # sbiancati), .ink_ratio, .empty, .struck, .row_struck, .line_across ("-" tirato a mano),
-        # .slash ("/" isolata), .stroke_angle, .overflow_removed, .strike_removed
+        # .crop/.mask (solo la scrittura propria: linee, barrature, pieghe e tratti delle celle
+        # vicine sbiancati), .ink_ratio, .empty, .struck, .row_struck, .line_across ("-" tirato a
+        # mano), .slash ("/" isolata), .stroke_angle, .overflow_removed, .strike_removed, .crease
+
+def find_creases(img, grid) -> tuple[list[Crease], np.ndarray | None]
+    # pieghe del foglio: linee sottili quasi verticali (anche chiare, leggermente curve) continue
+    # per almeno 8 righe e lontane dai bordi di colonna; maschera dei pixel da togliere (i tratti
+    # di scrittura che le attraversano restano). Crease: y0, y1, path (x per ogni y),
+    # half_width, days, level (grigio tipico); .crosses(box)
+def ink_under_crease(img, box, creases, unit, mask=None) -> bool
+    # scrittura piu' scura della piega rimasta sotto di essa (sparirebbe togliendo la piega)
 ```
 
 **Autoverifica della griglia** (`check_alignment`, applicata da `detect_grid`): una griglia
@@ -296,6 +305,18 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    orari → nulla (altrove letta e segnalata); code di firme nella colonna Note tolte; nota senza
    inchiostro proprio → vuota. Se il ritaglio pulito non trova scrittura ma `PageInk` sì, si legge
    il ritaglio di `PageInk` e il valore resta segnalato.
+   **Pieghe del foglio** (`ink.find_creases`, foto di fogli piegati): la linea lunga quasi
+   verticale che attraversa molte righe non è un segno in nessuna colonna; viene tolta come le
+   barrature (anche dalla ricerca delle barrature) e non genera crocette, firme o testo; la
+   scrittura che taglia (o che resta sotto di essa, più scura della piega) è letta e segnalata
+   (motivo `piega`), una crocetta che attraversa diventa da verificare.
+   **Timbri e firme del piè di pagina** (`foreign_ink`): l'inchiostro unito a una struttura che
+   scende in buona parte sotto la tabella (timbro della scuola, firme del referente o del
+   coordinatore appoggiate sull'angolo della tabella) non è una firma, una crocetta o una nota
+   della riga: se è la maggior parte dell'inchiostro della cella la firma diventa `TIMBRO`
+   (falsa, segnalata) o, se tolto resta una firma, firma da verificare; una quota minore rende
+   comunque il segno da verificare. Nella colonna Note si legge (segnalato) solo ciò che resta
+   tolta la struttura, se è scrittura vera.
 2. *Lettura* TrOCR a lotti, con bianco sopra/sotto i ritagli di orari e ore.
 3. *Assemblaggio* (`assemble`): formati reali degli orari ("8:30", "8,30", "830", "8h30", "8"),
    ore a quarti ("2,5", "2h30'", "1:15", "0"), fascia scolastica plausibile (fuori 7–18 sempre
@@ -309,10 +330,18 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    una relazione *esatta* impone il valore (una durata solo plausibile non basta); programmato ≠
    effettivo con il valore gemello fra le letture della cella, anche quando le due coppie tornano
    entrambe con le ore, e quando la cella gemella è stata riportata a un valore diverso dalla sua
-   lettura; orario programmato diverso da quello (uguale) degli stessi giorni della settimana; un
+   lettura; orario programmato diverso da quello (uguale) degli stessi giorni della settimana
+   (bastano due settimane concordi, o una sola letta con sicurezza); durata programmata diversa
+   di almeno un'ora da quella (uguale) degli stessi giorni della settimana; con l'alunno assente,
+   ore riconosciute che non sono una frazione "tonda" (¼, ⅓, ½, ⅔, ¾, intera) della durata
+   programmata (es. 1,5 su 11:00–16:00) → orario programmato e ore da verificare; un
    solo orario programmato (o effettivo) leggibile; crocetta di assenza dell'operatore in una riga
-   firmata con l'orario effettivo; nota breve del vocabolario ("104") proposta da verificare invece
-   di essere scartata. Intestazione: mese/anno sicuri
+   firmata con l'orario effettivo; firma o crocetta in una riga senza orari, ore, trattini e note
+   (segno isolato: timbro, firma del piè di pagina, macchia); nota breve del vocabolario ("104")
+   proposta da verificare invece di essere scartata; nota scritta per davvero (due righe, o
+   inchiostro proprio largo e alto come una parola) di cui nessuna lettura è accettata →
+   `illeggibili`, mai vuota in silenzio (lo stesso per ogni campo: inchiostro proprio presente e
+   nessun valore → segnalato). Intestazione: mese/anno sicuri
    quando il nome del mese è letto (lettura vincolata e libera concordi) e il calendario dei
    giorni compilati esclude ogni altro anno non futuro; totale mensile segnalato se diverso dalla
    somma delle ore lette (salvo ore illeggibili che spieghino la differenza).

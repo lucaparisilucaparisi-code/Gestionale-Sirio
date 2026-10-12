@@ -772,3 +772,62 @@ def test_curled_photo_with_strong_keystone_and_background_is_found():
     grid = detect_grid(page)
     assert grid.detected and grid.reliable
     assert info["maglia"]
+
+
+@pytest.mark.parametrize("column", ["assenza_operatore", "firma", "eff_entrata"])
+def test_fold_crease_is_found_and_removed_from_cell_ink(column):
+    """Foglio piegato in verticale e fotografato: l'ombra della piega attraversa tutta
+    la tabella dentro una colonna. E' riconosciuta come piega (non scrittura) e tolta
+    dall'inchiostro proprio delle celle: una cella con la sola piega resta vuota."""
+    from tests.synthetic import fold_crease
+
+    img, truth = _sheet(1)
+    gx = truth["griglia"]["col_x"]
+    j = COLUMNS.index(column)
+    xc = gx[j] + 0.45 * (gx[j + 1] - gx[j])
+    page = normalize_page(fold_crease(img, xc, darkness=110, width=5, seed=1))
+    grid = detect_grid(page)
+    creases, mask = ink.find_creases(page, grid)
+    assert len(creases) == 1 and mask is not None and mask.any()
+    c = creases[0]
+    assert len(c.days) >= 25
+    assert grid.col_x[j] < float(np.median(c.path)) < grid.col_x[j + 1]
+    pi = ink.PageInk(page, grid)
+    empty_rows = [t["giorno"] for t in truth["rows"] if not t[column] and not t["note"]
+                  and t["giorno"] in c.days and not t["trattino_effettivo"]]
+    assert empty_rows
+    for g in empty_rows:
+        res = pi.own_ink(g, column)
+        assert res.crease and res.empty, (g, res.ink_ratio)
+
+
+def test_fold_crease_seen_only_in_part_is_still_one_crease():
+    """Piega poco visibile in alcuni punti (luce radente): i pezzi restano una piega."""
+    from tests.synthetic import curl, fold_crease
+
+    img, truth = _sheet(1)
+    gx = truth["griglia"]["col_x"]
+    xc = gx[7] + 0.5 * (gx[8] - gx[7])
+    photo = photograph(curl(fold_crease(img, xc, darkness=70, width=4, gaps=4, seed=2), sag=0.006,
+                            fold=0.004, fold_x=xc / img.shape[1]), keystone=0.03, seed=2)
+    page = normalize_page(photo)
+    grid = detect_grid(page)
+    creases, _mask = ink.find_creases(page, grid)
+    assert len(creases) == 1 and len(creases[0].days) >= 25
+    assert grid.col_x[7] < float(np.median(creases[0].path)) < grid.col_x[8]
+
+
+def test_synthetic_sheet_with_crease_option():
+    img, truth = make_synthetic_sheet(seed=2, crease_column="assenza_operatore")
+    page = normalize_page(img)
+    grid = detect_grid(page)
+    creases, _mask = ink.find_creases(page, grid)
+    assert len(creases) == 1
+    assert grid.col_x[7] < float(np.median(creases[0].path)) < grid.col_x[8]
+
+
+def test_no_creases_on_regular_sheets():
+    """Scrittura di righe consecutive allineata in colonna (firme, ore) non e' una piega."""
+    for seed in (0, 3, 5):
+        page, grid = _processed(seed)
+        assert ink.find_creases(page, grid) == ([], None)

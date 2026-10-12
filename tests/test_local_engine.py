@@ -1386,3 +1386,210 @@ def test_page_marks_own_crop_for_fallback_reading():
     assert crop is not None and crop.ndim == 2 and crop.dtype == np.uint8 and (crop < 128).any()
     assert marks.own_crop(7, "eff_entrata") is None    # sabato: cella vuota
     assert not marks.struck_rows
+
+
+# --------------------------------------------------------------------------
+# Pieghe, timbri del pie' di pagina, note non lette, orari programmati implausibili
+# --------------------------------------------------------------------------
+
+class _SplitNoteRecognizer(FakeRecognizer):
+    """Come ``FakeRecognizer``; le note lette riga per riga ("#1", "#2") non leggibili
+    salvo letture indicate in ``overrides``."""
+
+    def _reading(self, key: str) -> le.Reading:
+        if key in self.overrides:
+            return self.overrides[key]
+        if "#" in key:
+            return le.Reading([], "", -math.inf, 0)
+        return super()._reading(key)
+
+
+def _wrong_unflagged(truth: dict, res) -> list[tuple]:
+    out = []
+    for t, r in zip(truth["rows"], res.rows):
+        for f in (*le.TEXT_FIELDS, "assenza_alunno", "assenza_operatore", "firma", "note", "trattino_effettivo"):
+            if getattr(r, f) != t[f] and f not in r.incerti and f not in r.illeggibili:
+                out.append((t["giorno"], f, getattr(r, f), t[f]))
+    return out
+
+
+@pytest.mark.parametrize("column,darkness,width", [
+    ("assenza_operatore", 110, 5), ("assenza_operatore", 60, 7), ("assenza_alunno", 110, 5),
+    ("firma", 110, 5), ("ore_dichiarate", 110, 5), ("note", 60, 7),
+])
+def test_fold_crease_is_not_read_as_marks_or_text(column, darkness, width):
+    """Foto di un foglio piegato in verticale: l'ombra della piega attraversa tutta la
+    colonna. Prima: crocetta di assenza dell'operatore letta in ~28 righe (alcune non
+    segnalate); ora la piega e' tolta come le barrature in ogni colonna: nessun segno
+    inventato, nessun ritaglio letto dove c'e' solo la piega, nessun errore non segnalato."""
+    from tests.synthetic import COLUMN_NAMES, fold_crease
+
+    img, truth = make_synthetic_sheet(seed=1)
+    gx = truth["griglia"]["col_x"]
+    j = COLUMN_NAMES.index(column)
+    img = fold_crease(img, gx[j] + 0.45 * (gx[j + 1] - gx[j]), darkness=darkness, width=width, seed=1)
+    page = normalize_page(img)
+    fake = FakeRecognizer(truth)
+    res = le.LocalEngine(recognizer=fake).extract(PageInput(page, detect_grid(page), "piega.jpg", 1),
+                                                  lambda *_: None)
+    assert "Piega del foglio" in (res.ocr_notes or "")
+    for t, r in zip(truth["rows"], res.rows):
+        for f in ("assenza_alunno", "assenza_operatore", "firma"):
+            assert getattr(r, f) == t[f], (t["giorno"], f)       # nessun segno inventato dalla piega
+    assert not _wrong_unflagged(truth, res)
+    expected = {f"rows.{t['giorno']}.{f}" for t in truth["rows"] for f in (*le.TEXT_FIELDS, "note")
+                if t[f] is not None}
+    assert {k for k in fake.keys if k.startswith("rows.")} <= expected
+
+
+def test_fold_crease_through_written_cells_flags_them():
+    """La piega che taglia la scrittura (ore) la rende da verificare; una piega che passa
+    nella parte vuota della cella no."""
+    from tests.synthetic import fold_crease
+
+    img, truth = make_synthetic_sheet(seed=1)
+    gx = truth["griglia"]["col_x"]
+    j = 5          # ore: la cifra e' centrata nella cella
+    page = normalize_page(fold_crease(img, (gx[j] + gx[j + 1]) / 2.0, darkness=110, width=5, seed=1))
+    grid = detect_grid(page)
+    plan = le.plan_page(page, grid)
+    worked = [t["giorno"] for t in truth["rows"] if t["ore_dichiarate"] is not None]
+    assert all(plan.flags.get(g, {}).get("ore_dichiarate") == "piega" for g in worked)
+    # piega nella parte destra (vuota) delle celle dell'entrata effettiva
+    page = normalize_page(fold_crease(img, gx[3] + 0.88 * (gx[4] - gx[3]), darkness=110, width=5, seed=1))
+    plan = le.plan_page(page, detect_grid(page))
+    assert not any(plan.flags.get(g, {}).get("eff_entrata") == "piega" for g in range(1, 32))
+
+
+def test_stamp_and_footer_signature_over_last_rows_are_not_operator_signatures():
+    """Timbro tondo della scuola e firma del referente appoggiati sull'angolo in basso a
+    destra della tabella: sconfinano nelle celle "Firma operatore" delle ultime righe
+    (vuote). Prima: firma=True non segnalata nei giorni 30 e 31."""
+    page, truth = _degraded_page(seed=2, footer_over_table=True)
+    plan = le.plan_page(page.image, page.grid)
+    for g in (30, 31):
+        assert plan.cells[g]["firma"] in (le.VUOTA, le.TIMBRO), (g, plan.cells[g]["firma"])
+    res = le.LocalEngine(recognizer=FakeRecognizer(truth)).extract(page, lambda *_: None)
+    assert not _wrong_unflagged(truth, res)
+    for r in res.rows[28:]:
+        assert not r.firma or "firma" in r.incerti, r
+    # le firme delle righe lavorate restano firme sicure
+    signed = [t["giorno"] for t in truth["rows"] if t["firma"] and t["giorno"] < 28]
+    assert all(res.rows[g - 1].firma and "firma" not in res.rows[g - 1].incerti for g in signed)
+
+
+def test_foreign_ink_keeps_touching_row_signatures():
+    """Firme di righe vicine che si toccano (struttura alta piu' righe dentro la tabella)
+    restano firme delle righe: solo cio' che scende nel pie' di pagina e' estraneo."""
+    img, grid, truth = _synthetic(0)
+    foreign = le.foreign_ink(le.to_gray(img), grid)
+    for t in truth["rows"]:
+        if t["firma"]:
+            assert foreign is None or foreign.share(grid.cell(t["giorno"], "firma")) < le.QUOTA_DUBBIA
+
+
+def test_isolated_signature_or_absence_mark_is_never_sure():
+    """Firma (o crocetta) in una riga senza orari, ore e note: segno isolato (timbro,
+    firma del pie' di pagina, macchia), da verificare; nelle righe compilate no."""
+    plan = _plan_with({7: {"firma": le.FIRMA}, 8: {"assenza_alunno": le.CROCETTA},
+                       9: {**FULL_ROW, "firma": le.FIRMA},
+                       10: {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO, "assenza_operatore": le.CROCETTA,
+                            "firma": le.FIRMA}})
+    readings = {**_row_readings(9), "rows.10.prog_entrata": _time("08:00"), "rows.10.prog_uscita": _time("11:00")}
+    res = le.assemble(plan, readings, _grid())
+    assert res.rows[6].firma and "firma" in res.rows[6].incerti
+    assert res.rows[7].assenza_alunno and "assenza_alunno" in res.rows[7].incerti
+    assert not res.rows[8].incerti
+    assert res.rows[9].assenza_operatore and not ({"firma", "assenza_operatore"} & set(res.rows[9].incerti))
+
+
+def test_two_line_note_written_but_not_read_is_flagged():
+    """Nota scritta piccola su due righe (es. un recupero): se nessuna lettura viene
+    accettata la nota e' illeggibile, mai vuota in silenzio (prima: note=None, nessun avviso)."""
+    data = {"rows": [{"giorno": 11, "prog_entrata": "08:00", "prog_uscita": "11:00", "eff_entrata": "08:00",
+                      "eff_uscita": "11:00", "ore_dichiarate": 3.0, "firma": True, "note": "RECUPERO\nDEL 9/2"}]}
+    page, truth = _degraded_page(data=data, seed=3)
+    junk = {"rows.11.note#1": le.Reading([], "RE", -2.0, 2), "rows.11.note#2": le.Reading([], "9", -2.0, 2),
+            "rows.11.note": le.Reading([], "RE 9", -3.0, 3)}
+    fake = _SplitNoteRecognizer(truth, junk)
+    res = le.LocalEngine(recognizer=fake).extract(page, lambda *_: None)
+    assert any(k.startswith("rows.11.note") for k in fake.keys)
+    r = res.rows[10]
+    assert r.note is None and "note" in r.illeggibili
+    assert not _wrong_unflagged(truth, res)
+
+
+def test_unread_note_flagged_only_when_really_written():
+    """Lettura breve fuori vocabolario: scrittura vera (``note_scritta``) -> illeggibile;
+    segno piccolo (coda di firma, tratto) -> ignorato come prima."""
+    plan = _plan_with({5: {"note": le.TESTO}, 6: {"note": le.TESTO}})
+    plan.note_scritta.add(5)
+    readings = {f"rows.{g}.note": le.Reading([("104", -9.0)], "DE", -3.0, 3) for g in (5, 6)}
+    res = le.assemble(plan, readings, _grid())
+    assert res.rows[4].note is None and "note" in res.rows[4].illeggibili
+    assert res.rows[5].note is None and not res.rows[5].illeggibili and not res.rows[5].incerti
+
+
+def test_substantial_note_shape():
+    unit = 50.0
+    canvas = np.full((40, 200), 255, np.uint8)
+    assert not le._substantial_note(canvas, unit)
+    word = canvas.copy()
+    for i, x in enumerate(range(10, 170, 40)):
+        word[8 + (i % 2) * 4:34, x:x + 6] = 0          # quattro tratti su una larghezza di 3 righe
+    assert le._substantial_note(word, unit)
+    tail = canvas.copy()
+    tail[20:23, 5:150] = 0                               # un solo tratto lungo (coda di una firma)
+    assert not le._substantial_note(tail, unit)
+
+
+def test_absence_row_with_implausible_programmed_exit_is_flagged():
+    """Alunno assente, ore riconosciute 1,5 e uscita programmata "14:00" letta "16:00" con
+    sicurezza: 1,5 / 5 ore non e' una frazione tonda (di solito la meta') e lo stesso
+    giorno della settimana ha 11:00-14:00. Prima: nessuna segnalazione."""
+    data = {"rows": [
+        {"giorno": 19, "prog_entrata": "11:00", "prog_uscita": "16:00", "ore_dichiarate": 1.5,
+         "assenza_alunno": True, "firma": True, "trattino_effettivo": True},
+        {"giorno": 5, "note": "GITA"}, {"giorno": 26, "note": "GITA"}]}
+    page, truth = _degraded_page(data=data, seed=4)
+    res = le.LocalEngine(recognizer=FakeRecognizer(truth)).extract(page, lambda *_: None)
+    r = res.rows[18]
+    assert (r.prog_entrata, r.prog_uscita, r.ore_dichiarate) == ("11:00", "16:00", 1.5)
+    assert "prog_uscita" in r.incerti
+
+
+def test_absence_hours_ratio_flags_programmed_times():
+    plan = _plan_with({g: {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO, "ore_dichiarate": le.TESTO,
+                           "assenza_alunno": le.CROCETTA, "firma": le.FIRMA} for g in (3, 4)})
+    readings = {"rows.3.prog_entrata": _time("11:00"), "rows.3.prog_uscita": _time("16:00"),
+                "rows.3.ore_dichiarate": le.Reading([(1.5, -0.05)], "1,5", -0.06, 3),
+                "rows.4.prog_entrata": _time("11:00"), "rows.4.prog_uscita": _time("14:00"),
+                "rows.4.ore_dichiarate": le.Reading([(1.5, -0.05)], "1,5", -0.06, 3)}
+    res = le.assemble(plan, readings, _grid())
+    assert {"prog_entrata", "prog_uscita"} <= set(res.rows[2].incerti)      # 1,5 su 5 ore
+    assert not {"prog_entrata", "prog_uscita"} & set(res.rows[3].incerti)    # 1,5 su 3 ore: la meta'
+
+
+def test_weekly_schedule_with_a_single_sure_week_flags_the_outlier():
+    """Una sola altra settimana con lo stesso giorno, letta con sicurezza: basta per
+    segnalare l'orario programmato diverso (prima servivano due settimane concordi)."""
+    days = (5, 12)
+    plan = _plan_with({g: {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO} for g in days})
+    readings = {"rows.5.prog_entrata": _time("11:00"), "rows.5.prog_uscita": _time("14:00"),
+                "rows.12.prog_entrata": _time("11:00"), "rows.12.prog_uscita": _time("16:00", -0.01)}
+    res = le.assemble(plan, readings, _grid())
+    assert "prog_uscita" in res.rows[11].incerti
+    assert "prog_entrata" not in res.rows[11].incerti and "prog_entrata" not in res.rows[4].incerti
+
+
+def test_programmed_duration_different_from_same_weekday_is_flagged():
+    """Orari diversi fra le settimane ma stessa durata (3 ore); in una settimana la durata
+    letta e' 5 ore: l'orario programmato di quel giorno va verificato."""
+    sched = {3: ("08:00", "11:00"), 10: ("09:00", "12:00"), 17: ("10:00", "15:00")}
+    plan = _plan_with({g: {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO} for g in sched})
+    readings = {}
+    for g, (a, b) in sched.items():
+        readings |= {f"rows.{g}.prog_entrata": _time(a), f"rows.{g}.prog_uscita": _time(b)}
+    res = le.assemble(plan, readings, _grid())
+    assert {"prog_entrata", "prog_uscita"} <= set(res.rows[16].incerti)
+    assert not res.rows[2].incerti and not res.rows[9].incerti

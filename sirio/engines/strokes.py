@@ -147,9 +147,13 @@ def stroke_shape(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float, float, f
     return length, thickness, dev, angle
 
 
-def find_strikes(gray: np.ndarray, grid: TableGrid) -> StrikeInfo:
+def find_strikes(gray: np.ndarray, grid: TableGrid, ignore: np.ndarray | None = None) -> StrikeInfo:
     """Barrature a mano nella parte giornaliera della tabella (giorni 1-31,
     colonne dagli orari alle note).
+
+    ``ignore`` (facoltativo, bool, dimensioni dell'immagine): pixel da non
+    considerare (es. le pieghe del foglio, ``sirio.vision.ink.find_creases``: una
+    piega quasi verticale non e' una barratura).
 
     Le barrature sono spesso tracciate con poca pressione e risultano spezzate:
     si usa una soglia d'inchiostro piu' bassa di quella dei ritagli e i pezzi
@@ -169,6 +173,8 @@ def find_strikes(gray: np.ndarray, grid: TableGrid) -> StrikeInfo:
     region = gray[y0:y1, x0:x1]
     bg = paper_background(region, unit).astype(np.float32)
     weak = (bg - region.astype(np.float32)) > np.maximum(WEAK_INK_MIN, WEAK_INK_REL * bg)
+    if ignore is not None and ignore.shape[:2] == (H, W):
+        weak &= ~ignore[y0:y1, x0:x1]
     row_y = [y - y0 for y in grid.row_y]
     lines = _printed_lines(weak, unit, row_y, [x - x0 for x in grid.col_x])
     rest = weak & ~lines

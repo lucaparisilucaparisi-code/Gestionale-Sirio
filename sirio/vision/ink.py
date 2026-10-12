@@ -35,6 +35,7 @@ chiede ogni cella (circa 1-2 s per pagina a 300 dpi, poi ~2 ms per cella)::
     res.strike_removed   # frazione tolta perche' parte di barrature/linee
     page.strokes         # list[Stroke]: kind "diagonale"/"orizzontale", points, days, columns
     page.struck_days     # giorni con righe barrate; page.line_days: giorni con linee orizzontali
+    page.creases         # list[Crease]: pieghe del foglio (tolte come le barrature; res.crease)
 
 Cosa riconosce:
 
@@ -45,6 +46,13 @@ Cosa riconosce:
 * linee orizzontali tirate a mano attraverso le celle di una riga (orario
   effettivo "non svolto"), nella fascia centrale della riga; le linee doppie o
   le ombre del modulo, perfettamente parallele alla griglia, sono ignorate;
+* pieghe del foglio (``find_creases``): lunghe linee sottili quasi verticali,
+  anche chiare e leggermente curve, continue per almeno 8 righe e lontane dai
+  bordi di colonna stampati (l'ombra della piega di un foglio piegato e
+  fotografato): tolte dall'inchiostro proprio come le barrature, salvo i tratti
+  di scrittura che le attraversano; ``ink_under_crease`` dice se sotto la piega
+  c'e' scrittura piu' scura della piega (una cifra che togliendo la piega
+  sparirebbe);
 * tratti debordanti: un tratto appartiene alla cella che ne contiene la parte
   maggiore (ricucito solo attraverso le linee orizzontali); le code sottili
   (virgole, aste) della riga sopra/sotto che lasciano nella cella solo un
@@ -458,6 +466,8 @@ class CellInkResult:
       del tratto principale, ``None`` se la cella e' vuota;
     * ``row_struck``: la riga del giorno e' attraversata da una barratura
       diagonale (anche se il tratto non passa per questa cella);
+    * ``crease``: la cella e' attraversata da una piega del foglio (``Crease``),
+      tolta dall'inchiostro proprio come le barrature;
     * ``box``: riquadro della cella (x0, y0, x1, y1) nell'immagine.
     """
 
@@ -472,6 +482,7 @@ class CellInkResult:
     slash: bool = False
     stroke_angle: float | None = None
     row_struck: bool = False
+    crease: bool = False
 
     @property
     def empty(self) -> bool:
@@ -487,7 +498,8 @@ class PageInk:
     ``Stroke``), ``strike_mask`` (bool, coordinate della zona ``origin``).
     """
 
-    def __init__(self, img: np.ndarray, grid) -> None:  # noqa: ANN001 - TableGrid (import circolare evitato)
+    def __init__(self, img: np.ndarray, grid,  # noqa: ANN001 - TableGrid (import circolare evitato)
+                 creases: tuple[list[Crease], np.ndarray | None] | None = None) -> None:
         gray = _darkness_gray(img)
         H, W = gray.shape[:2]
         if (grid.width, grid.height) != (W, H):        # griglia di un'immagine ridimensionata
@@ -516,8 +528,16 @@ class PageInk:
         self.v_lines = v_lines
         self.lines = h_lines | v_lines
         faint_core, _, _ = _remove_grid_lines(faint, lk, lk, rows=rows, cols=cols)
+        # pieghe del foglio (linee lunghe quasi verticali): non sono scrittura ne' barrature
+        if creases is None:
+            creases = find_creases(img, grid)
+        self.creases = list(creases[0])
+        crease_mask = np.zeros_like(faint_core)
+        if creases[1] is not None and creases[1].shape[:2] == (H, W):
+            crease_mask = creases[1][y0:y1, x0:x1].copy()
+        faint_core &= ~crease_mask
         self.strokes, strike = _find_strokes(faint_core, grid, rh, (x0, y0))
-        self.strike_mask = strike
+        self.strike_mask = strike | crease_mask
         core = core & ~self.strike_mask
         self.core = core
         # pixel delle linee orizzontali che ricuciono un tratto che le attraversa:
@@ -590,10 +610,11 @@ class PageInk:
         px1, py1 = min(w, bx1 + pad), min(h, by1 + pad)
         cw, ch = bx1 - bx0, by1 - by0
         struck, across = self.cell_strike(giorno, c)
+        crease = any(cr.crosses(box) for cr in self.creases)
         empty_crop = np.full((max(0, py1 - py0), max(0, px1 - px0)), 255, np.uint8)
         if cw < 3 or ch < 3:
             return CellInkResult(empty_crop, empty_crop > 0, 0.0, struck, across, 0.0, 0.0, box,
-                                 row_struck=int(giorno) in self.struck_days)
+                                 row_struck=int(giorno) in self.struck_days, crease=crease)
         # finestra: le celle vicine per intero (a sinistra, a destra, sopra, sotto)
         ox, oy = self.origin
         wl = (g.col_x[c] - g.col_x[c - 1]) if c > 0 else int(0.5 * self.rh)
@@ -724,6 +745,7 @@ class PageInk:
             slash=slash,
             stroke_angle=angle,
             row_struck=int(giorno) in self.struck_days,
+            crease=crease,
         )
 
 
@@ -1005,6 +1027,218 @@ _COLUMN_NAMES = ("giorno", "prog_entrata", "prog_uscita", "eff_entrata", "eff_us
                  "assenza_alunno", "assenza_operatore", "firma", "note")
 
 
+# --------------------------------------------------------------------------
+# Pieghe del foglio: lunghe linee quasi verticali che non sono la griglia
+# --------------------------------------------------------------------------
+
+CREASE_MIN_ROWS = 8.0        # estensione verticale minima di una piega (righe): la scrittura di righe
+                             # consecutive allineata in colonna forma al massimo 5-6 righe continue
+CREASE_MAX_WIDTH = 0.25      # spessore mediano massimo (righe), ombra compresa
+CREASE_COVERAGE = 0.75       # frazione dell'estensione in cui la linea e' presente (quasi continua)
+CREASE_GAP = 1.0             # interruzione massima (righe) ricucita: una piega poco visibile in qualche
+                             # punto resta una; la scrittura dei giorni feriali si ferma al fine settimana
+CREASE_MAX_SLOPE = 0.35      # inclinazione massima rispetto alla verticale (dx/dy, circa 20 gradi)
+CREASE_MAX_DEV = 0.15        # scarto massimo (righe, 90 percentile) dalla curva adattata
+CREASE_PRINTED = 0.35        # piu' vicina di cosi' (righe) a un bordo di colonna: e' la linea stampata
+
+
+@dataclass
+class Crease:
+    """Linea lunga, sottile e continua quasi verticale (piega del foglio fotografato,
+    ombra della piega, graffio della scansione) che attraversa piu' righe della
+    tabella senza essere una linea stampata della griglia. Non e' scrittura: va
+    tolta dall'analisi di crocette, firme e testo in tutte le colonne.
+
+    ``path``: ascissa (pixel dell'immagine) per ogni ordinata da ``y0`` a ``y1``
+    (esclusa); ``half_width``: semispessore in pixel; ``days``: giorni attraversati."""
+
+    y0: int
+    y1: int
+    path: np.ndarray
+    half_width: float
+    days: tuple[int, ...]
+    level: float = 0.0          # grigio tipico (mediano) della piega: la scrittura sotto e' piu' scura
+
+    def x_at(self, y: float) -> float:
+        i = int(round(min(max(y, self.y0), self.y1 - 1))) - self.y0
+        return float(self.path[i])
+
+    def crosses(self, box: Box, inner: float = 0.08) -> bool:
+        """True se la linea passa dentro il riquadro (al netto di un margine ``inner``
+        della larghezza) per almeno meta' della sua altezza."""
+        x0, y0, x1, y1 = box
+        ya, yb = max(y0, self.y0), min(y1, self.y1)
+        if yb - ya < 0.5 * (y1 - y0):
+            return False
+        xs = self.path[ya - self.y0:yb - self.y0]
+        m = inner * (x1 - x0)
+        return bool(((xs >= x0 + m) & (xs <= x1 - m)).mean() >= 0.5)
+
+
+def _crossing_rows(ink: np.ndarray, path: np.ndarray, half: float, ext: int) -> np.ndarray:
+    """Righe (bool, una per ordinata) in cui l'inchiostro attorno alla curva ``path``
+    continua per piu' di ``ext`` pixel oltre la fascia larga ``2 * half``: un tratto
+    di scrittura attraversa la piega. Allargate di qualche pixel in verticale (spessore
+    del tratto)."""
+    h, w = ink.shape
+    out = np.zeros(h, dtype=bool)
+    for i in range(h):
+        a = int(np.floor(path[i] - half))
+        b = int(np.ceil(path[i] + half))
+        row = ink[i]
+        la, rb = max(0, a - ext), min(w, b + ext + 1)
+        if a - 1 >= 0 and la < a and row[la:a].all():
+            out[i] = True
+        elif b + 1 <= w and b + 1 < rb and row[b + 1:rb].all():
+            out[i] = True
+    if out.any():
+        out = np.convolve(out.astype(np.float32), np.ones(5, np.float32), mode="same") > 0
+    return out
+
+
+def find_creases(img: np.ndarray, grid) -> tuple[list[Crease], np.ndarray | None]:  # noqa: ANN001
+    """Pieghe del foglio nella tabella dei giorni (vedi ``Crease``) e maschera dei
+    loro pixel (bool, dimensioni dell'immagine; None se non ce ne sono).
+
+    Un foglio piegato in verticale e fotografato mostra l'ombra della piega: una
+    linea scura sottile, leggermente curva, che attraversa tutte le righe dentro
+    una colonna. Le crocette e le firme non si estendono per piu' righe con una
+    linea continua: si cercano tratti quasi verticali (anche chiari) lunghi almeno
+    ``CREASE_MIN_ROWS`` righe, sottili, presenti in modo continuo e lontani dai
+    bordi di colonna stampati."""
+    gray = _darkness_gray(img)
+    H, W = gray.shape[:2]
+    if (grid.width, grid.height) != (W, H):
+        grid = grid.scaled(W / float(grid.width), H / float(grid.height))
+    rh = float(grid.row_height)
+    if rh <= 6:
+        return [], None
+    x0 = max(0, int(grid.col_x[1] - 0.2 * rh))
+    x1 = min(W, int(grid.col_x[-1] + 0.2 * rh))
+    y0 = max(0, int(grid.row_y[0] - 0.1 * rh))
+    y1 = min(H, int(grid.row_y[-1] + 0.1 * rh))
+    if x1 - x0 < 10 or y1 - y0 < CREASE_MIN_ROWS * rh:
+        return [], None
+    region = gray[y0:y1, x0:x1]
+    _strong, faint = _local_ink(region, rh, faint=True)
+    m = faint.copy()
+    # i bordi di colonna stampati (e cio' che vi si confonde) non sono pieghe
+    band = max(2, int(round(0.12 * rh)))
+    for x in grid.col_x:
+        xl = int(round(x)) - x0
+        m[:, max(0, xl - band):max(0, xl + band + 1)] = False
+    # tratti quasi verticali: allargati di poco in orizzontale (linee inclinate o
+    # curve restano continue), poi apertura verticale (toglie scrittura e linee orizzontali)
+    d = max(1, int(round(0.04 * rh)))
+    k = max(7, int(round(0.35 * rh)))
+    wide = cv2.dilate(m.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (2 * d + 1, 1)))
+    vert = cv2.morphologyEx(wide, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
+    gap = max(3, int(round(CREASE_GAP * rh)))
+    linked = cv2.morphologyEx(vert, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (1, gap)))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(linked, connectivity=8)
+    creases: list[Crease] = []
+    mask = np.zeros((H, W), dtype=bool)
+    for i in range(1, n):
+        bx, by, bw, bh, _a = (int(v) for v in stats[i])
+        if bh < CREASE_MIN_ROWS * rh:
+            continue
+        sub = (lab[by:by + bh, bx:bx + bw] == i) & (vert[by:by + bh, bx:bx + bw] > 0)
+        rows_on = sub.any(axis=1)
+        if rows_on.mean() < CREASE_COVERAGE:
+            continue
+        ys = np.nonzero(rows_on)[0]
+        first = np.argmax(sub[ys], axis=1)
+        last = sub.shape[1] - 1 - np.argmax(sub[ys][:, ::-1], axis=1)
+        widths = (last - first + 1).astype(np.float64) - 2 * d
+        centers = (first + last) / 2.0
+        # righe in cui c'e' solo la linea (sottile): almeno meta'; le altre sono
+        # attraversate da scrittura unita alla linea e non servono a misurarla
+        clean = widths <= CREASE_MAX_WIDTH * rh
+        if clean.sum() < 0.5 * ys.size or clean.sum() < CREASE_MIN_ROWS * rh * 0.5:
+            continue
+        # curva regolare (piega leggermente incurvata), quasi verticale
+        try:
+            coef = np.polyfit(ys[clean].astype(np.float64), centers[clean], 2)
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        resid = np.abs(centers[clean] - np.polyval(coef, ys[clean]))
+        if float(np.percentile(resid, 90)) > CREASE_MAX_DEV * rh:
+            continue
+        yy = np.arange(bh, dtype=np.float64)
+        slope = np.abs(2 * coef[0] * yy + coef[1])
+        if float(slope.max()) > CREASE_MAX_SLOPE:
+            continue
+        half = 0.5 * float(np.percentile(widths[clean], 75)) + 1.5
+        # presente lungo la curva (non solo nella componente, che puo' includere scrittura)
+        fit = np.polyval(coef, yy)
+        cols_sub = np.arange(bw, dtype=np.float64)[None, :]
+        near_fit = np.abs(cols_sub - fit[:, None]) <= half + d + 1
+        if float((sub & near_fit).any(axis=1).mean()) < CREASE_COVERAGE:
+            continue
+        path = fit + bx + x0
+        # vicina e parallela a un bordo di colonna: e' la linea stampata (o vi si confonde)
+        near = [abs(float(np.median(path)) - float(x)) for x in grid.col_x]
+        if min(near) < CREASE_PRINTED * rh:
+            continue
+        gy0 = by + y0
+        days = tuple(g for g in range(1, 32)
+                     if min(gy0 + bh, grid.row_y[g]) - max(gy0, grid.row_y[g - 1]) >= 0.5 * rh)
+        if not days:
+            continue
+        cross = _crossing_rows(faint[by:by + bh], path - x0, half, max(2, int(round(0.06 * rh))))
+        px = np.clip(np.round(path).astype(int), 0, W - 1)
+        along = gray[np.arange(gy0, gy0 + bh), px]
+        level = float(np.median(along[~cross])) if (~cross).any() else float(np.median(along))
+        creases.append(Crease(y0=gy0, y1=gy0 + bh, path=path, half_width=half, days=days, level=level))
+        # pixel d'inchiostro (anche chiaro) lungo la curva, salvo dove un tratto di
+        # scrittura la attraversa (inchiostro che continua oltre la fascia della piega
+        # da una parte o dall'altra): li' si lascia tutto, per non tagliare le cifre
+        lo, hi = max(x0, int(path.min() - half - 2)), min(x1, int(path.max() + half + 3))
+        cols = np.arange(lo, hi, dtype=np.float64)[None, :]
+        sel = np.abs(cols - path[:, None]) <= half
+        band_ink = faint[by:by + bh, lo - x0:hi - x0]
+        sel &= cv2.dilate(band_ink.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        sel[cross] = False
+        mask[gy0:gy0 + bh, lo:hi] |= sel
+    if not creases:
+        return [], None
+    mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    return creases, mask
+
+
+CREASE_INK_DARKER = 40.0     # scrittura sotto la piega: piu' scura della piega di almeno tanti livelli
+
+
+def ink_under_crease(img: np.ndarray, box: Box, creases: list[Crease], unit: float,
+                     mask: np.ndarray | None = None) -> bool:
+    """True se dentro la fascia di una piega che attraversa il riquadro c'e' inchiostro
+    nettamente piu' scuro della piega stessa: scrittura (una cifra stretta, un "1")
+    finita sotto la piega, che togliendo la piega sparirebbe. Con ``mask`` (pixel
+    tolti con la piega, ``find_creases``) contano solo i pixel tolti: i tratti che
+    attraversano la piega restano nell'immagine e non sono "nascosti"."""
+    hits = [c for c in creases if c.crosses(box)]
+    if not hits:
+        return False
+    gray = _darkness_gray(img)
+    H, W = gray.shape[:2]
+    x0, y0, x1, y1 = _norm_box(gray, box)
+    my = int(round(0.08 * (y1 - y0)))
+    need = max(8.0, (0.1 * unit) ** 2)
+    for c in hits:
+        ya, yb = max(y0 + my, c.y0), min(y1 - my, c.y1)
+        if yb <= ya:
+            continue
+        xs = c.path[ya - c.y0:yb - c.y0]
+        cols = np.arange(x0, x1)[None, :]
+        band = np.abs(cols - xs[:, None]) <= c.half_width + 1
+        dark = gray[ya:yb, x0:x1] < c.level - CREASE_INK_DARKER
+        if mask is not None and mask.shape[:2] == (H, W):
+            dark &= mask[ya:yb, x0:x1]
+        if float((band & dark).sum()) >= need:
+            return True
+    return False
+
+
 def find_strokes(img: np.ndarray, grid) -> list[Stroke]:  # noqa: ANN001
     """Barrature diagonali e linee orizzontali a penna della tabella (vedi ``Stroke``)."""
     return PageInk(img, grid).strokes
@@ -1024,10 +1258,13 @@ def cell_own_ink(img: np.ndarray, grid, giorno: int, colonna: str | int,  # noqa
 __all__ = [
     "CellInk",
     "CellInkResult",
+    "Crease",
     "PageInk",
     "Stroke",
     "cell_own_ink",
+    "find_creases",
     "find_strokes",
+    "ink_under_crease",
     "analyze_cell",
     "crop",
     "has_cross",

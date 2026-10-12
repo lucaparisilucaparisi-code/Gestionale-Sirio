@@ -57,6 +57,9 @@ REFERENT_BOTTOM = 0.9735
 
 A4_IN = (8.27, 11.69)
 
+COLUMN_NAMES = ("giorno", "prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita", "ore_dichiarate",
+                "assenza_alunno", "assenza_operatore", "firma", "note")
+
 ROW_FIELDS = (
     "giorno", "prog_entrata", "prog_uscita", "eff_entrata", "eff_uscita", "ore_dichiarate",
     "assenza_alunno", "assenza_operatore", "firma", "note", "trattino_effettivo",
@@ -338,7 +341,8 @@ def _fmt_hours(v: float | None) -> str:
 def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: float = 0.0, dpi: int = 200,
                          noise: bool = True, form_color: tuple[int, int, int] | None = None,
                          time_style: str = "colon", crossed_rows: tuple = (),
-                         long_signatures: bool = False) -> tuple[np.ndarray, dict]:
+                         long_signatures: bool = False, footer_over_table: bool = False,
+                         crease_column: str | None = None) -> tuple[np.ndarray, dict]:
     """Disegna un foglio firma sintetico. Vedi la documentazione del modulo.
 
     Varianti realistiche (tutte facoltative):
@@ -355,19 +359,29 @@ def make_synthetic_sheet(data: dict | None = None, seed: int = 0, skew_deg: floa
       (nelle righe senza nota);
     * nelle righe dei dati la chiave ``"linea_effettivo": True`` disegna una
       linea orizzontale a penna attraverso le celle dell'orario effettivo
-      (prestazione non svolta: nella verita' ``trattino_effettivo`` = True).
+      (prestazione non svolta: nella verita' ``trattino_effettivo`` = True);
+    * una nota con ``"\\n"`` e' scritta piccola su due righe nella cella (nella
+      verita' le due righe sono unite da uno spazio);
+    * ``footer_over_table``: il timbro rotondo della scuola e la firma del
+      referente scolastico sono messi sopra l'angolo in basso a destra della
+      tabella e sconfinano nelle celle "Firma operatore" e "Note" delle ultime
+      righe (la verita' delle righe non cambia);
+    * ``crease_column``: foglio piegato in verticale e fotografato: l'ombra della
+      piega (``fold_crease``) attraversa tutta la pagina dentro la colonna indicata
+      (es. ``"assenza_operatore"``); la verita' non cambia.
     """
     _FORM_COLOR[0] = tuple(int(v) for v in form_color) if form_color is not None else (25, 25, 25)
     try:
         return _make_sheet(data, seed, skew_deg, dpi, noise, form_color, time_style, crossed_rows,
-                           long_signatures)
+                           long_signatures, footer_over_table, crease_column)
     finally:
         _FORM_COLOR[0] = (25, 25, 25)
 
 
 def _make_sheet(data: dict | None, seed: int, skew_deg: float, dpi: int, noise: bool,
                 form_color: tuple[int, int, int] | None, time_style: str, crossed_rows: tuple,
-                long_signatures: bool) -> tuple[np.ndarray, dict]:
+                long_signatures: bool, footer_over_table: bool = False,
+                crease_column: str | None = None) -> tuple[np.ndarray, dict]:
     rng = np.random.default_rng(seed)
     d = _merge_data(data)
     hdr = d["header"]
@@ -578,9 +592,18 @@ def _make_sheet(data: dict | None, seed: int, skew_deg: float, dpi: int, noise: 
                 _signature(img, cell(8), rng, pen, pt)
         if r.get("note"):
             x0, _, x1, _ = cell(9)
-            _hand(img, str(r["note"]), x0 + (x1 - x0) * 0.06, yb - rh * 0.28, text_h * 0.9, rng, pen,
-                  max_width=(x1 - x0) * 0.88)
+            lines = str(r["note"]).split("\n")
+            if len(lines) == 1:
+                _hand(img, lines[0], x0 + (x1 - x0) * 0.06, yb - rh * 0.28, text_h * 0.9, rng, pen,
+                      max_width=(x1 - x0) * 0.88)
+            else:
+                # nota piccola su due righe dentro la cella
+                for k, line in enumerate(lines[:2]):
+                    _hand(img, line, x0 + (x1 - x0) * 0.06, ya + rh * (0.44 if k == 0 else 0.86), text_h * 0.62,
+                          rng, pen, max_width=(x1 - x0) * 0.6)
         t = {k: r.get(k) for k in ROW_FIELDS}
+        if t.get("note"):
+            t["note"] = " ".join(str(t["note"]).split())
         if r.get("linea_effettivo"):
             t["trattino_effettivo"] = True
         rows_truth.append(t)
@@ -602,7 +625,14 @@ def _make_sheet(data: dict | None, seed: int, skew_deg: float, dpi: int, noise: 
               tbot - rh * 0.22, text_h * 1.1, rng, pen, center=True)
     if hdr.get("firma_coordinatore"):
         _signature(img, (col_x[9], r31, col_x[10], tbot), rng, pen, pt)
-    if hdr.get("timbro_referente"):
+    if hdr.get("timbro_referente") and footer_over_table:
+        # timbro e firma del referente appoggiati sull'angolo della tabella: sconfinano
+        # nelle celle "Firma operatore" e "Note" delle ultime righe
+        rad = 2.1 * rh
+        _stamp(img, (col_x[9] - 0.1 * (col_x[9] - col_x[8]), r31 + 0.2 * rh), rad, rng)
+        _signature(img, (col_x[8] + 0.45 * (col_x[9] - col_x[8]), r31 - 1.2 * rh,
+                         col_x[10] - 0.15 * (col_x[10] - col_x[9]), rbot), rng, (40, 40, 40), pt)
+    elif hdr.get("timbro_referente"):
         rad = (rbot - tbot) * 1.15
         _stamp(img, (col_x[9] + (col_x[10] - col_x[9]) * 0.55, rbot + rad * 0.25), rad, rng)
         _signature(img, (col_x[9], tbot, col_x[10], rbot), rng, (40, 40, 40), pt)
@@ -617,6 +647,11 @@ def _make_sheet(data: dict | None, seed: int, skew_deg: float, dpi: int, noise: 
         img = cv2.GaussianBlur(img, (3, 3), 0.6)
         grain = rng.normal(0, 5.0, img.shape[:2]).astype(np.float32)[..., None]
         img = np.clip(img.astype(np.float32) + grain, 0, 255).astype(np.uint8)
+
+    if crease_column is not None:
+        j = COLUMN_NAMES.index(crease_column)
+        xc = col_x[j] + 0.45 * (col_x[j + 1] - col_x[j])
+        img = fold_crease(img, xc, darkness=110, width=5, seed=seed, bend=0.15 * (col_x[j + 1] - col_x[j]) / W)
 
     if abs(skew_deg) > 1e-9:
         m = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), skew_deg, 1.0)
@@ -726,6 +761,41 @@ def curl(img: np.ndarray, sag: float = 0.01, fold: float = 0.0, fold_x: float = 
     return cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 
+def fold_crease(img: np.ndarray, x: float, darkness: float = 90.0, width: float = 3.0, bend: float = 0.004,
+                slant: float = 0.0, shadow: float = 8.0, gaps: int = 0, seed: int = 0) -> np.ndarray:
+    """Piega verticale di un foglio piegato in due e fotografato: una linea lunga,
+    sottile e scura (l'ombra della piega) che attraversa la pagina dall'alto in basso.
+
+    * ``x``: ascissa della piega a meta' pagina (pixel);
+    * ``darkness``: quanto la piega scurisce la carta al centro (livelli di grigio);
+    * ``width``: spessore del tratto scuro (pixel);
+    * ``bend``: incurvatura (frazione della larghezza della pagina, al centro);
+    * ``slant``: inclinazione (pixel di spostamento orizzontale per pixel verticale);
+    * ``shadow``: larghezza (pixel) dell'ombra sfumata a destra della piega;
+    * ``gaps``: tratti (lunghi l'1% della pagina) in cui la piega non si vede (luce radente).
+    Non tocca la verita': la piega non e' scrittura."""
+    rng = np.random.default_rng(seed)
+    h, w = img.shape[:2]
+    ys = np.arange(h, dtype=np.float32)
+    wobble = np.cumsum(rng.normal(0, 0.15, h)).astype(np.float32)
+    wobble = cv2.GaussianBlur((wobble - wobble.mean()).reshape(-1, 1), (1, 0), sigmaX=1, sigmaY=25).ravel()
+    path = x + bend * w * np.sin(np.pi * ys / h) + slant * (ys - h / 2.0) + 0.5 * wobble
+    reach = int(np.ceil(width + shadow + 3))
+    x0 = max(0, int(np.floor(path.min())) - reach)
+    x1 = min(w, int(np.ceil(path.max())) + reach + 1)
+    xs = np.arange(x0, x1, dtype=np.float32)
+    d = xs[None, :] - path[:, None]                       # distanza orizzontale dalla piega
+    core = np.clip(width / 2.0 + 0.7 - np.abs(d), 0.0, 1.0)
+    side = np.where(d > 0, np.clip(1.0 - d / max(1.0, width / 2.0 + shadow), 0.0, 1.0), 0.0) * 0.35
+    dark = darkness * np.maximum(core, side) * rng.uniform(0.85, 1.0, (h, 1)).astype(np.float32)
+    for y in rng.uniform(0.2 * h, 0.9 * h, int(gaps)):
+        dark[int(y):int(y + 0.01 * h)] = 0.0
+    out = img.copy()
+    band = out[:, x0:x1].astype(np.float32) - dark[..., None]
+    out[:, x0:x1] = np.clip(band, 0, 255).astype(np.uint8)
+    return out
+
+
 def degrade(img: np.ndarray, contrast: float = 1.0, shadow: float = 0.0, blur: float = 0.0,
             jpeg_quality: int | None = None, seed: int = 0) -> np.ndarray:
     """Scansione/foto di qualita' scadente: ``contrast`` < 1 schiarisce tutto
@@ -751,4 +821,4 @@ def degrade(img: np.ndarray, contrast: float = 1.0, shadow: float = 0.0, blur: f
     return out
 
 
-__all__ = ["curl", "default_data", "degrade", "make_synthetic_sheet", "photograph", "sheet_to_pdf"]
+__all__ = ["curl", "default_data", "degrade", "fold_crease", "make_synthetic_sheet", "photograph", "sheet_to_pdf"]
