@@ -106,7 +106,7 @@ import cv2
 import numpy as np
 
 from sirio.engines.base import EngineError, PageInput, ProgressFn, no_progress
-from sirio.engines.strokes import erase, find_strikes, is_slash
+from sirio.engines.strokes import erase, find_strikes, is_slash, stroke_shape
 from sirio.models import DAY_FIELDS, HEADER_FIELDS, DayRow, ExtractionResult, Header, Usage
 from sirio.validation import avviso_griglia_incerta, hours_between, normalize_time, parse_hours, parse_time
 from sirio.vision import ink
@@ -382,7 +382,9 @@ def _hours_forms(v: float) -> list[str]:
     if minutes == 0:
         forms = [w, f"{w}H", f"{w},0", f"{w}.0", f"{w}:00", f"{w}H00", f"{w}H00'"]
     elif minutes == 30:
-        forms = [*_num_forms(v), f"{w},50", f"{w}.50", f"{w},30", f"{w}.30"]
+        forms = [*_num_forms(v), f"{w},50", f"{w}.50", f"{w},30", f"{w}.30", f"{w}½", f"{w}1/2", f"{w}1⁄2"]
+        if whole == 0:
+            forms += ["½", "1/2"]
     else:
         forms = []
     if minutes:
@@ -1762,6 +1764,7 @@ class PagePlan:
     aspect: dict[str, float] = field(default_factory=dict)              # chiave -> larghezza/altezza del ritaglio
     flags: dict[int, dict[str, str]] = field(default_factory=dict)      # giorno -> campo -> motivo di dubbio
     note_scritta: set[int] = field(default_factory=set)   # giorni con una nota scritta per davvero (vedi plan_page)
+    firme_vere: set[int] = field(default_factory=set)     # giorni con una firma dalla forma di firma (non un tratto)
 
 
 def _cell_state_text(img: np.ndarray, box: Box, allow_dash: bool) -> str:
@@ -1868,6 +1871,10 @@ def stamp_boxes(gray: np.ndarray, grid: TableGrid) -> list[Box]:
         x, y, w, h, area = (int(v) for v in stats[i])
         if not (w >= 1.5 * rh and h >= 1.5 * rh and 0.5 <= w / float(h) <= 2.0 and area >= 0.3 * w * h):
             continue
+        if y + h + zy0 < grid.row_y[-1] - TIMBRO_DAL_FONDO * rh:
+            # lontano dal fondo della tabella: un blocco di note scritte su piu' righe
+            # ("USCITO / PRIMA" in due giorni di fila), non il timbro della scuola
+            continue
         if x + zx0 + w / 2.0 < grid.col_x[9]:
             # nella colonna delle firme: firme di righe vicine fuse insieme somigliano a
             # una macchia; un timbro vero e' piu' grande e scende fino al fondo della tabella
@@ -1875,6 +1882,9 @@ def stamp_boxes(gray: np.ndarray, grid: TableGrid) -> list[Box]:
                 continue
         out.append((x + zx0, y + zy0, x + w + zx0, y + h + zy0))
     return out
+
+
+TIMBRO_DAL_FONDO = 3.0     # righe: un timbro arriva almeno fin qui dal fondo della tabella
 
 
 def _inside_stamp(gray: np.ndarray, box: Box, stamps: Sequence[Box]) -> bool:
@@ -2223,18 +2233,30 @@ SEGNO_MIN_SCURO = 60.0      # sotto: non e' un segno a penna (cella vuota)
 SEGNO_SCURO_SICURO = 110.0  # sotto: segno troppo chiaro per essere sicuro (matita, penna scarica)
 
 
+# Forma: scarto dell'inchiostro da una linea (altezze di riga). Misurato su 18 fogli: firme
+# vere almeno 0,18, crocette vere almeno 0,13; barre "/" e linee che annullano la riga quasi
+# tutte sotto 0,05.
+FIRMA_TRATTO = 0.12         # sotto: un tratto solo, non una firma (da verificare)
+FIRMA_VERA = 0.17           # da qui: forma di firma...
+FIRMA_SPESSORE = 0.10       # ... se anche fitta (spessore medio): le linee ondulate non lo sono (firme vere >= 0,117 nel 99%)
+CROCETTA_TRATTO = 0.08      # sotto: una barra, non una crocetta (da verificare)
+
+
 def _faint_mark(st: str, marks: PageMarks, g: int, f: str) -> str:
     """Crocetta o firma fatta di inchiostro troppo chiaro: vuota se e' solo un'ombra,
-    da verificare se e' un segno chiaro."""
+    da verificare se e' un segno chiaro. Crocetta o firma che e' un tratto solo (la
+    barra di una riga annullata): da verificare."""
     if st not in (CROCETTA, FIRMA, SEGNO):
         return st
     dark = marks.darkness(g, f)
-    if dark is None:
-        return st
-    if dark < SEGNO_MIN_SCURO:
+    if dark is not None and dark < SEGNO_MIN_SCURO:
         return VUOTA
-    if dark < SEGNO_SCURO_SICURO:
+    if dark is not None and dark < SEGNO_SCURO_SICURO:
         return SEGNO
+    if st in (CROCETTA, FIRMA):
+        spread = marks.spread(g, f)
+        if spread is not None and spread < (FIRMA_TRATTO if st == FIRMA else CROCETTA_TRATTO):
+            return SEGNO
     return st
 
 
@@ -2379,6 +2401,26 @@ class PageMarks:
         r = self.own(g, f)
         return bool(r is not None and r.empty)
 
+    def shape(self, g: int, f: str) -> tuple[float, float] | None:
+        """Forma dell'inchiostro proprio della cella, in altezze di riga: (scarto da una
+        linea al 90 percentile, spessore medio lungo la linea). Un tratto solo ("/", linea)
+        ha lo scarto basso, una linea ondulata lo spessore basso, una firma nessuno dei
+        due; None se non misurabile."""
+        r = self.own(g, f)
+        if r is None or r.empty:
+            return None
+        ys, xs = np.nonzero(np.asarray(r.mask, dtype=bool))
+        if xs.size < 10:
+            return None
+        _length, thick, dev, _angle = stroke_shape(xs.astype(np.float64), ys.astype(np.float64))
+        rh = max(1.0, self.grid.row_height)
+        return dev / rh, thick / rh
+
+    def spread(self, g: int, f: str) -> float | None:
+        """Scarto dell'inchiostro proprio della cella da una linea (vedi ``shape``)."""
+        sh = self.shape(g, f)
+        return None if sh is None else sh[0]
+
     def darkness(self, g: int, f: str) -> float | None:
         """Quanto e' scuro l'inchiostro proprio della cella rispetto alla carta vicina
         (90 percentile, livelli di grigio); None se non misurabile."""
@@ -2480,6 +2522,9 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
                 plan.requests.append(_text_request(key, crop, h_lex, beams=5, max_tokens=6, vpad=VPAD_NUMERI))
             else:
                 plan.requests.append(_text_request(key, crop, t_lex, beams=6, max_tokens=8, vpad=VPAD_NUMERI))
+        if states.get("ore_dichiarate") == TESTO and any(flags.get(f) == "due_orari" for f in TIME_FIELDS):
+            # con due fasce orarie le ore non si possono verificare con entrata e uscita
+            flags.setdefault("ore_dichiarate", "due_orari")
         # "/" isolata in una riga senza altri orari (riga non lavorata): nessun valore;
         # altrimenti (o nella colonna delle ore, dove un "1" puo' somigliarle) si legge e si segnala
         others = [f for f in TIME_FIELDS if states[f] == TESTO and f not in slashes]
@@ -2525,6 +2570,9 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
         elif st == VUOTA and marks.crease(g, "firma") and marks.hidden_by_crease(g, "firma"):
             st = SEGNO          # tratto sotto la piega: da verificare
         states["firma"] = st
+        sh = marks.shape(g, "firma") if st == FIRMA else None
+        if sh is not None and sh[0] >= FIRMA_VERA and sh[1] >= FIRMA_SPESSORE:
+            plan.firme_vere.add(g)
         if st in (FIRMA, SEGNO) and states["assenza_operatore"] == CROCETTA:
             worked = any(states[f] == TESTO for f in ("eff_entrata", "eff_uscita"))
             if worked or _touches_signature(gray, grid.cell(g, "assenza_operatore"), fbox):
@@ -2566,7 +2614,17 @@ def plan_page(img: np.ndarray, grid: TableGrid) -> PagePlan:
             if _remove_overflow(notes_gray, grid, g):
                 source = notes_gray
                 if ink.is_blank(source, box):
-                    st = VUOTA
+                    # tolta la firma che sconfina non resta nulla: ma se la nota attaccata
+                    # alla firma e' una scrittura consistente si legge com'e' e si segnala
+                    c = grid.col_index("note")
+                    whole = clean_crop(gray, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]),
+                                       extend=(0.3, 0.5))
+                    if whole is not None and _substantial_note(whole, rh) and len(
+                            split_text_lines(whole, rh)) > 1:
+                        source = gray
+                        flags["note"] = "attribuzione"
+                    else:
+                        st = VUOTA
         if st == TESTO:
             c = grid.col_index("note")
             crop = clean_crop(source, box, rh, rows=(y0, y1), cols=(grid.col_x[c], grid.col_x[c + 1]),
@@ -3801,10 +3859,19 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
         st = plan.cells.get(row.giorno, {})
         # firma o crocetta in una riga senza orari, ore e note: segno isolato (timbro,
         # firma del pie' di pagina, piega, macchia): mai sicuro
-        for f in _lonely_marks(row, st):
+        for f in _lonely_marks(row, st, row.giorno in plan.firme_vere):
             if f not in row.incerti and f not in row.illeggibili:
                 row.incerti.append(f)
                 row.confidenza[f] = min(row.confidenza.get(f, 0.5), 0.5)
+        if (row.ore_dichiarate and "ore_dichiarate" not in row.incerti
+                and all(getattr(row, f) is None for f in TIME_FIELDS)
+                and not any(st.get(f) == TESTO for f in TIME_FIELDS)):
+            # ore (diverse da zero) in una riga senza alcun orario: nessun riscontro
+            # possibile ("0" della riga annullata letto "3")
+            row.incerti.append("ore_dichiarate")
+    if _flag_difficult_page(rows):
+        extra_notes.append("Scrittura difficile per il motore: quasi tutti gli orari e le ore della pagina "
+                           "sono dubbi, quindi anche gli altri sono da verificare.")
 
     header = _assemble_header(plan, readings, rows, confs)
     flagged_rows = _flag_unreliable_grid(grid, rows, header)
@@ -3846,7 +3913,7 @@ def assemble(plan: PagePlan, readings: dict[str, Reading], grid: TableGrid,
     )
 
 
-def _lonely_marks(row: DayRow, states: dict[str, str]) -> list[str]:
+def _lonely_marks(row: DayRow, states: dict[str, str], firma_vera: bool = False) -> list[str]:
     """Firme e crocette di una riga senza alcun valore sicuro (orari, ore, nota):
     un segno isolato e' sospetto.
 
@@ -3854,14 +3921,20 @@ def _lonely_marks(row: DayRow, states: dict[str, str]) -> list[str]:
     barra in ogni cella (giorno non lavorato) hanno barre anche nella colonna della
     firma e delle assenze, che sembrano una firma o una crocetta; e una nota letta con
     incertezza spesso e' proprio un pezzo del timbro o della firma del pie' di pagina
-    che ha prodotto anche il falso segno."""
+    che ha prodotto anche il falso segno. In una riga con scrittura (dubbia) nelle celle
+    di orari e ore, una firma che ha la forma di una firma (``firma_vera``, non un tratto
+    solo) resta sicura: la scrittura difficile da leggere non la rende dubbia."""
     nota_sicura = bool(row.note) and "note" not in row.incerti and "note" not in row.illeggibili
     if nota_sicura:
         return []
     if any(getattr(row, f) is not None and f not in row.incerti and f not in row.illeggibili
            for f in TEXT_FIELDS):
         return []
-    return [f for f in ("firma", "assenza_alunno", "assenza_operatore") if getattr(row, f)]
+    marks = [f for f in ("firma", "assenza_alunno", "assenza_operatore") if getattr(row, f)]
+    scritta = any(states.get(f) == TESTO for f in TEXT_FIELDS)
+    if firma_vera and scritta:
+        marks = [f for f in marks if f != "firma"]
+    return marks
 
 
 # Coerenza della grafia dei minuti: chi scrive "00" lo scrive sempre allo stesso modo.
@@ -3945,6 +4018,32 @@ def _flag_minute_lookalikes(plan: PagePlan, states: dict[tuple[int, str], _CellS
         states[(g, f)].reasons.add("grafia_minuti")
         out.append((g, f))
     return sorted(out)
+
+
+# Pagina difficile: se quasi tutti gli orari e le ore letti sono dubbi, la scrittura e' fuori
+# dalla portata del modello e la sua sicurezza sui pochi valori rimasti non e' affidabile
+# (misurato: sulle pagine con oltre l'85% di valori dubbi i valori "sicuri" sbagliati sono
+# molti di piu' che sulle altre). Si segnalano anche quelli.
+PAGINA_DIFFICILE_QUOTA = 0.85
+PAGINA_DIFFICILE_MIN_CELLE = 20
+
+
+def _flag_difficult_page(rows: list[DayRow]) -> bool:
+    """Segnala tutti gli orari e le ore di una pagina in cui quasi tutti sono gia' dubbi."""
+    total = flagged = 0
+    for row in rows:
+        doubt = set(row.incerti) | set(row.illeggibili)
+        for f in TEXT_FIELDS:
+            if getattr(row, f) is not None or f in doubt:
+                total += 1
+                flagged += f in doubt
+    if total < PAGINA_DIFFICILE_MIN_CELLE or flagged < PAGINA_DIFFICILE_QUOTA * total or flagged == total:
+        return False
+    for row in rows:
+        for f in TEXT_FIELDS:
+            if getattr(row, f) is not None and f not in row.incerti and f not in row.illeggibili:
+                row.incerti.append(f)
+    return True
 
 
 FUORI_INTERVALLO_MIN = 90      # minuti oltre il minimo/massimo degli altri orari sicuri

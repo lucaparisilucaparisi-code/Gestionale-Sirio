@@ -316,7 +316,12 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    celle vicine appoggiate sulla linea della riga, ricucite fra loro: spessa e alta insieme) non è
    mai una linea né una barratura. Crocette e firme di inchiostro chiarissimo (meno di 60 livelli
    sulla carta: ombre, aloni del retro del foglio) sono celle vuote; fra 60 e 110 sono segni da
-   verificare (le crocette e le firme vere misurate sono tutte oltre 130). Una cella di orari con
+   verificare (le crocette e le firme vere misurate sono tutte oltre 130). Anche la forma conta:
+   una "firma" o una "crocetta" che è un tratto solo (scarto dalla retta sotto 0,12 o 0,08
+   righe: la barra di una riga annullata) è da verificare; le firme vere misurate stanno oltre
+   0,18. I "timbri" lontani dal fondo della tabella (oltre 3 righe) sono blocchi di note scritte
+   su più righe, non timbri: si leggono. Una nota su due righe attaccata alla firma non sparisce
+   togliendo la firma che sconfina: si legge e si segnala. Una cella di orari con
    **due fasce scritte una sopra l'altra** ("9:00" sopra "13:00") si legge riga per riga: entrata
    = la prima, uscita = l'ultima, sempre segnalata (motivo `due_orari`). Se il ritaglio pulito non trova scrittura ma `PageInk` sì, si legge
    il ritaglio di `PageInk` e il valore resta segnalato.
@@ -358,7 +363,11 @@ Download del modello alla prima esecuzione con avanzamento tramite `progress`.
    un orario diversi da quelli delle celle di altre righe con la scrittura più simile (stessa
    grafia, es. "13:ↄↄ" letto con sicurezza "13:30" dove gli altri "ↄↄ" sono letti ":00": la riga
    resta coerente perché anche l'entrata si sposta, quindi la coerenza non basta a confermare);
-   nota fatta di sole parole vuote ("IL", "DI LA") mai sicura; nota breve del vocabolario ("104")
+   nota fatta di sole parole vuote ("IL", "DI LA") mai sicura; ore diverse da zero in una riga
+   senza alcun orario; ore di una riga con due fasce orarie; **pagina difficile**: se oltre l'85%
+   degli orari e delle ore letti è dubbio, sono segnalati anche gli altri (con una nota: la
+   sicurezza del modello su quella grafia non è affidabile). Una firma con la forma di una firma
+   resta sicura anche se gli orari della riga sono tutti dubbi; nota breve del vocabolario ("104")
    proposta da verificare invece di essere scartata; nota scritta per davvero (due righe, o
    almeno tre segni larghi e alti come una parola breve, es. "104") di cui nessuna lettura è accettata →
    `illeggibili`, mai vuota in silenzio (lo stesso per ogni campo: inchiostro proprio presente e

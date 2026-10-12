@@ -1536,6 +1536,15 @@ def test_marks_on_a_row_with_only_doubtful_values_are_flagged():
     lavorata = DayRow(giorno=16, prog_entrata="08:00", eff_entrata="09:00", firma=True,
                       incerti=["eff_entrata"])
     assert le._lonely_marks(lavorata, {"prog_entrata": le.TESTO, "firma": le.FIRMA}) == []
+    # riga lavorata ma con tutti gli orari dubbi (scrittura difficile): la firma che ha la
+    # forma di una firma resta sicura, un tratto solo no
+    difficile = DayRow(giorno=17, prog_entrata="08:00", prog_uscita="11:00", firma=True,
+                       incerti=["prog_entrata", "prog_uscita"])
+    st2 = {"prog_entrata": le.TESTO, "prog_uscita": le.TESTO, "firma": le.FIRMA}
+    assert le._lonely_marks(difficile, st2, firma_vera=True) == []
+    assert le._lonely_marks(difficile, st2, firma_vera=False) == ["firma"]
+    # riga senza scrittura nelle celle di orari: anche una firma vera e' isolata
+    assert le._lonely_marks(DayRow(giorno=30, firma=True), {"firma": le.FIRMA}, firma_vera=True) == ["firma"]
 
 
 def test_minutes_off_the_quarter_hour_are_read_when_the_page_uses_them():
@@ -1584,6 +1593,52 @@ def test_minutes_written_like_the_others_but_read_differently_are_flagged():
         plan2.requests.append(le.ReadRequest(f"rows.{g}.prog_entrata", _glyph_image(v.replace(":", "."), g)))
         states2[(g, "prog_entrata")] = le._CellState(g, "prog_entrata", v, le.Evidence([(v, 0.0)], 1.0), set())
     assert le._flag_minute_lookalikes(plan2, states2) == []
+
+
+def test_hours_without_any_time_in_the_row_are_flagged():
+    """Ore diverse da zero in una riga senza alcun orario (riga annullata con "/" e lo
+    "0" letto "3"): nessun riscontro possibile, da verificare. Lo zero no."""
+    plan = _plan_with({5: {"ore_dichiarate": le.TESTO, "firma": le.FIRMA},
+                       6: {"ore_dichiarate": le.TESTO, "firma": le.FIRMA}, 7: FULL_ROW})
+    readings = {"rows.5.ore_dichiarate": le.Reading([(3.0, -0.02)], "3", -0.03, 2),
+                "rows.6.ore_dichiarate": le.Reading([(0.0, -0.02)], "0", -0.03, 2), **_row_readings(7)}
+    res = le.assemble(plan, readings, _grid())
+    assert res.rows[4].ore_dichiarate == 3.0 and "ore_dichiarate" in res.rows[4].incerti
+    assert res.rows[5].ore_dichiarate == 0.0 and "ore_dichiarate" not in res.rows[5].incerti
+    assert not res.rows[6].incerti
+
+
+def test_page_with_almost_every_value_doubtful_flags_the_rest():
+    """Se quasi tutti gli orari e le ore della pagina sono dubbi, la sicurezza del modello
+    sui pochi rimasti non vale: si segnalano anche quelli (con una nota)."""
+    from sirio.models import DayRow
+
+    rows = []
+    for g in range(1, 7):
+        r = DayRow(giorno=g, prog_entrata="08:00", prog_uscita="11:00", ore_dichiarate=3.0)
+        if g > 1:
+            r.incerti = ["prog_entrata", "prog_uscita", "ore_dichiarate"]
+        rows.append(r)
+    rows += [DayRow(giorno=g, prog_entrata="08:00", prog_uscita="11:00", eff_entrata="08:00",
+                    eff_uscita="11:00", ore_dichiarate=3.0, incerti=list(le.TEXT_FIELDS)) for g in range(7, 10)]
+    assert le._flag_difficult_page(rows)
+    assert set(rows[0].incerti) == {"prog_entrata", "prog_uscita", "ore_dichiarate"}
+    # pagina letta per lo piu' con sicurezza: nessun cambiamento
+    sure = [DayRow(giorno=g, prog_entrata="08:00", prog_uscita="11:00", ore_dichiarate=3.0) for g in range(1, 11)]
+    sure[0].incerti = ["prog_entrata"]
+    assert not le._flag_difficult_page(sure) and not sure[1].incerti
+
+
+def test_two_time_slots_in_one_cell_are_read_line_by_line():
+    """Cella con due orari uno sopra l'altro: due righe di scrittura separate."""
+    crop = np.full((120, 220), 255, np.uint8)
+    cv2.putText(crop, "9.00", (20, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.4, 0, 3)
+    cv2.putText(crop, "13.00", (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 1.4, 0, 3)
+    lines = le.split_text_lines(crop, 120.0, min_width=le.ORARI_DUE_RIGHE_LARGHEZZA)
+    assert len(lines) == 2
+    single = np.full((120, 220), 255, np.uint8)
+    cv2.putText(single, "10.30", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.6, 0, 3)
+    assert len(le.split_text_lines(single, 120.0, min_width=le.ORARI_DUE_RIGHE_LARGHEZZA)) == 1
 
 
 def test_time_far_outside_the_sheet_range_is_flagged_not_changed():
